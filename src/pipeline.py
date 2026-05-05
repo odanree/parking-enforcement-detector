@@ -24,6 +24,7 @@ from src.behavior.sweeper_analyzer import SweeperAnalyzer
 from src.detection.object_detector import Detection, ObjectDetector
 from src.detection.zone_filter import ZoneFilter
 from src.stream.rtsp_handler import RTSPHandler
+from src.stream.video_file_handler import VideoFileHandler
 from src.vlm.analyzer import VLMAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -89,7 +90,15 @@ def run(state=None) -> None:
     chalk_cfg = cfg_det["chalking"]
     sweep_cfg = cfg_det["sweeper"]
 
-    stream = RTSPHandler(url=os.environ["RTSP_URL"])
+    video_path = os.getenv("VIDEO_PATH", "")
+    if video_path:
+        stream = VideoFileHandler(
+            path=video_path,
+            loop=os.getenv("VIDEO_LOOP", "true").lower() != "false",
+            speed=float(os.getenv("VIDEO_SPEED", "1.0")),
+        )
+    else:
+        stream = RTSPHandler(url=os.environ["RTSP_URL"])
 
     detector = ObjectDetector(
         model_path=os.getenv("YOLO_MODEL", det_cfg["model"]),
