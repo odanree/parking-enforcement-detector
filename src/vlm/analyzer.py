@@ -1,17 +1,20 @@
 """Vision-language model client.
 
-Supports two backends:
+Supports three backends:
   • claude  — Anthropic claude-haiku-4-5-20251001 via the API (fast, ~$0.0001/call).
               System prompt is cache-controlled so repeated calls are ~5× cheaper.
   • ollama  — Local LLaVA-style model via Ollama REST API (zero API cost, 8 GB VRAM).
               Use a 4-bit or 8-bit quantised 7 B model to stay under 2 s/frame.
+  • mock    — Always returns chalking_detected=True. Use to verify the full alert
+              chain (zone → analyzer → notifier → dashboard) without a real VLM.
 
 Returns a dict matching the spec schema:
     {
-        "chalking_detected": bool,
-        "sweeper_detected":  bool,
-        "confidence":        float,  # 0.0–1.0
-        "description":       str,
+        "chalking_detected":    bool,
+        "sweeper_detected":     bool,
+        "pe_vehicle_detected":  bool,
+        "confidence":           float,  # 0.0–1.0
+        "description":          str,
     }
 """
 
@@ -29,28 +32,34 @@ logger = logging.getLogger(__name__)
 
 # Exact prompt from the spec — kept here so it's easy to tune.
 _USER_PROMPT = (
-    'Analyze the person in this frame relative to the vehicle. '
-    'Specifically identify if the person is leaning over a tire or holding a '
-    'long-reaching tool (chalk stick) toward the ground/tire area. '
-    'Separately, identify if any vehicle in the frame has characteristic '
-    '"Street Sweeper" features: oversized side brushes, water spray nozzles, '
-    'or yellow caution lights. '
+    'Analyze this street camera frame (wide-angle, person may appear small/distant) '
+    'for three parking-enforcement events:\n'
+    '1. CHALKING: Is a person holding or extending a stick, chalk, or long tool '
+    'toward the ground, a wheel, or tire area of a parked vehicle? At distance the '
+    'person may appear upright — focus on any extended object toward a wheel.\n'
+    '2. SWEEPER: Does any vehicle show street sweeper features: oversized side '
+    'brushes, water spray nozzles, or yellow caution lights?\n'
+    '3. PE_VEHICLE: Does any vehicle show parking enforcement markings: '
+    'government/city emblems, "PARKING ENFORCEMENT" text, a small enforcement '
+    'cart or scooter, or an officer in uniform visible near the vehicle?\n'
     'Output only a JSON object with: '
     '{ "chalking_detected": boolean, "sweeper_detected": boolean, '
-    '"confidence": float, "description": string }'
+    '"pe_vehicle_detected": boolean, "confidence": float, "description": string }'
 )
 
 _SYSTEM_PROMPT = (
     "You are a parking-enforcement detection AI. "
-    "Analyze camera frames strictly for two behaviours: "
+    "Analyze camera frames strictly for three behaviours: "
     "(1) a person chalking a vehicle's tire, "
-    "(2) a street sweeper vehicle. "
+    "(2) a street sweeper vehicle, "
+    "(3) a parking enforcement vehicle stopped on the street. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
 _FALLBACK = {
     "chalking_detected": False,
     "sweeper_detected": False,
+    "pe_vehicle_detected": False,
     "confidence": 0.0,
     "description": "VLM analysis failed",
 }
@@ -72,6 +81,9 @@ class VLMAnalyzer:
             self._claude = anthropic.Anthropic()
             self._claude_model = claude_model
             logger.info("VLM backend: Claude (%s)", claude_model)
+        elif backend == "mock":
+            self._claude = None  # type: ignore[assignment]
+            logger.warning("VLM backend: MOCK — all detections will be forced True")
         else:
             self._claude = None  # type: ignore[assignment]
             logger.info("VLM backend: Ollama (%s @ %s)", ollama_model, ollama_url)
@@ -80,6 +92,14 @@ class VLMAnalyzer:
 
     def analyze(self, image_bytes: bytes) -> dict:
         """Send a JPEG frame to the VLM and return the parsed JSON result."""
+        if self._backend == "mock":
+            return {
+                "chalking_detected": True,
+                "sweeper_detected": False,
+                "pe_vehicle_detected": True,
+                "confidence": 0.95,
+                "description": "Mock: person leaning toward tire with chalk stick",
+            }
         try:
             if self._backend == "claude":
                 return self._analyze_claude(image_bytes)
@@ -138,7 +158,7 @@ class VLMAnalyzer:
         resp = httpx.post(
             f"{self._ollama_url}/api/generate",
             json=payload,
-            timeout=10.0,
+            timeout=60.0,
         )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
@@ -156,6 +176,7 @@ def _parse_json(text: str) -> dict:
         return {
             "chalking_detected": bool(data.get("chalking_detected", False)),
             "sweeper_detected": bool(data.get("sweeper_detected", False)),
+            "pe_vehicle_detected": bool(data.get("pe_vehicle_detected", False)),
             "confidence": float(data.get("confidence", 0.0)),
             "description": str(data.get("description", "")),
         }

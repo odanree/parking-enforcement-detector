@@ -1,51 +1,48 @@
-# ── Object Detection ─────────────────────────────────────────────────────────
+chalking:
+  cooldown_seconds: 60
+  entry_frames: 10
+  sample_every_n: 30
 detector:
-  model: yolov8n.pt
-  threshold: 0.65          # 65% — prevents ghost alerts from shadows / cats
-  input_width: 1280
   input_height: 720
-  tracked_classes:         # COCO class names
-    - person
-    - truck
-    - motorcycle
-  # Fraction of total frame area (width * height)
-  min_area_fraction: 0.02  # filters birds / tiny objects
-  max_area_fraction: 0.50  # filters vehicle parked right in front of lens
-
-# ── Stationary masking ────────────────────────────────────────────────────────
-# Tracks that haven't moved more than `pixel_threshold` px in `frames` frames
-# are suppressed so your own parked car doesn't fire alerts every 5 s.
+  input_width: 1280
+  max_area_fraction: 0.5
+  min_area_fraction: 0.001
+  model: yolov8n.pt
+  threshold: 0.65
+  tracked_classes:
+  - person
+  - truck
+  - motorcycle
+motion_detector:
+  edge_margin: 50
+  history: 500
+  max_area: 12000
+  min_area: 600
+  seam_margin: 0
+  seam_x: 0
+  var_threshold: 25
+pe_vehicle:
+  cooldown_seconds: 120
+  entry_frames: 8
+  entry_min_px: 60.0
+  stop_px_per_frame: 3.0
+  sustained_frames: 60
 stationary_mask:
   enabled: true
-  pixel_threshold: 15
   frames: 30
-
-# ── Zones ─────────────────────────────────────────────────────────────────────
-# Polygon vertices in [x, y] pixel coordinates at 1280x720.
-# Use scripts/calibrate_zones.py to draw these interactively.
+  pixel_threshold: 15
+sweeper:
+  max_velocity_px_per_frame: 20.0
+  min_velocity_px_per_frame: 3.0
+  sustained_frames: 10
 zones:
   street_zone:
-    # Covers street-side tires of cars parked along the curb.
-    # Adjust to your camera's perspective.
     polygon:
-      - [0, 0]
-      - [1280, 0]
-      - [1280, 300]
-      - [0, 300]
-
-# ── Chalking behavior signature ──────────────────────────────────────────────
-chalking:
-  # Person's bounding-box height must decrease by this fraction to trigger.
-  height_decrease_threshold: 0.30   # 30 %
-  history_frames: 15                # sliding window used to compute baseline
-  # Cooldown before the same track_id can fire again (seconds).
-  cooldown_seconds: 60
-
-# ── Sweeper behavior signature ────────────────────────────────────────────────
-sweeper:
-  # Pixel-per-frame velocity range translated to real-world 5–10 mph.
-  # Calibrate with scripts/calibrate_velocity.py once camera is mounted.
-  min_velocity_px_per_frame: 3.0
-  max_velocity_px_per_frame: 20.0
-  # Number of consecutive frames the velocity must be in range before trigger.
-  sustained_frames: 10
+    - - 0
+      - 0
+    - - 1280
+      - 0
+    - - 1278
+      - 253
+    - - 0
+      - 206

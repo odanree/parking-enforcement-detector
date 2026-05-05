@@ -2,74 +2,57 @@ from __future__ import annotations
 
 import time
 import logging
-from collections import deque
 
 logger = logging.getLogger(__name__)
 
 
 class ChalkingAnalyzer:
-    """Detects the chalking behavioral signature.
+    """Triggers VLM sampling while a person is present in the zone.
 
-    Signature: a person in the street zone whose bounding-box height
-    decreases by ≥ 30 % relative to their own recent baseline — indicating
-    a crouch or forward lean toward a tire.
-
-    Each track_id can only fire once per `cooldown_seconds` to avoid
-    duplicate alerts while the officer is still at the same car.
+    Replaces the bounding-box height-decrease heuristic, which is unreliable
+    at camera distances where the person occupies only a small fraction of the
+    frame.  Instead, samples the VLM periodically and lets it detect whether
+    the person is holding a chalk stick near a tire.
     """
 
     def __init__(
         self,
-        height_decrease_threshold: float = 0.30,
-        history_frames: int = 15,
+        entry_frames: int = 10,
+        sample_every_n: int = 30,
         cooldown_seconds: float = 60.0,
     ) -> None:
-        self._threshold = height_decrease_threshold
-        self._history_frames = history_frames
+        self._entry_frames = entry_frames
+        self._sample_every_n = sample_every_n
         self._cooldown = cooldown_seconds
 
-        # track_id -> deque of recent bounding-box heights
-        self._heights: dict[int, deque[int]] = {}
-        # track_id -> timestamp of last alert
+        self._frame_count: dict[int, int] = {}
         self._last_alert: dict[int, float] = {}
 
-    def update(self, track_id: int, bbox_height: int) -> bool:
-        """Feed one frame's bounding-box height.  Returns True when the
-        chalking signature is confirmed for this track."""
-        history = self._heights.setdefault(track_id, deque(maxlen=self._history_frames))
-        history.append(bbox_height)
+    def update(self, track_id: int) -> bool:
+        """Returns True when this frame should be sent to the VLM.
 
-        if len(history) < max(4, self._history_frames // 3):
+        Fires once the person has been stably tracked for `entry_frames`, then
+        every `sample_every_n` frames thereafter (unless in cooldown).
+        """
+        count = self._frame_count.get(track_id, 0) + 1
+        self._frame_count[track_id] = count
+
+        if count < self._entry_frames:
             return False
 
-        # Baseline = average of the first third of the history window
-        baseline_window = list(history)[: len(history) // 3]
-        baseline = sum(baseline_window) / len(baseline_window)
-
-        if baseline == 0:
+        if (count - self._entry_frames) % self._sample_every_n != 0:
             return False
 
-        current = history[-1]
-        decrease = (baseline - current) / baseline
-
-        if decrease < self._threshold:
+        if time.monotonic() - self._last_alert.get(track_id, 0) < self._cooldown:
             return False
 
-        now = time.monotonic()
-        if now - self._last_alert.get(track_id, 0) < self._cooldown:
-            return False
-
-        self._last_alert[track_id] = now
-        logger.info(
-            "Chalking signature — track %d height ↓%.0f%% (baseline=%d → current=%d)",
-            track_id,
-            decrease * 100,
-            int(baseline),
-            current,
-        )
         return True
 
+    def on_alert(self, track_id: int) -> None:
+        """Call after a confirmed chalking alert to start the per-track cooldown."""
+        self._last_alert[track_id] = time.monotonic()
+        logger.info("Chalking alert confirmed — track %d cooldown started", track_id)
+
     def evict(self, track_id: int) -> None:
-        """Call when a track disappears to free memory."""
-        self._heights.pop(track_id, None)
+        self._frame_count.pop(track_id, None)
         self._last_alert.pop(track_id, None)

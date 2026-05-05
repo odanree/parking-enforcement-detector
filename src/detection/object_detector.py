@@ -10,7 +10,11 @@ from ultralytics import YOLO
 logger = logging.getLogger(__name__)
 
 # COCO class names the spec requires us to track
-_TRACKED_CLASSES = {"person", "truck", "motorcycle"}
+_TRACKED_CLASSES = {"person", "truck", "motorcycle", "car"}
+
+# Cars are exempt from stationary masking — a car that *stops* is the signal
+# we want for PE vehicle detection, not noise to suppress.
+_STATIONARY_EXEMPT = {"car"}
 
 
 @dataclass
@@ -52,9 +56,14 @@ class ObjectDetector:
         max_area_fraction: float = 0.50,
         stationary_px: int = 15,
         stationary_frames: int = 30,
+        tracker_config: str = "config/bytetrack.yaml",
     ) -> None:
         self._model = YOLO(model_path)
         self._threshold = threshold
+        # ByteTrack low threshold: fed to the tracker so it can re-associate
+        # partly-occluded tracks without creating new false-positive tracks.
+        self._track_low_thresh = max(0.05, threshold * 0.40)
+        self._tracker_config = tracker_config
         self._input_size = input_size
         self._min_area = min_area_fraction
         self._max_area = max_area_fraction
@@ -68,7 +77,10 @@ class ObjectDetector:
         self._min_px = min_area_fraction * frame_px
         self._max_px = max_area_fraction * frame_px
 
-        logger.info("Detector ready — model=%s threshold=%.2f", model_path, threshold)
+        logger.info(
+            "Detector ready — model=%s high=%.2f low=%.2f tracker=%s",
+            model_path, threshold, self._track_low_thresh, tracker_config,
+        )
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
@@ -77,7 +89,8 @@ class ObjectDetector:
         results = self._model.track(
             resized,
             persist=True,
-            conf=self._threshold,
+            conf=self._track_low_thresh,
+            tracker=self._tracker_config,
             classes=self._class_ids(),
             verbose=False,
         )
@@ -113,7 +126,7 @@ class ObjectDetector:
                 area_fraction=area_frac,
             )
 
-            if self._is_stationary(det.track_id, det.center):
+            if class_name not in _STATIONARY_EXEMPT and self._is_stationary(det.track_id, det.center):
                 continue
 
             detections.append(det)
