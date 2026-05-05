@@ -1,8 +1,8 @@
 """Video file source — drop-in replacement for RTSPHandler during testing.
 
-Reads frames from a local video file at the camera's native fps (or a
-configurable playback speed multiplier).  Loops automatically so the clip
-keeps cycling without restarting the pipeline.
+Forward: sequential cap.read() at native fps × speed.
+Reverse: chunk-based — reads REVERSE_CHUNK frames forward into a buffer then
+plays them backwards.  One I-frame decode per chunk, not per frame.
 
 Usage: set VIDEO_PATH=/path/to/clip.mp4 in .env — pipeline.py picks it up.
 """
@@ -13,10 +13,14 @@ import queue
 import threading
 import time
 import logging
+from pathlib import Path
 
 import cv2
 
 logger = logging.getLogger(__name__)
+
+_VIDEO_EXTS    = {".mp4", ".avi", ".mkv", ".mov", ".ts", ".m4v"}
+_REVERSE_CHUNK = 20
 
 
 class VideoFileHandler:
@@ -27,15 +31,21 @@ class VideoFileHandler:
         speed: float = 1.0,
         queue_size: int = 2,
     ) -> None:
-        self._path = path
-        self._loop = loop
-        self._speed = speed
+        self._path      = path
+        self._loop      = loop
+        self._speed     = speed
+        self._direction: int = 1
+        self._seek_frames: int = 0   # set by seek(); applied on next loop tick
+        self._current_fps: float = 20.0
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._stop = threading.Event()
+        self._stop   = threading.Event()
+        self._paused = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop_fn, daemon=True, name="video-file")
+        self._thread = threading.Thread(
+            target=self._loop_fn, daemon=True, name="video-file"
+        )
         self._thread.start()
         mode = "looping" if self._loop else "single-pass"
         logger.info("Video file source (%s) → %s  speed=%.1fx", mode, self._path, self._speed)
@@ -45,30 +55,99 @@ class VideoFileHandler:
         if self._thread:
             self._thread.join(timeout=5)
 
+    def set_speed(self, speed: float) -> None:
+        self._speed = max(0.1, speed)
+
+    def set_direction(self, direction: int) -> None:
+        self._direction = 1 if direction >= 0 else -1
+
+    def seek(self, frames: int) -> None:
+        """Offset playback position by +/- frames. Applied on the next loop tick."""
+        self._seek_frames = frames
+
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+
     def get_frame(self, timeout: float = 2.0):
         try:
             return self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
 
+    def _files(self) -> list[str]:
+        p = Path(self._path)
+        if p.is_dir():
+            files = sorted(f for f in p.iterdir() if f.suffix.lower() in _VIDEO_EXTS)
+            if not files:
+                logger.error("No video files found in %s", self._path)
+            return [str(f) for f in files]
+        return [self._path]
+
     def _loop_fn(self) -> None:
         while not self._stop.is_set():
-            cap = cv2.VideoCapture(self._path)
-            if not cap.isOpened():
-                logger.error("Cannot open video file: %s", self._path)
-                return
+            files = self._files()
+            ordered = list(reversed(files)) if self._direction < 0 else files
+            for file_path in ordered:
+                if self._stop.is_set():
+                    break
+                prev_dir = self._direction
+                self._play_file(file_path)
+                # Direction changed mid-file — restart outer loop immediately
+                # so the playlist order and start position are recalculated.
+                if self._direction != prev_dir:
+                    break
 
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            frame_delay = 1.0 / (fps * self._speed)
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            logger.info("Loaded %s  %.0f fps  %d frames", self._path, fps, total)
+            if not self._loop:
+                logger.info("Video playback finished — pipeline will idle")
+                break
 
+            logger.info("Video playlist looping…")
+
+    def _play_file(self, file_path: str) -> None:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            logger.error("Cannot open video file: %s", file_path)
+            return
+
+        fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if total == 0:
+            logger.warning("Skipping file with no frames: %s", file_path)
+            cap.release()
+            return
+
+        self._current_fps = fps
+        logger.info("Playing %s  %.0f fps  %d frames  dir=%+d",
+                    file_path, fps, total, self._direction)
+
+        # ── Forward ───────────────────────────────────────────────────────────
+        if self._direction >= 0:
             while not self._stop.is_set():
-                t0 = time.monotonic()
-                ok, frame = cap.read()
+                while self._paused.is_set() and not self._stop.is_set():
+                    time.sleep(0.05)
+                if self._stop.is_set():
+                    break
+                if self._direction < 0:
+                    break  # direction changed mid-file
 
+                # Apply pending seek (thread-safe: int assignment is atomic in CPython)
+                if self._seek_frames:
+                    delta = self._seek_frames
+                    self._seek_frames = 0
+                    pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(total - 1, pos + delta)))
+
+                t0          = time.monotonic()
+                fps         = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                frame_delay = 1.0 / (fps * self._speed)
+
+                ok, frame = cap.read()
                 if not ok:
-                    break   # end of file — outer loop will restart if looping
+                    break
 
                 if self._queue.full():
                     try:
@@ -78,14 +157,57 @@ class VideoFileHandler:
                 self._queue.put(frame)
 
                 elapsed = time.monotonic() - t0
-                sleep = frame_delay - elapsed
+                sleep   = frame_delay - elapsed
                 if sleep > 0:
                     time.sleep(sleep)
 
-            cap.release()
+        # ── Reverse (chunk-based) ─────────────────────────────────────────────
+        else:
+            head = total  # exclusive end of the next chunk
+            while not self._stop.is_set() and head > 0:
+                while self._paused.is_set() and not self._stop.is_set():
+                    time.sleep(0.05)
+                if self._stop.is_set():
+                    break
+                if self._direction >= 0:
+                    break  # direction changed mid-file
 
-            if not self._loop:
-                logger.info("Video file finished — pipeline will idle")
-                break
+                chunk_start = max(0, head - _REVERSE_CHUNK)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
 
-            logger.info("Video file looping…")
+                frames: list = []
+                for _ in range(head - chunk_start):
+                    ok, f = cap.read()
+                    if not ok:
+                        break
+                    frames.append(f)
+
+                if not frames:
+                    break
+
+                fps_now     = cap.get(cv2.CAP_PROP_FPS) or fps
+                frame_delay = 1.0 / (fps_now * self._speed)
+
+                for frame in reversed(frames):
+                    while self._paused.is_set() and not self._stop.is_set():
+                        time.sleep(0.05)
+                    if self._stop.is_set() or self._direction >= 0:
+                        cap.release()
+                        return
+
+                    t0 = time.monotonic()
+                    if self._queue.full():
+                        try:
+                            self._queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                    self._queue.put(frame)
+
+                    elapsed = time.monotonic() - t0
+                    sleep   = frame_delay - elapsed
+                    if sleep > 0:
+                        time.sleep(sleep)
+
+                head = chunk_start
+
+        cap.release()
