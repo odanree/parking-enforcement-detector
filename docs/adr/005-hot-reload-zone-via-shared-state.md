@@ -1,51 +1,61 @@
-# ADR 005 — Zone hot-reload via shared AppState (no process restart)
+# ADR 005 — Live zone editor in dashboard with hot-reload (no process restart)
 
 **Status**: Accepted
 **Date**: 2026-05-04
 
 ## Context
 
-Zone calibration is iterative: place the polygon, watch the feed, adjust,
-repeat. If each adjustment requires restarting the uvicorn process the feedback
-loop takes ~15 s per iteration (restart + YOLO model load + stream reconnect).
+Zone calibration is iterative: place the polygon over the curb area, watch the
+live feed to see if detections fire in the right place, adjust, repeat. Two
+problems with the initial YAML-only approach:
 
-Two options to make the zone update without a restart:
+1. **No visual editor** — the user must manually guess pixel coordinates in
+   `config/detection.yaml`, restart, and look at the feed to see where the box
+   landed. Non-technical users (or anyone calibrating at night under camera
+   distortion) cannot do this reliably.
 
-1. **File watch** — pipeline polls `config/detection.yaml` for mtime changes,
-   reloads when the file changes. Simple, but adds I/O on every frame and
-   creates a race condition if the file is partially written.
-2. **Shared in-process state** — `AppState` holds the canonical zone polygon.
-   The API endpoint updates `state.zone_polygon` and increments a version
-   counter. The pipeline compares the version counter each frame and rebuilds
-   `ZoneFilter` only when it changes.
+2. **Slow feedback loop** — each YAML edit requires restarting uvicorn (~15 s:
+   uvicorn restart + YOLO model load + RTSP stream reconnect). At 5–10 iterations
+   to dial in a polygon, that's 2+ minutes of dead time.
 
 ## Decision
 
-Use the version-counter approach via `AppState`. The pipeline checks
-`state.get_zone_version()` each frame (a single lock + integer read, ~1 μs)
-and reconstructs `ZoneFilter` only when the counter changes. The API endpoint
-also persists the new polygon to `config/detection.yaml` so the updated zone
-survives a process restart.
+Build an interactive polygon editor directly into the dashboard video feed, and
+make zone changes take effect without restarting the process.
 
-The zone editor UI in the dashboard posts to `POST /api/zone`, which updates
-state and saves the file atomically from the FastAPI thread — no file-watch
-race condition.
+**Zone editor UI** (canvas overlay in the browser):
+- An "Edit Zone" button switches the video overlay canvas to interactive mode
+- Click on the live video to add polygon vertices; drag to reposition; right-click to remove
+- The polygon is drawn on top of the live annotated feed in real time so the
+  user can see exactly which part of the frame the zone covers
+- Save / Cancel buttons: Save posts the polygon to `POST /api/zone`, Cancel reverts
+
+**Hot-reload mechanism** (shared `AppState`):
+- `AppState` holds the canonical zone polygon at runtime and a monotonic version counter
+- `POST /api/zone` updates `state.zone_polygon`, increments `_zone_version`, and
+  persists the polygon to `config/detection.yaml` for restart durability
+- The pipeline checks `state.get_zone_version()` each frame (one lock + integer
+  read, ~1 μs); when the version changes it rebuilds `ZoneFilter` in place —
+  the RTSP stream and YOLO model are untouched
+
+This was preferred over a file-watch approach (which adds per-frame I/O and a
+partial-write race condition) and over a separate CLI calibration tool (which
+wouldn't show the live feed).
 
 ## Consequences
 
 **Positive:**
-- Zone takes effect within one frame (~66 ms) after clicking Save
-- No process restart means YOLO model stays loaded and the RTSP stream stays
-  open — zero interruption to monitoring during calibration
-- Single source of truth: `AppState.zone_polygon` is authoritative at runtime;
-  `config/detection.yaml` is authoritative at startup
-- Version counter is cheap: one mutex acquisition per frame regardless of zone
-  size or polygon complexity
+- Full calibration loop (draw polygon → see effect on live feed) takes ~1 s vs ~15 s
+- Non-technical users can calibrate without touching YAML or restarting anything
+- Zone takes effect within one frame (~66 ms at 15 fps) after clicking Save
+- YOLO model stays loaded and RTSP stream stays open during calibration
+- Persisted to YAML automatically — zone survives process restarts
 
 **Negative:**
-- If the process crashes between the API updating `AppState` and the file write
-  completing, the in-memory zone and the YAML file can diverge for that one
-  frame — the YAML write uses Python's built-in buffering so partial writes are
-  possible in theory (acceptable risk for a home-use tool)
-- Headless (`python -m src.main`) mode reads the zone only from YAML at
-  startup; live zone editing requires the web dashboard
+- Zone editor only available when running the web dashboard (`uvicorn`);
+  headless mode (`python -m src.main`) reads zone from YAML at startup only
+- If the process crashes between the API updating `AppState` and the YAML write
+  completing, the runtime zone and the file can diverge for that session
+  (acceptable risk for a home-use tool; a write-then-swap pattern would fix it)
+- Canvas polygon editor does not support snapping or grid alignment — precise
+  pixel-boundary zones require manual YAML editing after a rough UI calibration
