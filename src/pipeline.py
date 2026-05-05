@@ -42,10 +42,9 @@ def _annotate(
     frame: np.ndarray,
     all_dets: list[Detection],
     zone_dets: list[Detection],
-    zone_filter: ZoneFilter,
     alert_ids: set[int],
 ) -> np.ndarray:
-    out = zone_filter.draw_zones(frame.copy())
+    out = frame.copy()
 
     zone_id_set = {d.track_id for d in zone_dets}
 
@@ -209,7 +208,7 @@ def run(state=None) -> None:
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
-                annotated = _annotate(frame, all_dets, zone_dets, zone_filter, alert_ids)
+                annotated = _annotate(frame, all_dets, zone_dets, alert_ids)
                 state.push_frame(_encode_jpeg(annotated))
 
     except KeyboardInterrupt:
