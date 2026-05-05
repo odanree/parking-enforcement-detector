@@ -1,0 +1,14 @@
+.env
+*.pt
+*.onnx
+__pycache__/
+*.pyc
+.venv/
+venv/
+snapshots/*
+!snapshots/.gitkeep
+logs/*
+!logs/.gitkeep
+.pytest_cache/
+dist/
+*.egg-info/

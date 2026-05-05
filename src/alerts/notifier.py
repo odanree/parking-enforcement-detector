@@ -1,0 +1,142 @@
+"""Alert dispatcher.
+
+Supports:
+  • Home Assistant webhook  (separate IDs per event type so HA automations
+                             can distinguish chalking from sweeper)
+  • Generic HTTP POST       (any third-party webhook)
+  • Snapshot saver          (annotated JPEG written to disk alongside every alert)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import httpx
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class Notifier:
+    def __init__(
+        self,
+        config: dict,
+        ha_webhook_base: str = "",
+        ha_token: str = "",
+    ) -> None:
+        self._cfg = config
+        self._ha_base = ha_webhook_base.rstrip("/")
+        self._ha_token = ha_token
+        self._snapshot_dir = Path(config.get("snapshot_dir", "snapshots"))
+        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # event_type -> last fire timestamp (monotonic)
+        self._last_fire: dict[str, float] = {}
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def send(
+        self,
+        event_type: str,        # "chalking" | "sweeper"
+        vlm_result: dict,
+        frame: np.ndarray,
+        bbox: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        """Fire all configured alert channels if cooldown has elapsed."""
+        if vlm_result.get("confidence", 0.0) < self._cfg.get("min_confidence", 0.70):
+            logger.debug("Alert suppressed — confidence below threshold")
+            return
+
+        cooldown = self._cfg.get("cooldown_seconds", {}).get(event_type, 300)
+        now = time.monotonic()
+        if now - self._last_fire.get(event_type, 0) < cooldown:
+            logger.debug("Alert suppressed — cooldown active for '%s'", event_type)
+            return
+        self._last_fire[event_type] = now
+
+        snapshot_path = None
+        if self._cfg.get("save_snapshot", True):
+            snapshot_path = self._save_snapshot(event_type, frame, bbox)
+
+        payload = self._build_payload(event_type, vlm_result, snapshot_path)
+
+        if self._cfg.get("home_assistant", {}).get("enabled"):
+            self._fire_ha(event_type, payload)
+
+        if self._cfg.get("generic_webhook", {}).get("enabled"):
+            self._fire_generic(payload)
+
+        logger.info(
+            "Alert fired: %s  confidence=%.2f  snapshot=%s",
+            event_type,
+            vlm_result.get("confidence", 0),
+            snapshot_path or "none",
+        )
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _build_payload(
+        self, event_type: str, vlm_result: dict, snapshot_path: Path | None
+    ) -> dict:
+        return {
+            "event_type": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "confidence": vlm_result.get("confidence"),
+            "description": vlm_result.get("description"),
+            "snapshot": str(snapshot_path) if snapshot_path else None,
+        }
+
+    def _fire_ha(self, event_type: str, payload: dict) -> None:
+        ha_cfg = self._cfg["home_assistant"]
+        webhook_id_key = f"{event_type}_webhook_id"
+        webhook_id = ha_cfg.get(webhook_id_key, f"parking_{event_type}_detected")
+        url = f"{self._ha_base}/api/webhook/{webhook_id}"
+        headers = {"Authorization": f"Bearer {self._ha_token}"} if self._ha_token else {}
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=5.0)
+            resp.raise_for_status()
+            logger.debug("HA webhook OK: %s", url)
+        except Exception:
+            logger.exception("HA webhook failed: %s", url)
+
+    def _fire_generic(self, payload: dict) -> None:
+        url = self._cfg["generic_webhook"].get("url", "")
+        if not url:
+            return
+        headers = self._cfg["generic_webhook"].get("headers", {})
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=5.0)
+            resp.raise_for_status()
+        except Exception:
+            logger.exception("Generic webhook failed: %s", url)
+
+    def _save_snapshot(
+        self,
+        event_type: str,
+        frame: np.ndarray,
+        bbox: tuple[int, int, int, int] | None,
+    ) -> Path:
+        annotated = frame.copy()
+        if bbox:
+            x1, y1, x2, y2 = bbox
+            color = (0, 0, 255) if event_type == "chalking" else (0, 165, 255)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(
+                annotated,
+                event_type.upper(),
+                (x1, max(y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                color,
+                2,
+            )
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self._snapshot_dir / f"{event_type}_{ts}.jpg"
+        cv2.imwrite(str(path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return path

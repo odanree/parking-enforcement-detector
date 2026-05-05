@@ -1,0 +1,13 @@
+# ── Street-sweeper schedule ───────────────────────────────────────────────────
+# Sweeper VLM analysis only activates during these windows.
+# Keeps CPU/API usage near zero on non-sweep days.
+#
+# weekday: 0=Monday … 6=Sunday
+sweeper_schedule:
+  - weekday: 1          # Tuesday
+    start_time: "08:00"
+    end_time: "13:00"
+  # Add more entries for alternating-side or bi-weekly schedules:
+  # - weekday: 4        # Friday
+  #   start_time: "08:00"
+  #   end_time: "13:00"

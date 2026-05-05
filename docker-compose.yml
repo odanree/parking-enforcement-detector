@@ -1,0 +1,17 @@
+services:
+  detector:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./snapshots:/app/snapshots
+      - ./logs:/app/logs
+    network_mode: host   # needed to reach RTSP camera on LAN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]   # remove block if running CPU-only
