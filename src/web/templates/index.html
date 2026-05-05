@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parking Enforcement Detector</title>
+  <link rel="stylesheet" href="/static/css/dashboard.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">&#x1F6D1; Parking Enforcement Detector</span>
+    <div class="header-badges">
+      <span class="badge" id="badge-pipeline">&#x25CF; Pipeline</span>
+      <span class="badge" id="badge-sweep">&#x25CF; Sweep Window</span>
+      <span class="badge badge-ws" id="badge-ws">&#x25CF; Stream</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- ── Video feed ──────────────────────────────────────────────────── -->
+    <section class="video-panel">
+      <canvas id="feed" width="1280" height="720"></canvas>
+      <div class="no-signal" id="no-signal">Waiting for stream&hellip;</div>
+    </section>
+
+    <!-- ── Side panel ─────────────────────────────────────────────────── -->
+    <aside class="side-panel">
+
+      <div class="card">
+        <h2>Stats</h2>
+        <div class="stat-grid">
+          <div class="stat-block">
+            <span class="stat-value" id="stat-chalking">0</span>
+            <span class="stat-label">Chalking alerts</span>
+          </div>
+          <div class="stat-block">
+            <span class="stat-value" id="stat-sweeper">0</span>
+            <span class="stat-label">Sweeper alerts</span>
+          </div>
+          <div class="stat-block wide">
+            <span class="stat-value mono" id="stat-uptime">00:00:00</span>
+            <span class="stat-label">Uptime</span>
+          </div>
+          <div class="stat-block wide">
+            <span class="stat-value mono small" id="stat-last-chalking">&mdash;</span>
+            <span class="stat-label">Last chalking</span>
+          </div>
+          <div class="stat-block wide">
+            <span class="stat-value mono small" id="stat-last-sweeper">&mdash;</span>
+            <span class="stat-label">Last sweeper</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card events-card">
+        <h2>Event Log <span class="event-count" id="event-count">0</span></h2>
+        <ul class="event-list" id="event-list">
+          <li class="event-empty">No alerts yet</li>
+        </ul>
+      </div>
+
+    </aside>
+  </main>
+
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
