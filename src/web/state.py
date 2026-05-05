@@ -33,6 +33,20 @@ class AppState:
         self.sweep_window_active: bool = False
         self.pipeline_running: bool = False
         self._start_time: float = time.monotonic()
+        # Zone polygon in frame coordinates — pipeline watches _zone_version
+        self.zone_polygon: list[list[int]] = []
+        self._zone_version: int = 0
+
+    # ── Zone ─────────────────────────────────────────────────────────────────
+
+    def update_zone(self, polygon: list[list[int]]) -> None:
+        with self._lock:
+            self.zone_polygon = polygon
+            self._zone_version += 1
+
+    def get_zone_version(self) -> int:
+        with self._lock:
+            return self._zone_version
 
     # ── Pipeline writes ───────────────────────────────────────────────────────
 

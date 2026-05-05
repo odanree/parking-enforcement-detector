@@ -37,7 +37,6 @@ function connectVideoStream() {
     badgeWs.textContent = '● Stream';
     badgeWs.className = 'badge badge-ws disconnected';
     noSignal.classList.remove('hidden');
-    // Auto-reconnect after 3 s
     setTimeout(connectVideoStream, 3000);
   };
 
@@ -124,27 +123,180 @@ async function fetchEvents() {
     if (!events.length) return;
 
     const newest = events[0].timestamp;
-    if (newest <= lastEventTs) return;   // nothing new
+    if (newest <= lastEventTs) return;
     lastEventTs = newest;
 
-    // Remove placeholder
     const empty = eventList.querySelector('.event-empty');
     if (empty) empty.remove();
 
-    // Prepend only new events (those newer than the previous known newest)
     const newOnes = events.filter(e => e.timestamp > (lastEventTs - 0.001));
     newOnes.forEach(ev => {
       eventList.insertBefore(buildEventItem(ev), eventList.firstChild);
     });
 
-    // Trim list to 30 items
-    while (eventList.children.length > 30) {
-      eventList.removeChild(eventList.lastChild);
-    }
-
+    while (eventList.children.length > 30) eventList.removeChild(eventList.lastChild);
     eventCount.textContent = events.length;
   } catch (_) { /* ignore */ }
 }
 
 fetchEvents();
 setInterval(fetchEvents, 3000);
+
+// ── Zone editor ───────────────────────────────────────────────────────────────
+const overlay     = document.getElementById('zone-overlay');
+const octx        = overlay.getContext('2d');
+const btnEdit     = document.getElementById('btn-edit-zone');
+const zoneControls = document.getElementById('zone-controls');
+const btnSave     = document.getElementById('btn-save-zone');
+const btnCancel   = document.getElementById('btn-cancel-zone');
+
+const W = overlay.width;   // 1280
+const H = overlay.height;  // 720
+const HIT_R = 18;          // vertex hit radius in canvas pixels
+
+let editing   = false;
+let points    = [];   // [[x,y], ...] in frame coordinates
+let saved     = [];   // snapshot of points before edit session
+let dragIdx   = -1;
+
+// Convert a MouseEvent to canvas (frame) coordinates
+function toFrame(e) {
+  const r = overlay.getBoundingClientRect();
+  return [
+    Math.round((e.clientX - r.left) * (W / r.width)),
+    Math.round((e.clientY - r.top)  * (H / r.height)),
+  ];
+}
+
+function hitIndex(cx, cy) {
+  return points.findIndex(([px, py]) => {
+    const dx = px - cx, dy = py - cy;
+    return Math.sqrt(dx * dx + dy * dy) < HIT_R;
+  });
+}
+
+function drawOverlay() {
+  octx.clearRect(0, 0, W, H);
+  if (!points.length) return;
+
+  // Polygon fill
+  octx.beginPath();
+  octx.moveTo(points[0][0], points[0][1]);
+  for (let i = 1; i < points.length; i++) octx.lineTo(points[i][0], points[i][1]);
+  octx.closePath();
+  octx.fillStyle = editing ? 'rgba(0,230,118,0.10)' : 'rgba(0,230,118,0.06)';
+  octx.fill();
+
+  // Polygon outline
+  octx.strokeStyle = editing ? '#00e676' : '#00e676aa';
+  octx.lineWidth   = editing ? 2 : 1.5;
+  octx.setLineDash(editing ? [] : [6, 4]);
+  octx.stroke();
+  octx.setLineDash([]);
+
+  if (!editing) return;
+
+  // Vertex handles
+  points.forEach(([px, py], i) => {
+    octx.beginPath();
+    octx.arc(px, py, 7, 0, Math.PI * 2);
+    octx.fillStyle   = i === dragIdx ? '#ffffff' : '#00e676';
+    octx.strokeStyle = '#000';
+    octx.lineWidth   = 1.5;
+    octx.fill();
+    octx.stroke();
+  });
+}
+
+// Load current zone from API
+async function loadZone() {
+  try {
+    const res  = await fetch('/api/zone');
+    const data = await res.json();
+    points = data.polygon || [];
+    drawOverlay();
+  } catch (_) {}
+}
+
+loadZone();
+
+function enterEditMode() {
+  editing = true;
+  saved   = points.map(p => [...p]);
+  overlay.classList.add('editing');
+  btnEdit.classList.add('active');
+  btnEdit.textContent = 'Editing…';
+  zoneControls.classList.remove('hidden');
+  drawOverlay();
+}
+
+function exitEditMode() {
+  editing = false;
+  dragIdx = -1;
+  overlay.classList.remove('editing');
+  btnEdit.classList.remove('active');
+  btnEdit.textContent = 'Edit Zone';
+  zoneControls.classList.add('hidden');
+  drawOverlay();
+}
+
+btnEdit.addEventListener('click', () => {
+  if (!editing) enterEditMode();
+});
+
+btnCancel.addEventListener('click', () => {
+  points = saved.map(p => [...p]);
+  exitEditMode();
+});
+
+btnSave.addEventListener('click', async () => {
+  if (points.length < 3) {
+    alert('Zone needs at least 3 points.');
+    return;
+  }
+  try {
+    const res = await fetch('/api/zone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ polygon: points }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    exitEditMode();
+  } catch (err) {
+    alert('Save failed: ' + err.message);
+  }
+});
+
+// Click → add point (unless we just finished a drag)
+overlay.addEventListener('click', (e) => {
+  if (!editing || dragIdx !== -1) return;
+  const [cx, cy] = toFrame(e);
+  if (hitIndex(cx, cy) !== -1) return;  // clicked an existing vertex
+  points.push([cx, cy]);
+  drawOverlay();
+});
+
+// Right-click → remove nearest vertex
+overlay.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (!editing) return;
+  const [cx, cy] = toFrame(e);
+  const idx = hitIndex(cx, cy);
+  if (idx !== -1) { points.splice(idx, 1); drawOverlay(); }
+});
+
+overlay.addEventListener('mousedown', (e) => {
+  if (!editing || e.button !== 0) return;
+  const [cx, cy] = toFrame(e);
+  dragIdx = hitIndex(cx, cy);
+});
+
+overlay.addEventListener('mousemove', (e) => {
+  if (!editing || dragIdx === -1) return;
+  const [cx, cy] = toFrame(e);
+  points[dragIdx] = [cx, cy];
+  drawOverlay();
+});
+
+overlay.addEventListener('mouseup', () => { dragIdx = -1; });
+overlay.addEventListener('mouseleave', () => { dragIdx = -1; });

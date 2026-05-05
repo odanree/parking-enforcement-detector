@@ -105,9 +105,12 @@ def run(state=None) -> None:
         stationary_frames=mask_cfg.get("frames", 30),
     )
 
-    zone_filter = ZoneFilter(
-        zones={name: data["polygon"] for name, data in cfg_det["zones"].items()}
+    initial_polygon = (
+        state.zone_polygon if (state and state.zone_polygon)
+        else cfg_det["zones"]["street_zone"]["polygon"]
     )
+    zone_filter = ZoneFilter(zones={"street_zone": initial_polygon})
+    _zone_version = state.get_zone_version() if state else -1
 
     chalking = ChalkingAnalyzer(
         height_decrease_threshold=chalk_cfg["height_decrease_threshold"],
@@ -149,6 +152,14 @@ def run(state=None) -> None:
             frame = stream.get_frame()
             if frame is None:
                 continue
+
+            # Hot-reload zone when updated via the dashboard
+            if state:
+                v = state.get_zone_version()
+                if v != _zone_version:
+                    zone_filter = ZoneFilter(zones={"street_zone": state.zone_polygon})
+                    _zone_version = v
+                    logger.info("Zone reloaded from dashboard")
 
             frame_count += 1
             all_dets = detector.detect(frame)

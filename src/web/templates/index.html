@@ -19,8 +19,20 @@
   <main>
     <!-- ── Video feed ──────────────────────────────────────────────────── -->
     <section class="video-panel">
-      <canvas id="feed" width="1280" height="720"></canvas>
-      <div class="no-signal" id="no-signal">Waiting for stream&hellip;</div>
+      <div class="canvas-wrap">
+        <canvas id="feed" width="1280" height="720"></canvas>
+        <canvas id="zone-overlay" width="1280" height="720"></canvas>
+        <div class="no-signal" id="no-signal">Waiting for stream&hellip;</div>
+      </div>
+
+      <div class="video-toolbar">
+        <button class="btn-zone" id="btn-edit-zone">Edit Zone</button>
+        <div class="zone-controls hidden" id="zone-controls">
+          <span class="zone-hint">Click&nbsp;to add &nbsp;·&nbsp; Drag&nbsp;to move &nbsp;·&nbsp; Right-click&nbsp;to remove</span>
+          <button class="btn-save" id="btn-save-zone">Save</button>
+          <button class="btn-cancel" id="btn-cancel-zone">Cancel</button>
+        </div>
+      </div>
     </section>
 
     <!-- ── Side panel ─────────────────────────────────────────────────── -->
