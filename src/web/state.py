@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import threading
 from collections import deque
+from typing import Deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -16,9 +17,10 @@ from typing import Optional
 @dataclass
 class Event:
     timestamp: float
-    event_type: str     # "chalking" | "sweeper"
+    event_type: str     # "chalking" | "sweeper" | "pe_vehicle"
     confidence: float
     description: str
+    snapshot: Optional[str] = None   # filename only, e.g. "chalking_20240101_120000.jpg"
 
 
 class AppState:
@@ -36,6 +38,73 @@ class AppState:
         # Zone polygon in frame coordinates — pipeline watches _zone_version
         self.zone_polygon: list[list[int]] = []
         self._zone_version: int = 0
+        self.paused: bool = False
+        self.motion_detect_enabled: bool = False
+        self.privacy_mode: bool = False
+        self.privacy_regions: list[list[int]] = []  # [[x1,y1,x2,y2], ...]
+        self._stream = None   # VideoFileHandler reference, set by pipeline
+        self._fps_times: Deque[float] = deque()  # monotonic timestamps of recent frames
+
+    # ── Playback control ─────────────────────────────────────────────────────
+
+    def set_stream(self, stream) -> None:
+        self._stream = stream
+
+    def set_playback_speed(self, speed: float) -> float:
+        speed = max(0.1, min(16.0, speed))
+        if self._stream and hasattr(self._stream, 'set_speed'):
+            self._stream.set_speed(speed)
+        return speed
+
+    def get_playback_speed(self) -> float:
+        if self._stream and hasattr(self._stream, '_speed'):
+            return self._stream._speed
+        return 1.0
+
+    def seek_playback(self, seconds: float) -> None:
+        """Seek by ±seconds relative to current position."""
+        if self._stream and hasattr(self._stream, 'seek'):
+            fps = getattr(self._stream, '_current_fps', 20.0)
+            self._stream.seek(int(seconds * fps))
+
+    def set_playback_direction(self, direction: int) -> int:
+        direction = 1 if direction >= 0 else -1
+        if self._stream and hasattr(self._stream, 'set_direction'):
+            self._stream.set_direction(direction)
+        return direction
+
+    def get_playback_direction(self) -> int:
+        if self._stream and hasattr(self._stream, '_direction'):
+            return self._stream._direction
+        return 1
+
+    def toggle_pause(self) -> bool:
+        with self._lock:
+            self.paused = not self.paused
+            if self._stream and hasattr(self._stream, 'pause'):
+                if self.paused:
+                    self._stream.pause()
+                else:
+                    self._stream.resume()
+            return self.paused
+
+    def toggle_motion_detect(self) -> bool:
+        with self._lock:
+            self.motion_detect_enabled = not self.motion_detect_enabled
+            return self.motion_detect_enabled
+
+    def toggle_privacy(self) -> bool:
+        with self._lock:
+            self.privacy_mode = not self.privacy_mode
+            return self.privacy_mode
+
+    def update_privacy_regions(self, regions: list[list[int]]) -> None:
+        with self._lock:
+            self.privacy_regions = regions
+
+    def get_privacy_regions(self) -> list[list[int]]:
+        with self._lock:
+            return list(self.privacy_regions)
 
     # ── Zone ─────────────────────────────────────────────────────────────────
 
@@ -50,11 +119,29 @@ class AppState:
 
     # ── Pipeline writes ───────────────────────────────────────────────────────
 
+    def tick_fps(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._fps_times.append(now)
+            cutoff = now - 1.0  # rolling 1-second window
+            while self._fps_times and self._fps_times[0] < cutoff:
+                self._fps_times.popleft()
+
+    def get_fps(self) -> float:
+        with self._lock:
+            return float(len(self._fps_times))
+
     def push_frame(self, jpeg: bytes) -> None:
         with self._lock:
             self.latest_frame = jpeg
 
-    def record_alert(self, event_type: str, confidence: float, description: str) -> None:
+    def record_alert(
+        self,
+        event_type: str,
+        confidence: float,
+        description: str,
+        snapshot: str | None = None,
+    ) -> None:
         with self._lock:
             self.events.appendleft(
                 Event(
@@ -62,6 +149,7 @@ class AppState:
                     event_type=event_type,
                     confidence=confidence,
                     description=description,
+                    snapshot=snapshot,
                 )
             )
             if event_type == "chalking":
@@ -82,12 +170,18 @@ class AppState:
             uptime = int(time.monotonic() - self._start_time)
             return {
                 "pipeline_running": self.pipeline_running,
+                "paused": self.paused,
+                "motion_detect_enabled": self.motion_detect_enabled,
+                "privacy_mode": self.privacy_mode,
                 "sweep_window_active": self.sweep_window_active,
                 "total_chalking": self._total_chalking,
                 "total_sweeper": self._total_sweeper,
                 "last_chalking": self._last_chalking,
                 "last_sweeper": self._last_sweeper,
                 "uptime_seconds": uptime,
+                "playback_speed": self._stream._speed if self._stream and hasattr(self._stream, '_speed') else 1.0,
+                "playback_direction": self._stream._direction if self._stream and hasattr(self._stream, '_direction') else 1,
+                "fps": float(len(self._fps_times)),
             }
 
     def get_events(self, limit: int = 30) -> list[dict]:
@@ -98,6 +192,7 @@ class AppState:
                     "event_type": e.event_type,
                     "confidence": e.confidence,
                     "description": e.description,
+                    "snapshot_url": f"/snapshots/{e.snapshot}" if e.snapshot else None,
                 }
                 for e in list(self.events)[:limit]
             ]

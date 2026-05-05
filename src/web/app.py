@@ -70,8 +70,12 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down")
 
 
+_SNAPSHOTS_DIR = Path("snapshots")
+_SNAPSHOTS_DIR.mkdir(exist_ok=True)
+
 app = FastAPI(title="Parking Enforcement Detector", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
+app.mount("/snapshots", StaticFiles(directory=str(_SNAPSHOTS_DIR)), name="snapshots")
 templates = Jinja2Templates(directory=str(_BASE / "templates"))
 
 
@@ -103,6 +107,67 @@ class ZonePayload(BaseModel):
     polygon: list[list[int]]
 
 
+@app.post("/api/pipeline/pause")
+async def toggle_pause():
+    paused = state.toggle_pause()
+    return {"paused": paused}
+
+
+@app.post("/api/motion/toggle")
+async def toggle_motion():
+    enabled = state.toggle_motion_detect()
+    return {"motion_detect_enabled": enabled}
+
+
+@app.post("/api/privacy/toggle")
+async def toggle_privacy():
+    enabled = state.toggle_privacy()
+    return {"privacy_mode": enabled}
+
+
+@app.get("/api/privacy/regions")
+async def get_privacy_regions():
+    return {"regions": state.get_privacy_regions()}
+
+
+class PrivacyRegionsPayload(BaseModel):
+    regions: list[list[int]]
+
+
+@app.post("/api/privacy/regions")
+async def update_privacy_regions(body: PrivacyRegionsPayload):
+    state.update_privacy_regions(body.regions)
+    return {"regions": state.get_privacy_regions()}
+
+
+class SpeedPayload(BaseModel):
+    speed: float
+
+
+class DirectionPayload(BaseModel):
+    direction: int  # 1 = forward, -1 = reverse
+
+class SeekPayload(BaseModel):
+    seconds: float
+
+
+@app.post("/api/playback/speed")
+async def set_playback_speed(body: SpeedPayload):
+    speed = state.set_playback_speed(body.speed)
+    return {"speed": speed}
+
+
+@app.post("/api/playback/direction")
+async def set_playback_direction(body: DirectionPayload):
+    direction = state.set_playback_direction(body.direction)
+    return {"direction": direction}
+
+@app.post("/api/playback/seek")
+async def seek_playback(body: SeekPayload):
+    state.seek_playback(body.seconds)
+    return {"ok": True}
+
+
 @app.post("/api/zone")
 async def update_zone(body: ZonePayload):
     if len(body.polygon) < 3:
@@ -132,7 +197,7 @@ async def video_stream(websocket: WebSocket):
             frame = state.get_frame()
             if frame:
                 await websocket.send_bytes(frame)
-            await asyncio.sleep(0.067)
+            await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         logger.debug("WS client disconnected")
     except Exception:

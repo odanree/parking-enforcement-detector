@@ -7,8 +7,10 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-# Force TCP transport before any VideoCapture is opened.
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+# Force TCP, video-only, and suppress FFmpeg log noise.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|allowed_media_types;video"
+)
 
 
 class RTSPHandler:
@@ -47,7 +49,16 @@ class RTSPHandler:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _open_capture(self) -> cv2.VideoCapture:
-        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+        # Redirect C-level stderr while opening so FFmpeg warnings don't spam the terminal.
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
+        try:
+            cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 

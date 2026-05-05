@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -42,34 +43,42 @@ class Notifier:
 
     def send(
         self,
-        event_type: str,        # "chalking" | "sweeper"
+        event_type: str,        # "chalking" | "sweeper" | "pe_vehicle"
         vlm_result: dict,
         frame: np.ndarray,
         bbox: tuple[int, int, int, int] | None = None,
-    ) -> None:
-        """Fire all configured alert channels if cooldown has elapsed."""
-        if vlm_result.get("confidence", 0.0) < self._cfg.get("min_confidence", 0.70):
-            logger.debug("Alert suppressed — confidence below threshold")
-            return
+    ) -> Path | None:
+        """Save a snapshot and fire external alert channels.
 
-        cooldown = self._cfg.get("cooldown_seconds", {}).get(event_type, 300)
-        now = time.monotonic()
-        if now - self._last_fire.get(event_type, 0) < cooldown:
-            logger.debug("Alert suppressed — cooldown active for '%s'", event_type)
-            return
-        self._last_fire[event_type] = now
-
+        Snapshot is always saved (one per call) so the event log always has a
+        thumbnail.  External webhooks (HA, generic) are gated by cooldown and
+        confidence threshold.  Returns the snapshot path, or None if snapshot
+        saving is disabled.
+        """
+        # Always save snapshot for the event log thumbnail
         snapshot_path = None
         if self._cfg.get("save_snapshot", True):
             snapshot_path = self._save_snapshot(event_type, frame, bbox)
 
+        # Gate external notifications on confidence + cooldown
+        if vlm_result.get("confidence", 0.0) < self._cfg.get("min_confidence", 0.70):
+            logger.debug("External alert suppressed — confidence below threshold")
+            return snapshot_path
+
+        cooldown = self._cfg.get("cooldown_seconds", {}).get(event_type, 300)
+        now = time.monotonic()
+        if now - self._last_fire.get(event_type, 0) < cooldown:
+            logger.debug("External alert suppressed — cooldown active for '%s'", event_type)
+            return snapshot_path
+        self._last_fire[event_type] = now
+
         payload = self._build_payload(event_type, vlm_result, snapshot_path)
 
         if self._cfg.get("home_assistant", {}).get("enabled"):
-            self._fire_ha(event_type, payload)
+            threading.Thread(target=self._fire_ha, args=(event_type, payload), daemon=True).start()
 
         if self._cfg.get("generic_webhook", {}).get("enabled"):
-            self._fire_generic(payload)
+            threading.Thread(target=self._fire_generic, args=(payload,), daemon=True).start()
 
         logger.info(
             "Alert fired: %s  confidence=%.2f  snapshot=%s",
@@ -77,6 +86,7 @@ class Notifier:
             vlm_result.get("confidence", 0),
             snapshot_path or "none",
         )
+        return snapshot_path
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
