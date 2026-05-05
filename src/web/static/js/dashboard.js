@@ -143,12 +143,13 @@ fetchEvents();
 setInterval(fetchEvents, 3000);
 
 // ── Zone editor ───────────────────────────────────────────────────────────────
-const overlay     = document.getElementById('zone-overlay');
-const octx        = overlay.getContext('2d');
-const btnEdit     = document.getElementById('btn-edit-zone');
+const overlay      = document.getElementById('zone-overlay');
+const octx         = overlay.getContext('2d');
+const btnEdit      = document.getElementById('btn-edit-zone');
 const zoneControls = document.getElementById('zone-controls');
-const btnSave     = document.getElementById('btn-save-zone');
-const btnCancel   = document.getElementById('btn-cancel-zone');
+const btnSave      = document.getElementById('btn-save-zone');
+const btnCancel    = document.getElementById('btn-cancel-zone');
+const btnUndo      = document.getElementById('btn-undo-zone');
 
 const W = overlay.width;   // 1280
 const H = overlay.height;  // 720
@@ -157,6 +158,7 @@ const HIT_R = 18;          // vertex hit radius in canvas pixels
 let editing   = false;
 let points    = [];   // [[x,y], ...] in frame coordinates
 let saved     = [];   // snapshot of points before edit session
+let history   = [];   // undo stack — each entry is a snapshot of points
 let dragIdx   = -1;
 
 // Convert a MouseEvent to canvas (frame) coordinates
@@ -220,9 +222,23 @@ async function loadZone() {
 
 loadZone();
 
+function pushHistory() {
+  history.push(points.map(p => [...p]));
+  btnUndo.disabled = false;
+}
+
+function applyUndo() {
+  if (!history.length) return;
+  points = history.pop();
+  btnUndo.disabled = history.length === 0;
+  drawOverlay();
+}
+
 function enterEditMode() {
   editing = true;
   saved   = points.map(p => [...p]);
+  history = [];
+  btnUndo.disabled = true;
   overlay.classList.add('editing');
   btnEdit.classList.add('active');
   btnEdit.textContent = 'Editing…';
@@ -233,6 +249,9 @@ function enterEditMode() {
 function exitEditMode() {
   editing = false;
   dragIdx = -1;
+  history = [];
+  btnUndo.disabled = true;
+  overlay.style.cursor = '';
   overlay.classList.remove('editing');
   btnEdit.classList.remove('active');
   btnEdit.textContent = 'Edit Zone';
@@ -244,9 +263,18 @@ btnEdit.addEventListener('click', () => {
   if (!editing) enterEditMode();
 });
 
+btnUndo.addEventListener('click', applyUndo);
+
 btnCancel.addEventListener('click', () => {
   points = saved.map(p => [...p]);
   exitEditMode();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (editing && (e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    applyUndo();
+  }
 });
 
 btnSave.addEventListener('click', async () => {
@@ -271,7 +299,8 @@ btnSave.addEventListener('click', async () => {
 overlay.addEventListener('click', (e) => {
   if (!editing || dragIdx !== -1) return;
   const [cx, cy] = toFrame(e);
-  if (hitIndex(cx, cy) !== -1) return;  // clicked an existing vertex
+  if (hitIndex(cx, cy) !== -1) return;  // clicked an existing vertex — no-op
+  pushHistory();
   points.push([cx, cy]);
   drawOverlay();
 });
@@ -282,21 +311,38 @@ overlay.addEventListener('contextmenu', (e) => {
   if (!editing) return;
   const [cx, cy] = toFrame(e);
   const idx = hitIndex(cx, cy);
-  if (idx !== -1) { points.splice(idx, 1); drawOverlay(); }
+  if (idx !== -1) {
+    pushHistory();
+    points.splice(idx, 1);
+    drawOverlay();
+  }
 });
 
 overlay.addEventListener('mousedown', (e) => {
   if (!editing || e.button !== 0) return;
   const [cx, cy] = toFrame(e);
   dragIdx = hitIndex(cx, cy);
+  if (dragIdx !== -1) overlay.style.cursor = 'grabbing';
 });
 
 overlay.addEventListener('mousemove', (e) => {
-  if (!editing || dragIdx === -1) return;
+  if (!editing) return;
   const [cx, cy] = toFrame(e);
-  points[dragIdx] = [cx, cy];
-  drawOverlay();
+  if (dragIdx !== -1) {
+    points[dragIdx] = [cx, cy];
+    drawOverlay();
+  } else {
+    // Cursor hint: pointer over a vertex, crosshair elsewhere
+    overlay.style.cursor = hitIndex(cx, cy) !== -1 ? 'grab' : 'crosshair';
+  }
 });
 
-overlay.addEventListener('mouseup', () => { dragIdx = -1; });
-overlay.addEventListener('mouseleave', () => { dragIdx = -1; });
+overlay.addEventListener('mouseup', () => {
+  dragIdx = -1;
+  overlay.style.cursor = 'crosshair';
+});
+
+overlay.addEventListener('mouseleave', () => {
+  dragIdx = -1;
+  overlay.style.cursor = '';
+});

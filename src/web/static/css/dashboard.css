@@ -170,6 +170,8 @@ main {
 
 .btn-save   { background: var(--green); color: #000; }
 .btn-cancel { background: var(--border); color: var(--text); }
+.btn-undo   { background: var(--border); color: var(--text); }
+.btn-undo:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* ── Side panel ──────────────────────────────────────────────────────────── */
 .side-panel {
