@@ -96,12 +96,27 @@ main {
   display: block;
 }
 
+#privacy-overlay {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+#privacy-overlay.editing {
+  pointer-events: all;
+  cursor: crosshair;
+}
+
 #zone-overlay {
   position: absolute;
   top: 0; left: 0;
   width: 100%;
   height: 100%;
   pointer-events: none;
+  z-index: 2;
 }
 
 #zone-overlay.editing {
@@ -118,18 +133,101 @@ main {
 
 .no-signal.hidden { display: none; }
 
+.fps-badge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #00e676cc;
+  background: rgba(0,0,0,0.55);
+  padding: 2px 7px;
+  border-radius: 4px;
+  pointer-events: none;
+  font-family: monospace;
+  letter-spacing: 0.03em;
+}
+
 /* ── Video toolbar ───────────────────────────────────────────────────────── */
 .video-toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  gap: 8px;
+  padding: 7px 12px;
   background: var(--surface);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
 
-.btn-zone {
+.toolbar-right {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.speed-controls {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+
+.btn-speed {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+  min-width: 32px;
+}
+
+.btn-speed:hover        { background: #1e1e1e; color: var(--text); border-color: #444; }
+.btn-speed.active       { background: #001a2a; border-color: var(--blue); color: var(--blue); }
+
+.btn-dir {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 9px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+
+.btn-dir:hover      { background: #1e1e1e; color: var(--text); border-color: #444; }
+.btn-dir.active     { background: #2a0a00; border-color: var(--orange); color: var(--orange); }
+.btn-dir-fwd.active { background: #0a2e1a; border-color: var(--green);  color: var(--green); }
+
+.btn-seek {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+  min-width: 38px;
+}
+
+.btn-seek:hover { background: #1e1e1e; color: var(--text); border-color: #444; }
+.btn-seek:active { background: #1a1a2a; border-color: var(--blue); color: var(--blue); }
+
+.speed-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+  margin: 0 4px;
+}
+
+.btn-zone, .btn-pause, .btn-motion, .btn-privacy {
   font-size: 12px;
   font-weight: 600;
   padding: 4px 12px;
@@ -143,23 +241,55 @@ main {
 
 .btn-zone:hover          { background: #1e1e1e; border-color: #444; }
 .btn-zone.active         { background: #0a2e1a; border-color: var(--green); color: var(--green); }
+.btn-pause:hover         { background: #1e1e1e; border-color: #444; }
+.btn-pause.paused        { background: #2a1a00; border-color: var(--orange); color: var(--orange); }
+.btn-motion:hover        { background: #1e1e1e; border-color: #444; }
+.btn-motion.active       { background: #001a2a; border-color: var(--blue); color: var(--blue); }
+.btn-privacy:hover        { background: #1e1e1e; border-color: #444; }
+.btn-privacy.active       { background: #1a0a2a; border-color: #b388ff; color: #b388ff; }
 
-.zone-controls {
+/* ── Privacy editing toolbar (second row) ───────────────────────────────── */
+.privacy-toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex: 1;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 14px;
+  background: #160a22;
+  border-top: 1px solid #b388ff40;
+  flex-shrink: 0;
 }
 
-.zone-controls.hidden { display: none; }
+.privacy-toolbar.hidden { display: none; }
+
+/* ── Zone editing toolbar (second row) ───────────────────────────────────── */
+.zone-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 14px;
+  background: #071a0f;
+  border-top: 1px solid #00e67640;
+  flex-shrink: 0;
+}
+
+.zone-toolbar.hidden { display: none; }
 
 .zone-hint {
   font-size: 11px;
-  color: var(--muted);
+  color: #00e676aa;
   flex: 1;
 }
 
-.btn-save, .btn-cancel {
+.zone-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.btn-save, .btn-cancel, .btn-reset {
   font-size: 12px;
   font-weight: 600;
   padding: 4px 12px;
@@ -171,6 +301,7 @@ main {
 .btn-save   { background: var(--green); color: #000; }
 .btn-cancel { background: var(--border); color: var(--text); }
 .btn-undo   { background: var(--border); color: var(--text); }
+.btn-reset  { background: #ff6d00; color: #fff; }
 .btn-undo:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* ── Side panel ──────────────────────────────────────────────────────────── */
@@ -325,10 +456,58 @@ main {
 .event-item.chalking .conf-fill { background: var(--red); }
 .event-item.sweeper  .conf-fill { background: var(--orange); }
 
+/* ── Event snapshot thumbnail ────────────────────────────────────────────── */
+.event-thumb {
+  display: block;
+  width: 100%;
+  margin-top: 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  object-fit: cover;
+  max-height: 140px;
+}
+
 @keyframes slide-in {
   from { opacity: 0; transform: translateY(-6px); }
   to   { opacity: 1; transform: translateY(0); }
 }
+
+/* ── Snapshot lightbox ───────────────────────────────────────────────────── */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.lightbox.hidden { display: none; }
+
+.lightbox img {
+  max-width: 92vw;
+  max-height: 88vh;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+}
+
+.lightbox-close {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 32px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: .7;
+}
+
+.lightbox-close:hover { opacity: 1; }
 
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media (max-width: 860px) {

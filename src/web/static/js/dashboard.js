@@ -53,6 +53,7 @@ const elSweeper     = document.getElementById('stat-sweeper');
 const elUptime      = document.getElementById('stat-uptime');
 const elLastChalk   = document.getElementById('stat-last-chalking');
 const elLastSweeper = document.getElementById('stat-last-sweeper');
+const elFps         = document.getElementById('fps-badge');
 
 function fmtUptime(secs) {
   const h = String(Math.floor(secs / 3600)).padStart(2, '0');
@@ -65,6 +66,87 @@ function fmtTime(ts) {
   if (!ts) return '—';
   const d = new Date(ts * 1000);
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// ── Pause button ──────────────────────────────────────────────────────────────
+const btnPause = document.getElementById('btn-pause');
+let _paused = false;
+
+btnPause.addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/pipeline/pause', { method: 'POST' });
+    const data = await res.json();
+    _paused = data.paused;
+    syncPauseBtn();
+  } catch (_) {}
+});
+
+function syncPauseBtn() {
+  btnPause.textContent = _paused ? '▶ Resume' : '⏸ Pause';
+  btnPause.classList.toggle('paused', _paused);
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !e.target.closest('input, textarea, select')) {
+    e.preventDefault();
+    btnPause.click();
+  }
+});
+
+// ── Seek buttons ──────────────────────────────────────────────────────────────
+document.querySelectorAll('.btn-seek').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const seconds = parseFloat(btn.dataset.seconds);
+    try {
+      await fetch('/api/playback/seek', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seconds }),
+      });
+    } catch (_) {}
+  });
+});
+
+// ── Playback speed ────────────────────────────────────────────────────────────
+const speedBtns = document.querySelectorAll('.btn-speed');
+
+function syncSpeedBtns(speed) {
+  speedBtns.forEach(btn => {
+    btn.classList.toggle('active', parseFloat(btn.dataset.speed) === speed);
+  });
+}
+
+speedBtns.forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const speed = parseFloat(btn.dataset.speed);
+    try {
+      const res  = await fetch('/api/playback/speed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed }),
+      });
+      const data = await res.json();
+      syncSpeedBtns(data.speed);
+    } catch (_) {}
+  });
+});
+
+// ── Motion detect toggle ──────────────────────────────────────────────────────
+const btnMotion = document.getElementById('btn-motion');
+let _motionEnabled = false;
+
+btnMotion.addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/motion/toggle', { method: 'POST' });
+    const data = await res.json();
+    _motionEnabled = data.motion_detect_enabled;
+    syncMotionBtn();
+  } catch (_) {}
+});
+
+function syncMotionBtn() {
+  btnMotion.textContent = _motionEnabled ? 'Motion Detect ON' : 'Motion Detect';
+  btnMotion.classList.toggle('active', _motionEnabled);
 }
 
 async function fetchStats() {
@@ -83,6 +165,18 @@ async function fetchStats() {
     elUptime.textContent      = fmtUptime(s.uptime_seconds);
     elLastChalk.textContent   = fmtTime(s.last_chalking);
     elLastSweeper.textContent = fmtTime(s.last_sweeper);
+
+    if (_paused !== s.paused) {
+      _paused = s.paused;
+      syncPauseBtn();
+    }
+    if (_motionEnabled !== s.motion_detect_enabled) {
+      _motionEnabled = s.motion_detect_enabled;
+      syncMotionBtn();
+    }
+    if (s.playback_speed  !== undefined) syncSpeedBtns(s.playback_speed);
+    if (s.privacy_mode    !== undefined) syncPrivacy(s.privacy_mode);
+    if (s.fps !== undefined) elFps.textContent = `${Math.round(s.fps)} fps`;
   } catch (_) { /* ignore transient fetch errors */ }
 }
 
@@ -103,14 +197,19 @@ function buildEventItem(ev) {
     hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
 
+  const thumbHtml = ev.snapshot_url
+    ? `<img class="event-thumb" src="${ev.snapshot_url}" alt="snapshot" loading="lazy">`
+    : '';
+
   li.innerHTML = `
     <div class="event-header">
-      <span class="event-type ${ev.event_type}">${ev.event_type === 'chalking' ? 'Chalking' : 'Sweeper'}</span>
+      <span class="event-type ${ev.event_type}">${{chalking:'Chalking',sweeper:'Sweeper',pe_vehicle:'PE Vehicle'}[ev.event_type] ?? ev.event_type}</span>
       <span class="event-conf">${pct}%</span>
       <span class="event-time">${timeStr}</span>
     </div>
     <div class="event-desc" title="${ev.description ?? ''}">${ev.description || 'No description'}</div>
     <div class="conf-bar"><div class="conf-fill" style="width:${pct}%"></div></div>
+    ${thumbHtml}
   `;
   return li;
 }
@@ -150,16 +249,21 @@ const zoneControls = document.getElementById('zone-controls');
 const btnSave      = document.getElementById('btn-save-zone');
 const btnCancel    = document.getElementById('btn-cancel-zone');
 const btnUndo      = document.getElementById('btn-undo-zone');
+const btnReset     = document.getElementById('btn-reset-zone');
 
 const W = overlay.width;   // 1280
 const H = overlay.height;  // 720
-const HIT_R = 18;          // vertex hit radius in canvas pixels
+const HIT_R      = 18;     // vertex hit radius
+const EDGE_HIT_R = 14;     // edge midpoint hit radius
 
 let editing   = false;
 let points    = [];   // [[x,y], ...] in frame coordinates
 let saved     = [];   // snapshot of points before edit session
 let history   = [];   // undo stack — each entry is a snapshot of points
-let dragIdx   = -1;
+let dragIdx   = -1;   // vertex being dragged (-1 = none)
+let dragEdge  = -1;   // edge being dragged, index i = edge points[i]→points[i+1] (-1 = none)
+let _dragPrev = null; // [cx,cy] at last mousemove
+let _didDrag  = false;
 
 // Convert a MouseEvent to canvas (frame) coordinates
 function toFrame(e) {
@@ -175,6 +279,19 @@ function hitIndex(cx, cy) {
     const dx = px - cx, dy = py - cy;
     return Math.sqrt(dx * dx + dy * dy) < HIT_R;
   });
+}
+
+// Returns edge index i (edge from points[i] to points[(i+1)%n]) or -1
+function hitEdge(cx, cy) {
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const [ax, ay] = points[i];
+    const [bx, by] = points[(i + 1) % n];
+    const mx = (ax + bx) / 2;
+    const my = (ay + by) / 2;
+    if (Math.sqrt((mx - cx) ** 2 + (my - cy) ** 2) < EDGE_HIT_R) return i;
+  }
+  return -1;
 }
 
 function drawOverlay() {
@@ -196,9 +313,40 @@ function drawOverlay() {
   octx.stroke();
   octx.setLineDash([]);
 
+  // Zone label — top-left vertex of the bounding box
+  const xs = points.map(p => p[0]);
+  const ys = points.map(p => p[1]);
+  const labelX = Math.min(...xs);
+  const labelY = Math.min(...ys) - 6;
+  octx.font = 'bold 11px Inter, system-ui, sans-serif';
+  octx.fillStyle = editing ? '#00e676' : '#00e676aa';
+  octx.fillText('STREET ZONE', labelX, Math.max(labelY, 12));
+
   if (!editing) return;
 
-  // Vertex handles
+  const n = points.length;
+
+  // Edge midpoint handles (blue diamonds) — drag to slide the whole edge
+  for (let i = 0; i < n; i++) {
+    const [ax, ay] = points[i];
+    const [bx, by] = points[(i + 1) % n];
+    const mx = (ax + bx) / 2;
+    const my = (ay + by) / 2;
+    const s = 14;
+    octx.beginPath();
+    octx.moveTo(mx,     my - s);
+    octx.lineTo(mx + s, my);
+    octx.lineTo(mx,     my + s);
+    octx.lineTo(mx - s, my);
+    octx.closePath();
+    octx.fillStyle   = i === dragEdge ? '#ffffff' : '#00b0ff';
+    octx.strokeStyle = '#000';
+    octx.lineWidth   = 2;
+    octx.fill();
+    octx.stroke();
+  }
+
+  // Vertex handles (green circles) — drag to move a single corner
   points.forEach(([px, py], i) => {
     octx.beginPath();
     octx.arc(px, py, 7, 0, Math.PI * 2);
@@ -265,6 +413,12 @@ btnEdit.addEventListener('click', () => {
 
 btnUndo.addEventListener('click', applyUndo);
 
+btnReset.addEventListener('click', () => {
+  pushHistory();
+  points = [[0, 0], [W, 0], [W, H], [0, H]];
+  drawOverlay();
+});
+
 btnCancel.addEventListener('click', () => {
   points = saved.map(p => [...p]);
   exitEditMode();
@@ -297,9 +451,10 @@ btnSave.addEventListener('click', async () => {
 
 // Click → add point (unless we just finished a drag)
 overlay.addEventListener('click', (e) => {
-  if (!editing || dragIdx !== -1) return;
+  if (!editing || _didDrag) return;
   const [cx, cy] = toFrame(e);
-  if (hitIndex(cx, cy) !== -1) return;  // clicked an existing vertex — no-op
+  if (hitIndex(cx, cy) !== -1) return;
+  if (hitEdge(cx, cy) !== -1) return;
   pushHistory();
   points.push([cx, cy]);
   drawOverlay();
@@ -320,9 +475,21 @@ overlay.addEventListener('contextmenu', (e) => {
 
 overlay.addEventListener('mousedown', (e) => {
   if (!editing || e.button !== 0) return;
+  _didDrag = false;
   const [cx, cy] = toFrame(e);
+  // Vertex takes priority over edge midpoint
   dragIdx = hitIndex(cx, cy);
-  if (dragIdx !== -1) overlay.style.cursor = 'grabbing';
+  if (dragIdx !== -1) {
+    _dragPrev = [cx, cy];
+    overlay.style.cursor = 'grabbing';
+    return;
+  }
+  dragEdge = hitEdge(cx, cy);
+  if (dragEdge !== -1) {
+    _dragPrev = [cx, cy];
+    overlay.style.cursor = 'grabbing';
+    pushHistory();
+  }
 });
 
 overlay.addEventListener('mousemove', (e) => {
@@ -331,18 +498,218 @@ overlay.addEventListener('mousemove', (e) => {
   if (dragIdx !== -1) {
     points[dragIdx] = [cx, cy];
     drawOverlay();
+    _dragPrev = [cx, cy];
+    _didDrag = true;
+  } else if (dragEdge !== -1) {
+    const [px, py] = _dragPrev;
+    const dx = cx - px, dy = cy - py;
+    const n = points.length;
+    const j = (dragEdge + 1) % n;
+    points[dragEdge] = [points[dragEdge][0] + dx, points[dragEdge][1] + dy];
+    points[j]        = [points[j][0]        + dx, points[j][1]        + dy];
+    drawOverlay();
+    _dragPrev = [cx, cy];
+    _didDrag = true;
   } else {
-    // Cursor hint: pointer over a vertex, crosshair elsewhere
-    overlay.style.cursor = hitIndex(cx, cy) !== -1 ? 'grab' : 'crosshair';
+    if (hitIndex(cx, cy) !== -1)     overlay.style.cursor = 'grab';
+    else if (hitEdge(cx, cy) !== -1) overlay.style.cursor = 'move';
+    else                             overlay.style.cursor = 'crosshair';
   }
 });
 
 overlay.addEventListener('mouseup', () => {
-  dragIdx = -1;
+  dragIdx  = -1;
+  dragEdge = -1;
+  _dragPrev = null;
   overlay.style.cursor = 'crosshair';
 });
 
 overlay.addEventListener('mouseleave', () => {
-  dragIdx = -1;
+  dragIdx  = -1;
+  dragEdge = -1;
+  _dragPrev = null;
   overlay.style.cursor = '';
+});
+
+// ── Privacy overlay ───────────────────────────────────────────────────────────
+const privacyCanvas   = document.getElementById('privacy-overlay');
+const pctx            = privacyCanvas.getContext('2d');
+const btnPrivacy      = document.getElementById('btn-privacy');
+const privacyControls = document.getElementById('privacy-controls');
+const btnSavePrivacy  = document.getElementById('btn-save-privacy');
+const btnCancelPrivacy = document.getElementById('btn-cancel-privacy');
+
+let _privacyMode    = false;
+let _privacyEditing = false;
+let _privacyRegions = [];   // [[x1,y1,x2,y2], ...]
+let _privacyDrag    = null; // {x0,y0,x1,y1} while drawing
+
+// Load saved regions from server
+(async () => {
+  try {
+    const r = await fetch('/api/privacy/regions');
+    const d = await r.json();
+    _privacyRegions = d.regions || [];
+    drawPrivacy();
+  } catch (_) {}
+})();
+
+function drawPrivacy() {
+  pctx.clearRect(0, 0, privacyCanvas.width, privacyCanvas.height);
+  if (!_privacyMode && !_privacyEditing) return;
+
+  for (const [x1, y1, x2, y2] of _privacyRegions) {
+    if (_privacyEditing) {
+      pctx.strokeStyle = '#b388ff';
+      pctx.lineWidth = 2;
+      pctx.setLineDash([6, 3]);
+      pctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      pctx.setLineDash([]);
+      pctx.fillStyle = 'rgba(179,136,255,0.15)';
+      pctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    } else {
+      pctx.fillStyle = '#000';
+      pctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    }
+  }
+
+  if (_privacyDrag) {
+    const { x0, y0, x1, y1 } = _privacyDrag;
+    pctx.strokeStyle = '#b388ff';
+    pctx.lineWidth = 2;
+    pctx.setLineDash([4, 3]);
+    pctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    pctx.setLineDash([]);
+    pctx.fillStyle = 'rgba(179,136,255,0.2)';
+    pctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  }
+}
+
+function toPrivacyFrame(e) {
+  const r = privacyCanvas.getBoundingClientRect();
+  return [
+    Math.round((e.clientX - r.left) * (privacyCanvas.width  / r.width)),
+    Math.round((e.clientY - r.top)  * (privacyCanvas.height / r.height)),
+  ];
+}
+
+btnPrivacy.addEventListener('click', async () => {
+  if (!_privacyEditing) {
+    // Simple toggle privacy mode
+    try {
+      const r = await fetch('/api/privacy/toggle', { method: 'POST' });
+      const d = await r.json();
+      _privacyMode = d.privacy_mode;
+      btnPrivacy.classList.toggle('active', _privacyMode);
+      drawPrivacy();
+    } catch (_) {}
+  }
+});
+
+btnPrivacy.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  // Right-click Privacy button → enter edit mode
+  _privacyEditing = true;
+  privacyCanvas.classList.add('editing');
+  privacyControls.classList.remove('hidden');
+  btnPrivacy.textContent = '🚫 Editing…';
+  drawPrivacy();
+});
+
+btnSavePrivacy.addEventListener('click', async () => {
+  try {
+    await fetch('/api/privacy/regions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ regions: _privacyRegions }),
+    });
+  } catch (_) {}
+  exitPrivacyEdit();
+});
+
+btnCancelPrivacy.addEventListener('click', () => {
+  // Reload from server to discard unsaved changes
+  fetch('/api/privacy/regions').then(r => r.json()).then(d => {
+    _privacyRegions = d.regions || [];
+    exitPrivacyEdit();
+  });
+});
+
+function exitPrivacyEdit() {
+  _privacyEditing = false;
+  privacyCanvas.classList.remove('editing');
+  privacyCanvas.style.cursor = '';
+  privacyControls.classList.add('hidden');
+  btnPrivacy.textContent = '🚫 Privacy';
+  drawPrivacy();
+}
+
+privacyCanvas.addEventListener('mousedown', (e) => {
+  if (!_privacyEditing || e.button !== 0) return;
+  const [x, y] = toPrivacyFrame(e);
+  _privacyDrag = { x0: x, y0: y, x1: x, y1: y };
+});
+
+privacyCanvas.addEventListener('mousemove', (e) => {
+  if (!_privacyEditing || !_privacyDrag) return;
+  const [x, y] = toPrivacyFrame(e);
+  _privacyDrag.x1 = x;
+  _privacyDrag.y1 = y;
+  drawPrivacy();
+});
+
+privacyCanvas.addEventListener('mouseup', () => {
+  if (!_privacyEditing || !_privacyDrag) return;
+  const { x0, y0, x1, y1 } = _privacyDrag;
+  const rx1 = Math.min(x0, x1), ry1 = Math.min(y0, y1);
+  const rx2 = Math.max(x0, x1), ry2 = Math.max(y0, y1);
+  if (rx2 - rx1 > 8 && ry2 - ry1 > 8) {
+    _privacyRegions.push([rx1, ry1, rx2, ry2]);
+  }
+  _privacyDrag = null;
+  drawPrivacy();
+});
+
+privacyCanvas.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (!_privacyEditing) return;
+  const [cx, cy] = toPrivacyFrame(e);
+  _privacyRegions = _privacyRegions.filter(([x1, y1, x2, y2]) =>
+    !(cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2)
+  );
+  drawPrivacy();
+});
+
+// Sync privacy mode from stats poll
+function syncPrivacy(mode) {
+  if (_privacyMode !== mode) {
+    _privacyMode = mode;
+    btnPrivacy.classList.toggle('active', mode);
+    drawPrivacy();
+  }
+}
+
+// ── Snapshot lightbox ─────────────────────────────────────────────────────────
+const lightbox      = document.getElementById('lightbox');
+const lightboxImg   = document.getElementById('lightbox-img');
+const lightboxClose = document.getElementById('lightbox-close');
+
+function openLightbox(src) {
+  lightboxImg.src = src;
+  lightbox.classList.remove('hidden');
+}
+
+function closeLightbox() {
+  lightbox.classList.add('hidden');
+  lightboxImg.src = '';
+}
+
+lightboxClose.addEventListener('click', closeLightbox);
+lightbox.addEventListener('click', (e) => { if (e.target === lightbox) closeLightbox(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeLightbox(); });
+
+// Delegate thumbnail clicks from the event list
+eventList.addEventListener('click', (e) => {
+  const thumb = e.target.closest('.event-thumb');
+  if (thumb) openLightbox(thumb.src);
 });
