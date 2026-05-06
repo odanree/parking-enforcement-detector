@@ -19,7 +19,7 @@ export function VideoPanel({ feedRef }: Props) {
   const fps       = Math.round(stats?.fps ?? 0);
 
   return (
-    <section className="video-panel">
+    <section className={`video-panel${zoneEditing || privEditing ? ' editing' : ''}`}>
       <div className="canvas-wrap">
         <canvas ref={feedRef}  id="feed"            width={1280} height={720} />
         <canvas ref={privRef}  id="privacy-overlay" width={1280} height={720} />

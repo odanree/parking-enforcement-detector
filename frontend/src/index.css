@@ -94,6 +94,12 @@ main {
   justify-content: center;
 }
 
+/* When the zone or privacy editing toolbar is open it adds ~44px.
+   Shrink the canvas so that second toolbar stays on-screen. */
+.video-panel.editing .canvas-wrap {
+  width: min(100%, calc((100vh - 154px) * 16 / 9));
+}
+
 #feed {
   position: absolute;
   top: 0; left: 0;
@@ -877,7 +883,23 @@ main {
 }
 .btn-debug-open .debug-badge.visible { display: block; }
 
-/* ── Responsive ──────────────────────────────────────────────────────────── */
+/* ── Responsive: MacBook / medium screens ────────────────────────────────── */
+@media (max-width: 1180px) and (min-width: 861px) {
+  main {
+    grid-template-columns: 1fr 240px;
+  }
+
+  .btn-seek { display: none; }
+  .speed-sep { display: none; }
+
+  .btn-speed {
+    min-width: 28px;
+    padding: 4px 6px;
+    font-size: 11px;
+  }
+}
+
+/* ── Responsive: mobile ──────────────────────────────────────────────────── */
 @media (max-width: 860px) {
   html, body, #root {
     height: auto;
