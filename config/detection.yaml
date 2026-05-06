@@ -1,7 +1,7 @@
 chalking:
-  cooldown_seconds: 60
-  entry_frames: 10
-  sample_every_n: 30
+  cooldown_seconds: 30
+  entry_frames: 5
+  sample_every_n: 15
 detector:
   input_height: 720
   input_width: 1280
@@ -22,11 +22,11 @@ motion_detector:
   seam_x: 0
   var_threshold: 25
 pe_vehicle:
-  cooldown_seconds: 120
-  entry_frames: 8
-  entry_min_px: 60.0
+  cooldown_seconds: 30
+  entry_frames: 3
+  entry_min_px: 5.0
   stop_px_per_frame: 3.0
-  sustained_frames: 60
+  sustained_frames: 20
 stationary_mask:
   enabled: true
   frames: 30
