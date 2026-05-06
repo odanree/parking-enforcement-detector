@@ -3,7 +3,7 @@ FROM node:24-slim AS frontend-builder
 
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm ci
+RUN npm install
 COPY frontend/ ./
 # vite.config.ts sets outDir: '../frontend-dist', so output lands at /app/frontend-dist
 RUN npm run build
