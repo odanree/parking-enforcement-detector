@@ -21,6 +21,7 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import json
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -47,6 +48,7 @@ from src.web.state import AppState
 state = AppState()
 _BASE = Path(__file__).parent
 _DETECTION_CFG = Path("config/detection.yaml")
+_PRIVACY_CFG   = Path("config/privacy.json")
 
 
 def _load_yaml(path: Path) -> dict:
@@ -60,9 +62,24 @@ def _seed_zone() -> None:
     state.update_zone(polygon)
 
 
+def _seed_privacy() -> None:
+    if _PRIVACY_CFG.exists():
+        try:
+            data = json.loads(_PRIVACY_CFG.read_text(encoding="utf-8"))
+            state.update_privacy_regions(data.get("regions", []))
+        except Exception:
+            logger.warning("Could not load privacy regions from %s", _PRIVACY_CFG)
+
+
+def _save_privacy(regions: list[list[int]]) -> None:
+    _PRIVACY_CFG.parent.mkdir(exist_ok=True)
+    _PRIVACY_CFG.write_text(json.dumps({"regions": regions}), encoding="utf-8")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _seed_zone()
+    _seed_privacy()
     t = threading.Thread(target=pipeline.run, args=(state,), daemon=True, name="pipeline")
     t.start()
     logger.info("Pipeline thread started")
@@ -125,6 +142,22 @@ async def toggle_privacy():
     return {"privacy_mode": enabled}
 
 
+@app.get("/api/pending")
+async def get_pending():
+    return JSONResponse({"jobs": state.get_pending_vlm()})
+
+
+@app.get("/api/debug/rejected")
+async def get_rejected():
+    return JSONResponse({"items": state.get_rejected_vlm()})
+
+
+@app.delete("/api/debug/rejected")
+async def clear_rejected():
+    state.clear_rejected_vlm()
+    return {"ok": True}
+
+
 @app.get("/api/privacy/regions")
 async def get_privacy_regions():
     return {"regions": state.get_privacy_regions()}
@@ -137,6 +170,7 @@ class PrivacyRegionsPayload(BaseModel):
 @app.post("/api/privacy/regions")
 async def update_privacy_regions(body: PrivacyRegionsPayload):
     state.update_privacy_regions(body.regions)
+    _save_privacy(body.regions)
     return {"regions": state.get_privacy_regions()}
 
 
@@ -166,6 +200,105 @@ async def set_playback_direction(body: DirectionPayload):
 async def seek_playback(body: SeekPayload):
     state.seek_playback(body.seconds)
     return {"ok": True}
+
+
+class AlertPayload(BaseModel):
+    event_type: str
+    timestamp: float
+    confidence: float
+    description: str | None = None
+    snapshot_url: str | None = None
+
+
+@app.post("/api/alert")
+async def send_alert(body: AlertPayload):
+    from datetime import datetime, timezone
+    import httpx
+
+    to = os.getenv("ALERT_PHONE", "+17145671107")
+    # Strip + for TextBelt (expects digits only)
+    to_digits = to.lstrip("+")
+
+    ts_str     = datetime.fromtimestamp(body.timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    type_label = {"chalking": "Chalking", "sweeper": "Sweeper", "pe_vehicle": "PE Vehicle"}.get(body.event_type, body.event_type)
+    pct        = round((body.confidence or 0) * 100)
+    desc       = (body.description or "No description")[:200]
+    msg        = f"[PED Alert] {type_label} detected ({pct}%)\n{ts_str}\n{desc}"
+
+    # Email — set ALERT_EMAIL, SMTP_USER, SMTP_PASS in .env
+    alert_email = os.getenv("ALERT_EMAIL")
+    smtp_user   = os.getenv("SMTP_USER")
+    smtp_pass   = os.getenv("SMTP_PASS")
+    if alert_email and smtp_user and smtp_pass:
+        import smtplib
+        from email.message import EmailMessage
+        try:
+            em = EmailMessage()
+            em["Subject"] = f"PED Alert: {type_label} detected ({pct}%)"
+            em["From"]    = smtp_user
+            em["To"]      = alert_email
+            em.set_content(msg)
+            with smtplib.SMTP("smtp.gmail.com", 587) as s:
+                s.starttls()
+                s.login(smtp_user, smtp_pass)
+                s.send_message(em)
+            logger.info("Alert email sent to %s", alert_email)
+            return {"ok": True}
+        except Exception as exc:
+            logger.error("Email alert failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    # ntfy.sh push notification — set NTFY_TOPIC=your-topic in .env
+    ntfy_topic = os.getenv("NTFY_TOPIC")
+    if ntfy_topic:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"https://ntfy.sh/{ntfy_topic}",
+                    content=msg.encode(),
+                    headers={"Title": f"PED: {type_label} detected"},
+                )
+            logger.info("Alert sent via ntfy to topic %s", ntfy_topic)
+            return {"ok": True}
+        except Exception as exc:
+            logger.error("ntfy alert failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    # TextBelt SMS — set TEXTBELT_KEY to a paid key from textbelt.com
+    textbelt_key = os.getenv("TEXTBELT_KEY")
+    if textbelt_key:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    "https://textbelt.com/text",
+                    data={"phone": to_digits, "message": msg, "key": textbelt_key},
+                )
+            data = r.json()
+            if not data.get("success"):
+                raise RuntimeError(data.get("error", "TextBelt failed"))
+            logger.info("Alert SMS sent via TextBelt to %s", to)
+            return {"ok": True}
+        except Exception as exc:
+            logger.error("TextBelt alert failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    # Twilio fallback
+    sid   = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_ = os.getenv("TWILIO_FROM_NUMBER")
+    if not (sid and token and from_):
+        raise HTTPException(
+            status_code=503,
+            detail="No SMS provider configured — set TEXTBELT_KEY or TWILIO_* vars in .env",
+        )
+    try:
+        from twilio.rest import Client
+        Client(sid, token).messages.create(body=msg, from_=from_, to=to)
+        logger.info("Alert SMS sent via Twilio to %s", to)
+        return {"ok": True}
+    except Exception as exc:
+        logger.error("Twilio alert failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/zone")
