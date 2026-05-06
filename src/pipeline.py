@@ -311,7 +311,7 @@ def run(state=None) -> None:
                         if job_key not in _vlm_jobs:
                             wide = _crop_wide_bytes(frame, det.bbox)
                             thumb = _thumb_b64_from_jpeg(wide)
-                            fut = _vlm_pool.submit(vlm.analyze, wide)
+                            fut = _vlm_pool.submit(vlm.analyze, wide, "chalking")
                             _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb)
                             if state:
                                 state.add_pending_vlm("chalking", det.track_id, thumb)
@@ -324,7 +324,7 @@ def run(state=None) -> None:
                             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                             sweep_bytes = buf.tobytes() if ok else b""
                             thumb = _thumb_b64_from_jpeg(sweep_bytes)
-                            fut = _vlm_pool.submit(vlm.analyze, sweep_bytes)
+                            fut = _vlm_pool.submit(vlm.analyze, sweep_bytes, "sweeper")
                             _vlm_jobs[job_key] = (fut, "sweeper", det.track_id, frame.copy(), det.bbox, thumb)
                             if state:
                                 state.add_pending_vlm("sweeper", det.track_id, thumb)
@@ -336,7 +336,7 @@ def run(state=None) -> None:
                         if job_key not in _vlm_jobs:
                             crop_bytes = _crop_bytes(frame, det.bbox)
                             thumb = _thumb_b64_from_jpeg(crop_bytes)
-                            fut = _vlm_pool.submit(vlm.analyze, crop_bytes)
+                            fut = _vlm_pool.submit(vlm.analyze, crop_bytes, "pe_vehicle")
                             _vlm_jobs[job_key] = (fut, "pe_vehicle", det.track_id, frame.copy(), det.bbox, thumb)
                             if state:
                                 state.add_pending_vlm("pe_vehicle", det.track_id, thumb)

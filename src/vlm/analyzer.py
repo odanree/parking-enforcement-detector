@@ -61,6 +61,39 @@ _SYSTEM_PROMPT = (
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
+_MOCK_RESULTS: dict[str, dict] = {
+    "chalking": {
+        "chalking_detected": True,
+        "sweeper_detected": False,
+        "pe_vehicle_detected": False,
+        "confidence": 0.91,
+        "description": (
+            "Officer visible crouching near rear tire of parked vehicle. "
+            "Posture and proximity to wheel area consistent with tire chalking activity."
+        ),
+    },
+    "sweeper": {
+        "chalking_detected": False,
+        "sweeper_detected": True,
+        "pe_vehicle_detected": False,
+        "confidence": 0.88,
+        "description": (
+            "Street sweeper truck detected in frame. Large rotating side brushes visible "
+            "along curb line. Vehicle moving slowly consistent with active sweep operation."
+        ),
+    },
+    "pe_vehicle": {
+        "chalking_detected": False,
+        "sweeper_detected": False,
+        "pe_vehicle_detected": True,
+        "confidence": 0.87,
+        "description": (
+            "White city vehicle with parking enforcement markings stopped adjacent to curb. "
+            "Officer visible near driver door. Vehicle has been stationary for several seconds."
+        ),
+    },
+}
+
 _FALLBACK = {
     "chalking_detected": False,
     "sweeper_detected": False,
@@ -95,16 +128,10 @@ class VLMAnalyzer:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def analyze(self, image_bytes: bytes) -> dict:
+    def analyze(self, image_bytes: bytes, kind: str = "") -> dict:
         """Send a JPEG frame to the VLM and return the parsed JSON result."""
         if self._backend == "mock":
-            return {
-                "chalking_detected": True,
-                "sweeper_detected": False,
-                "pe_vehicle_detected": True,
-                "confidence": 0.95,
-                "description": "Mock: person leaning toward tire with chalk stick",
-            }
+            return _MOCK_RESULTS.get(kind, _MOCK_RESULTS["pe_vehicle"])
         try:
             if self._backend == "claude":
                 return self._analyze_claude(image_bytes)
