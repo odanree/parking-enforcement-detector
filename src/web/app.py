@@ -231,13 +231,23 @@ async def send_alert(body: AlertPayload):
     smtp_pass   = os.getenv("SMTP_PASS")
     if alert_email and smtp_user and smtp_pass:
         import smtplib
-        from email.message import EmailMessage
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.image import MIMEImage
         try:
-            em = EmailMessage()
+            em = MIMEMultipart()
             em["Subject"] = f"PED Alert: {type_label} detected ({pct}%)"
             em["From"]    = smtp_user
             em["To"]      = alert_email
-            em.set_content(msg)
+            em.attach(MIMEText(msg, "plain"))
+
+            # Attach snapshot if available and on disk
+            if body.snapshot_url:
+                # snapshot_url is "/snapshots/<filename>"
+                snap_path = _SNAPSHOTS_DIR / Path(body.snapshot_url).name
+                if snap_path.exists():
+                    em.attach(MIMEImage(snap_path.read_bytes(), name=snap_path.name))
+
             with smtplib.SMTP("smtp.gmail.com", 587) as s:
                 s.starttls()
                 s.login(smtp_user, smtp_pass)

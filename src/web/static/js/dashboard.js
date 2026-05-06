@@ -177,6 +177,12 @@ async function fetchStats() {
     if (s.playback_speed  !== undefined) syncSpeedBtns(s.playback_speed);
     if (s.privacy_mode    !== undefined) syncPrivacy(s.privacy_mode);
     if (s.fps !== undefined) elFps.textContent = `${Math.round(s.fps)} fps`;
+    if (s.is_live !== undefined) {
+      const hide = s.is_live;
+      document.querySelectorAll('.btn-seek, .btn-speed, .speed-sep').forEach(el => {
+        el.style.display = hide ? 'none' : '';
+      });
+    }
   } catch (_) { /* ignore transient fetch errors */ }
 }
 
@@ -885,6 +891,59 @@ const btnAlert        = document.getElementById('btn-alert');
 const alertStatus     = document.getElementById('event-modal-alert-status');
 
 let _currentModalEvent = null;
+let _zoom = 1, _panX = 0, _panY = 0, _panning = false, _panOrigin = null;
+
+function _applyZoom() {
+  // translate is in pre-scale coords so divide by zoom
+  eventModalImg.style.transform = `scale(${_zoom}) translate(${_panX / _zoom}px, ${_panY / _zoom}px)`;
+  eventModalImg.style.cursor = _zoom > 1 ? 'grab' : 'zoom-in';
+}
+
+function _resetZoom() {
+  _zoom = 1; _panX = 0; _panY = 0;
+  eventModalImg.style.transform = '';
+  eventModalImg.style.cursor = 'zoom-in';
+}
+
+eventModalImg.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const prevZoom = _zoom;
+  const factor   = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  _zoom = Math.min(8, Math.max(1, _zoom * factor));
+  const ratio = _zoom / prevZoom;
+
+  // Zoom toward cursor: the image point under the cursor must not move.
+  // screenX = imageX*zoom + panX  →  panX2 = panX1 + cursorX*(1 - ratio)
+  // cursorX is measured from the current visual center (getBoundingClientRect
+  // returns post-transform bounds, so its center is the visual center).
+  const rect  = eventModalImg.getBoundingClientRect();
+  const cx    = e.clientX - (rect.left + rect.width  / 2);
+  const cy    = e.clientY - (rect.top  + rect.height / 2);
+  _panX += cx * (1 - ratio);
+  _panY += cy * (1 - ratio);
+
+  if (_zoom === 1) { _panX = 0; _panY = 0; }
+  _applyZoom();
+}, { passive: false });
+
+eventModalImg.addEventListener('mousedown', (e) => {
+  if (_zoom <= 1) return;
+  e.preventDefault();
+  _panning = true;
+  _panOrigin = { x: e.clientX - _panX, y: e.clientY - _panY };
+  eventModalImg.style.cursor = 'grabbing';
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!_panning) return;
+  _panX = e.clientX - _panOrigin.x;
+  _panY = e.clientY - _panOrigin.y;
+  _applyZoom();
+});
+
+window.addEventListener('mouseup', () => {
+  if (_panning) { _panning = false; _applyZoom(); }
+});
 
 const _TYPE_LABELS = { chalking: 'Chalking', sweeper: 'Sweeper', pe_vehicle: 'PE Vehicle' };
 
@@ -910,13 +969,15 @@ function openEventModal(src, ev) {
   alertStatus.className   = 'event-modal-status';
   btnAlert.disabled       = false;
   btnAlert.textContent    = '\u{1F4F1} Send Alert';
+  _resetZoom();
   eventModal.classList.remove('hidden');
 }
 
 function closeEventModal() {
   eventModal.classList.add('hidden');
-  eventModalImg.src      = '';
-  _currentModalEvent     = null;
+  eventModalImg.src  = '';
+  _currentModalEvent = null;
+  _resetZoom();
 }
 
 eventModalClose.addEventListener('click', closeEventModal);
