@@ -1,6 +1,6 @@
 # Operations Runbook
 
-## Starting the dashboard
+## Starting the dashboard (production build)
 
 ```bash
 source .venv/Scripts/activate   # Windows Git Bash
@@ -8,6 +8,41 @@ python -m src.main_web
 ```
 
 Browse to `http://localhost:8000`. Using bare `uvicorn` instead of `main_web` will cause WebSocket ping crashes on slow/mobile connections (see ADR 009).
+
+## Frontend development workflow
+
+Run the Vite dev server alongside FastAPI for hot-module replacement during frontend work:
+
+```bash
+# Terminal 1 — FastAPI backend
+source .venv/Scripts/activate
+python -m src.main_web
+
+# Terminal 2 — Vite dev server (proxies /api and /ws to localhost:8000)
+cd frontend
+npm run dev
+```
+
+Open `http://localhost:5173` (the Vite port, not 8000) to get HMR. The `/api`, `/snapshots`, and `/ws` paths are proxied to the FastAPI server automatically via `vite.config.ts`.
+
+After finishing frontend changes, rebuild before deploying:
+
+```bash
+cd frontend && npm run build
+```
+
+This outputs the compiled assets to `frontend-dist/` which FastAPI serves directly.
+
+## Deploying with Docker
+
+```bash
+docker compose build   # builds React frontend + Python image
+docker compose up -d
+```
+
+The `Dockerfile` uses a two-stage build: Node 20 compiles the React frontend in stage 1; Python 3.11 installs deps and runs the server in stage 2. No pre-build step is needed.
+
+> **GPU note:** The default `python:3.11-slim` base runs YOLO on CPU. For GPU acceleration change the stage-2 base image in `Dockerfile` to `nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04` and install Python 3.11 manually.
 
 ## Exposing to mobile / external via ngrok
 

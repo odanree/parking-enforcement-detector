@@ -24,10 +24,9 @@ from pathlib import Path
 import json
 import yaml
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 load_dotenv()
@@ -89,18 +88,18 @@ async def lifespan(app: FastAPI):
 
 _SNAPSHOTS_DIR = Path("snapshots")
 _SNAPSHOTS_DIR.mkdir(exist_ok=True)
+_DIST = _BASE.parent.parent / "frontend-dist"
 
 app = FastAPI(title="Parking Enforcement Detector", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=str(_BASE / "static")), name="static")
-app.mount("/snapshots", StaticFiles(directory=str(_SNAPSHOTS_DIR)), name="snapshots")
-templates = Jinja2Templates(directory=str(_BASE / "templates"))
+app.mount("/assets",    StaticFiles(directory=str(_DIST / "assets")),  name="assets")
+app.mount("/snapshots", StaticFiles(directory=str(_SNAPSHOTS_DIR)),    name="snapshots")
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
-async def dashboard(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
+async def dashboard():
+    return FileResponse(str(_DIST / "index.html"))
 
 
 # ── REST ──────────────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""Playwright E2E tests for the parking enforcement dashboard.
+"""Playwright E2E tests for the parking enforcement dashboard (React frontend).
 
 Requires `pytest --headed` to see the browser, or run headless (default).
 The `app_server` fixture (conftest.py) starts FastAPI on port 18999 with the
@@ -21,8 +21,24 @@ pytestmark = pytest.mark.e2e
 
 def goto_dashboard(page: Page, base_url: str) -> None:
     page.goto(base_url)
-    # Wait for JS to initialise (stats badge turns green/red within ~2s)
+    # Wait for React to mount and the first stats poll to complete (~2 s)
     page.wait_for_load_state("networkidle")
+
+
+def open_modal(page: Page, event_type: str = "chalking", confidence: float = 0.91,
+               description: str = "Person crouching near rear tire") -> None:
+    """Open the event modal via the Zustand store helper exposed by main.tsx."""
+    page.evaluate(f"""() => {{
+        window.__openModal({{
+            timestamp: Date.now() / 1000,
+            event_type: '{event_type}',
+            confidence: {confidence},
+            description: '{description}',
+            snapshot_url: null,
+        }});
+    }}""")
+    # Wait for the modal to appear in the DOM
+    page.locator(".event-modal").wait_for(state="visible")
 
 
 # ── Layout tests ──────────────────────────────────────────────────────────────
@@ -66,8 +82,6 @@ class TestStatsPolling:
         goto_dashboard(page, base_url)
         uptime = page.locator("#stat-uptime")
         expect(uptime).to_be_visible()
-        # Format is HH:MM:SS — match at least the colons
-        uptime.wait_for(state="visible")
         text = uptime.inner_text()
         assert text.count(":") == 2, f"Unexpected uptime format: {text!r}"
 
@@ -86,7 +100,7 @@ class TestDebugDrawer:
     def test_debug_button_opens_drawer(self, page: Page, base_url: str):
         goto_dashboard(page, base_url)
         page.click("#btn-debug-open")
-        # JS adds the 'open' class to the drawer on open
+        # React adds the 'open' class; drawer slides in via CSS transition
         expect(page.locator(".debug-drawer")).to_have_class("debug-drawer open")
         expect(page.locator("#btn-debug-close")).to_be_visible()
 
@@ -94,21 +108,19 @@ class TestDebugDrawer:
         goto_dashboard(page, base_url)
         page.click("#btn-debug-open")
         page.click("#btn-debug-close")
-        # After close, backdrop should not block the page
+        expect(page.locator(".debug-drawer")).not_to_have_class("debug-drawer open")
 
 
 # ── Toolbar playback controls ─────────────────────────────────────────────────
 
 class TestPlaybackControls:
-    def test_seek_buttons_hidden_on_live(self, page: Page, base_url: str):
-        """When is_live=true (no file stream), seek and speed buttons are hidden."""
+    def test_seek_buttons_absent_on_live(self, page: Page, base_url: str):
+        """When is_live=true (no file stream), React does not render seek buttons."""
         goto_dashboard(page, base_url)
-        # Wait one stats poll cycle (~2 s)
+        # Wait one stats poll cycle (~2 s) to receive is_live from the server
         page.wait_for_timeout(2500)
-        seek_btn = page.locator(".btn-seek").first
-        # In live mode, buttons should be display:none
-        # (will still be in the DOM, just hidden)
-        assert seek_btn.evaluate("el => el.style.display") == "none"
+        # React conditionally renders seek buttons — they are absent from the DOM
+        expect(page.locator(".btn-seek")).to_have_count(0)
 
     def test_pause_button_present(self, page: Page, base_url: str):
         goto_dashboard(page, base_url)
@@ -122,51 +134,44 @@ class TestPlaybackControls:
 # ── Event modal ───────────────────────────────────────────────────────────────
 
 class TestEventModal:
-    def test_modal_hidden_initially(self, page: Page, base_url: str):
+    def test_modal_absent_initially(self, page: Page, base_url: str):
+        """React renders the modal conditionally — it is not in the DOM until opened."""
         goto_dashboard(page, base_url)
-        modal = page.locator("#event-modal")
-        expect(modal).to_have_class("event-modal hidden")
+        expect(page.locator(".event-modal")).to_have_count(0)
 
     def test_modal_has_required_elements(self, page: Page, base_url: str):
-        """Verify modal structure even before it's opened (DOM is always present)."""
+        """Verify modal structure after it is opened."""
         goto_dashboard(page, base_url)
-        expect(page.locator("#event-modal-img")).to_be_attached()
-        expect(page.locator("#event-modal-desc")).to_be_attached()
-        expect(page.locator("#btn-alert")).to_be_attached()
-        expect(page.locator("#event-modal-close")).to_be_attached()
+        open_modal(page)
+        expect(page.locator(".event-modal-img-wrap")).to_be_attached()
+        expect(page.locator(".event-modal-desc")).to_be_attached()
+        expect(page.locator(".btn-alert")).to_be_attached()
+        expect(page.locator(".event-modal-close")).to_be_attached()
 
-    def test_modal_opens_via_js(self, page: Page, base_url: str):
-        """Trigger openEventModal() via JS to verify the modal shows correctly."""
+    def test_modal_opens_with_correct_content(self, page: Page, base_url: str):
+        """Open the modal via __openModal and verify displayed content."""
         goto_dashboard(page, base_url)
-        page.evaluate("""() => {
-            const fakeEvent = {
-                timestamp: Date.now() / 1000,
-                event_type: 'chalking',
-                confidence: 0.91,
-                description: 'Person crouching near rear tire',
-                snapshot_url: null,
-            };
-            openEventModal('', fakeEvent);
-        }""")
-        modal = page.locator("#event-modal")
-        expect(modal).not_to_have_class("event-modal hidden")
-        expect(page.locator("#event-modal-type")).to_contain_text("Chalking")
-        expect(page.locator("#event-modal-conf")).to_contain_text("91%")
-        expect(page.locator("#event-modal-desc")).to_contain_text("Person crouching")
+        open_modal(page, event_type="chalking", confidence=0.91,
+                   description="Person crouching near rear tire")
+        expect(page.locator(".event-modal-badge")).to_contain_text("Chalking")
+        expect(page.locator(".event-modal-conf")).to_contain_text("91%")
+        expect(page.locator(".event-modal-desc")).to_contain_text("Person crouching")
 
     def test_modal_close_button(self, page: Page, base_url: str):
         goto_dashboard(page, base_url)
-        page.evaluate("""() => {
-            openEventModal('', {
-                timestamp: Date.now() / 1000,
-                event_type: 'sweeper',
-                confidence: 0.8,
-                description: 'Street sweeper',
-                snapshot_url: null,
-            });
-        }""")
-        page.click("#event-modal-close")
-        expect(page.locator("#event-modal")).to_have_class("event-modal hidden")
+        open_modal(page, event_type="sweeper", confidence=0.8,
+                   description="Street sweeper")
+        page.click(".event-modal-close")
+        # After closing, React removes the element from the DOM
+        expect(page.locator(".event-modal")).to_have_count(0)
+
+    def test_modal_closes_on_backdrop_click(self, page: Page, base_url: str):
+        goto_dashboard(page, base_url)
+        open_modal(page)
+        # Click the backdrop (the modal overlay itself, not the inner card)
+        modal = page.locator(".event-modal")
+        modal.click(position={"x": 10, "y": 10})
+        expect(page.locator(".event-modal")).to_have_count(0)
 
 
 # ── API smoke tests ───────────────────────────────────────────────────────────
