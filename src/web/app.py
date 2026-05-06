@@ -166,8 +166,13 @@ class PrivacyRegionsPayload(BaseModel):
     regions: list[list[int]]
 
 
+_DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
+
+
 @app.post("/api/privacy/regions")
 async def update_privacy_regions(body: PrivacyRegionsPayload):
+    if _DEMO_MODE:
+        raise HTTPException(status_code=403, detail="Privacy regions are locked in demo mode")
     state.update_privacy_regions(body.regions)
     _save_privacy(body.regions)
     return {"regions": state.get_privacy_regions()}

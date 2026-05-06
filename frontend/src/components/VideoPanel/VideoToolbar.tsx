@@ -93,31 +93,29 @@ export function VideoToolbar({ zoneEditing, privEditing, onEnterZoneEdit, onEnte
         </div>
       )}
 
-      <div className="toolbar-right">
-        <button
-          className={`btn-privacy-edit${privEditing ? ' active' : ''}`}
-          onClick={privEditing ? undefined : onEnterPrivEdit}
-        >
-          Edit Regions
-        </button>
-        {!demo && (
-          <>
-            <button className={`btn-motion${motionOn ? ' active' : ''}`} onClick={toggleMotion}>
-              {motionOn ? 'Motion Detect ON' : 'Motion Detect'}
-            </button>
-            <button className={`btn-privacy${privacyOn ? ' active' : ''}`} onClick={togglePrivacy}>
-              &#128683; Privacy
-            </button>
-            <button
-              id="btn-edit-zone"
-              className={`btn-zone${zoneEditing ? ' active' : ''}`}
-              onClick={zoneEditing ? undefined : onEnterZoneEdit}
-            >
-              {zoneEditing ? 'Editing…' : 'Edit Zone'}
-            </button>
-          </>
-        )}
-      </div>
+      {!demo && (
+        <div className="toolbar-right">
+          <button className={`btn-motion${motionOn ? ' active' : ''}`} onClick={toggleMotion}>
+            {motionOn ? 'Motion Detect ON' : 'Motion Detect'}
+          </button>
+          <button className={`btn-privacy${privacyOn ? ' active' : ''}`} onClick={togglePrivacy}>
+            &#128683; Privacy
+          </button>
+          <button
+            className={`btn-privacy-edit${privEditing ? ' active' : ''}`}
+            onClick={privEditing ? undefined : onEnterPrivEdit}
+          >
+            Edit Regions
+          </button>
+          <button
+            id="btn-edit-zone"
+            className={`btn-zone${zoneEditing ? ' active' : ''}`}
+            onClick={zoneEditing ? undefined : onEnterZoneEdit}
+          >
+            {zoneEditing ? 'Editing…' : 'Edit Zone'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
