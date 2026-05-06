@@ -43,7 +43,7 @@ class AppState:
         self._zone_version: int = 0
         self.paused: bool = False
         self.motion_detect_enabled: bool = False
-        self.privacy_mode: bool = False
+        self.privacy_mode: bool = _DEMO_MODE
         self.privacy_regions: list[list[int]] = []  # [[x1,y1,x2,y2], ...]
         self._stream = None   # VideoFileHandler reference, set by pipeline
         self._fps_times: Deque[float] = deque()  # monotonic timestamps of recent frames
