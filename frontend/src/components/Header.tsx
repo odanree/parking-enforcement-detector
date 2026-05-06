@@ -5,6 +5,7 @@ export function Header() {
   const wsStatus   = useAppStore((s) => s.wsStatus);
   const debugItems = useAppStore((s) => s.debugItems);
   const setDebugOpen = useAppStore((s) => s.setDebugOpen);
+  const demo = stats?.demo_mode ?? false;
 
   return (
     <header>
@@ -19,12 +20,14 @@ export function Header() {
         <span id="badge-ws" className={`badge badge-ws ${wsStatus}`}>
           &#x25CF; Stream
         </span>
-        <button id="btn-debug-open" className="btn-debug-open" onClick={() => setDebugOpen(true)}>
-          Debug
-          {debugItems.length > 0 && (
-            <span className="debug-badge visible">{debugItems.length}</span>
-          )}
-        </button>
+        {!demo && (
+          <button id="btn-debug-open" className="btn-debug-open" onClick={() => setDebugOpen(true)}>
+            Debug
+            {debugItems.length > 0 && (
+              <span className="debug-badge visible">{debugItems.length}</span>
+            )}
+          </button>
+        )}
       </div>
     </header>
   );

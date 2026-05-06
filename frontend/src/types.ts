@@ -23,6 +23,7 @@ export interface Stats {
   playback_direction: number;
   is_live: boolean;
   fps: number;
+  demo_mode: boolean;
 }
 
 export interface VlmJob {

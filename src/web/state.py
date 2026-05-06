@@ -6,12 +6,15 @@ async handlers.  All mutations go through a single Lock.
 
 from __future__ import annotations
 
+import os
 import time
 import threading
 from collections import deque
 from typing import Any, Deque
 from dataclasses import dataclass, field
 from typing import Optional
+
+_DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 
 @dataclass
@@ -240,6 +243,7 @@ class AppState:
                 "playback_direction": self._stream._direction if self._stream and hasattr(self._stream, '_direction') else 1,
                 "is_live": not (self._stream and hasattr(self._stream, '_speed')),
                 "fps": float(len(self._fps_times)),
+                "demo_mode": _DEMO_MODE,
             }
 
     def get_events(self, limit: int = 30) -> list[dict]:

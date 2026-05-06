@@ -91,6 +91,7 @@ function ZoomableImage({ src }: { src: string }) {
 export function EventModal() {
   const ev         = useAppStore((s) => s.modalEvent);
   const closeModal = useAppStore((s) => s.closeModal);
+  const demo       = useAppStore((s) => s.stats?.demo_mode ?? false);
   const [alertStatus, setAlertStatus] = useState<{ msg: string; ok: boolean } | null>(null);
   const [alertDisabled, setAlertDisabled] = useState(false);
 
@@ -159,13 +160,17 @@ export function EventModal() {
             </div>
             <div className="event-modal-section-label">LLM Response</div>
             <div className="event-modal-desc">{ev.description || 'No description'}</div>
-            <button className="btn-alert" onClick={sendAlert} disabled={alertDisabled}>
-              &#128241; Send Alert
-            </button>
-            {alertStatus && (
-              <div className={`event-modal-status ${alertStatus.ok ? 'ok' : 'err'}`}>
-                {alertStatus.msg}
-              </div>
+            {!demo && (
+              <>
+                <button className="btn-alert" onClick={sendAlert} disabled={alertDisabled}>
+                  &#128241; Send Alert
+                </button>
+                {alertStatus && (
+                  <div className={`event-modal-status ${alertStatus.ok ? 'ok' : 'err'}`}>
+                    {alertStatus.msg}
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
