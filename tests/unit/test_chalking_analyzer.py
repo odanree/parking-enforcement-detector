@@ -3,52 +3,67 @@ import pytest
 from src.behavior.chalking_analyzer import ChalkingAnalyzer
 
 
-def feed(analyzer, track_id, heights):
-    results = []
-    for h in heights:
-        results.append(analyzer.update(track_id, h))
-    return results
-
-
 class TestChalkingAnalyzer:
-    def test_no_trigger_on_insufficient_history(self):
-        a = ChalkingAnalyzer(height_decrease_threshold=0.30, history_frames=15)
-        # Only 2 frames — not enough history
-        assert not a.update(1, 200)
-        assert not a.update(1, 150)
+    def test_no_trigger_before_entry_frames(self):
+        a = ChalkingAnalyzer(entry_frames=10, sample_every_n=30, cooldown_seconds=0)
+        for _ in range(9):
+            assert not a.update(1)
 
-    def test_triggers_on_30pct_decrease(self):
-        a = ChalkingAnalyzer(height_decrease_threshold=0.30, history_frames=9, cooldown_seconds=0)
-        # Establish a baseline of ~200 over 3 frames, then drop to 130 (35 % decrease)
-        heights = [200, 200, 200, 200, 200, 200, 200, 200, 130]
-        results = feed(a, 1, heights)
+    def test_triggers_at_entry_frame(self):
+        a = ChalkingAnalyzer(entry_frames=5, sample_every_n=30, cooldown_seconds=0)
+        results = [a.update(1) for _ in range(5)]
         assert results[-1] is True
 
-    def test_no_trigger_on_small_decrease(self):
-        a = ChalkingAnalyzer(height_decrease_threshold=0.30, history_frames=9, cooldown_seconds=0)
-        heights = [200, 200, 200, 200, 200, 200, 200, 200, 180]  # 10 % decrease
-        results = feed(a, 1, heights)
-        assert not any(results)
+    def test_triggers_every_sample_n_frames_after_entry(self):
+        a = ChalkingAnalyzer(entry_frames=3, sample_every_n=5, cooldown_seconds=0)
+        # Run 20 frames, collect indices where True is returned
+        trigger_indices = [i for i in range(20) if a.update(1)]
+        # Should fire at frame 2 (entry), then 7, 12, 17 (every 5 after)
+        assert trigger_indices == [2, 7, 12, 17]
 
-    def test_cooldown_prevents_duplicate_alerts(self):
-        a = ChalkingAnalyzer(height_decrease_threshold=0.30, history_frames=9, cooldown_seconds=999)
-        heights = [200] * 6 + [130, 130, 130]
-        results = feed(a, 1, heights)
-        first_trigger = results.index(True)
-        # All subsequent frames should be suppressed by cooldown
-        assert not any(results[first_trigger + 1:])
+    def test_cooldown_suppresses_after_alert(self):
+        a = ChalkingAnalyzer(entry_frames=3, sample_every_n=5, cooldown_seconds=999)
+        # Get first trigger
+        for _ in range(3):
+            a.update(1)
+        a.on_alert(1)
+        # Next sampling points should all be suppressed
+        for _ in range(20):
+            assert not a.update(1)
 
-    def test_evict_clears_history(self):
-        a = ChalkingAnalyzer(history_frames=9, cooldown_seconds=0)
-        feed(a, 42, [200, 200, 200])
+    def test_cooldown_zero_allows_immediate_retrigger(self):
+        a = ChalkingAnalyzer(entry_frames=3, sample_every_n=5, cooldown_seconds=0)
+        # Advance to first trigger
+        for _ in range(3):
+            a.update(1)
+        a.on_alert(1)
+        # advance to next sampling point
+        for _ in range(4):
+            a.update(1)
+        assert a.update(1) is True
+
+    def test_evict_clears_state(self):
+        a = ChalkingAnalyzer(entry_frames=3, sample_every_n=5, cooldown_seconds=0)
+        for _ in range(5):
+            a.update(42)
         a.evict(42)
-        assert 42 not in a._heights
+        assert 42 not in a._frame_count
+        assert 42 not in a._last_alert
 
     def test_multiple_tracks_independent(self):
-        a = ChalkingAnalyzer(height_decrease_threshold=0.30, history_frames=9, cooldown_seconds=0)
-        heights_trigger = [200] * 6 + [130, 130, 130]
-        heights_stable = [200] * 9
-        r1 = feed(a, 1, heights_trigger)
-        r2 = feed(a, 2, heights_stable)
-        assert any(r1)
+        a = ChalkingAnalyzer(entry_frames=3, sample_every_n=5, cooldown_seconds=0)
+        # Track 1: advance to trigger
+        r1 = [a.update(1) for _ in range(3)]
+        # Track 2: only 2 frames — should not trigger
+        r2 = [a.update(2) for _ in range(2)]
+        assert r1[-1] is True
         assert not any(r2)
+
+    def test_cooldown_per_track(self):
+        a = ChalkingAnalyzer(entry_frames=3, sample_every_n=5, cooldown_seconds=999)
+        for _ in range(3):
+            a.update(1)
+        a.on_alert(1)
+        # Track 2 is independent — no cooldown applied
+        r2 = [a.update(2) for _ in range(3)]
+        assert r2[-1] is True
