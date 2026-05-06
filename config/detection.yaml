@@ -1,7 +1,7 @@
 chalking:
   cooldown_seconds: 30
-  entry_frames: 5
-  sample_every_n: 15
+  entry_frames: 2
+  sample_every_n: 10
 detector:
   input_height: 720
   input_width: 1280

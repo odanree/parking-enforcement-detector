@@ -141,25 +141,24 @@ class VideoFileHandler:
                     pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(total - 1, pos + delta)))
 
-                t0          = time.monotonic()
-                fps         = cap.get(cv2.CAP_PROP_FPS) or 30.0
-                frame_delay = 1.0 / (fps * self._speed)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+                # Speed > 1x: skip intermediate frames so the pipeline sees
+                # every N-th frame while still advancing through the video at
+                # the requested rate.  Skipping via cap.read() is cheaper than
+                # a seek on CPU-decoded H.264 streams.
+                skip = max(0, round(self._speed) - 1)
+                for _ in range(skip):
+                    cap.read()
 
                 ok, frame = cap.read()
                 if not ok:
                     break
 
-                if self._queue.full():
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        pass
+                # Blocking put — video paces itself to the pipeline instead of
+                # dropping frames.  Frame drops broke ByteTrack continuity and
+                # reset the chalking entry-frame counter mid-person.
                 self._queue.put(frame)
-
-                elapsed = time.monotonic() - t0
-                sleep   = frame_delay - elapsed
-                if sleep > 0:
-                    time.sleep(sleep)
 
         # ── Reverse (chunk-based) ─────────────────────────────────────────────
         else:
