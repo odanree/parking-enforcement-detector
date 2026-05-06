@@ -211,3 +211,32 @@ stationary objects during low-confidence detection frames.
 **Fix:** Capture `prevLastTs = lastEventTs` before updating it. On first load (`prevLastTs === 0`), render all events. On subsequent polls, filter `e.timestamp > prevLastTs` to add only genuinely new events.
 
 **Why it matters:** A filter that references a variable it just modified is a classic off-by-one class of bug. The symptom (works during session, breaks on refresh) is a strong signal that initial state differs from steady-state — look for variables initialized to 0 or null that are mutated before use.
+
+---
+
+## L12 — `width: 100%; aspect-ratio: 16/9` causes oversized canvas on ultrawide monitors
+
+**Date:** 2026-05-05
+
+**What happened:** After fixing the canvas to maintain 16:9 with `width: 100%; aspect-ratio: 16/9`, the video was correct on standard monitors but dominated ultrawide screens. The `1fr` grid column on a 3440px monitor was ~3000px wide, making the canvas 1688px tall — taller than the viewport and squishing the side panel into an unusable strip.
+
+**Fix:** Replace `width: 100%` with `width: min(100%, calc((100vh - 110px) * 16 / 9))`. The second argument caps the canvas width at the value that produces exactly the available viewport height at 16:9. `min()` picks the smaller of the two, so narrow screens behave normally while ultrawide screens cap the canvas to a viewport-filling size.
+
+**Why it matters:** `1fr` in a grid column grows without bound on wide screens. Any element that derives its height from its width via `aspect-ratio` will eventually exceed the viewport height as the screen gets wider. Cap width by both the container width AND the viewport-height-derived max width.
+
+---
+
+## L13 — CSS zoom-to-cursor formula: `panX * ratio` drifts; correct is `panX += cursorX * (1 - ratio)`
+
+**Date:** 2026-05-05
+
+**What happened:** A scroll-to-zoom feature on the event modal image used `panX2 = cursorX * (1 - ratio) + panX1 * ratio`. After the first scroll the zoom appeared correct, but on subsequent scrolls the focal point drifted back toward the original cursor position rather than tracking the current cursor.
+
+**Root cause:** The `panX1 * ratio` term accumulates error. Each zoom step multiplies the accumulated pan by the zoom ratio, causing the pan to grow proportionally rather than staying fixed. The correct derivation is:
+
+Screen position of image point P: `screenX = P.x * zoom + panX`.  
+To keep P fixed under cursor at `cursorX` (relative to visual center): `panX2 = panX1 + cursorX * (1 - ratio)`.
+
+This is simply `panX += cursorX * (1 - ratio)` — add a delta, never multiply the accumulated pan.
+
+**Why it matters:** The `panX * ratio` form appears intuitive ("scale the existing offset too") but is mathematically wrong. Always derive zoom-to-point formulas from the fixed-point constraint: the image coordinate under the cursor must be identical before and after the zoom step.
