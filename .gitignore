@@ -11,4 +11,5 @@ logs/*
 !logs/.gitkeep
 .pytest_cache/
 dist/
+frontend-dist/
 *.egg-info/

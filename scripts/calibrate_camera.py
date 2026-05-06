@@ -118,7 +118,9 @@ class _QuietServer(ThreadingMixIn, HTTPServer):
 def _start_stream_server() -> None:
     server = _QuietServer(("0.0.0.0", STREAM_PORT), _SnapshotHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"Calibration stream → http://192.168.1.138:{STREAM_PORT}  (open on phone)")
+    import socket
+    host_ip = socket.gethostbyname(socket.gethostname())
+    print(f"Calibration stream → http://{host_ip}:{STREAM_PORT}  (open on phone)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

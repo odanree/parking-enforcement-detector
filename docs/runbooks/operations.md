@@ -168,7 +168,7 @@ ALERT_PHONE=+1xxxxxxxxxx
 | `SMTP_PASS` | *(unset)* | Gmail App Password |
 | `NTFY_TOPIC` | *(unset)* | ntfy.sh topic name |
 | `TEXTBELT_KEY` | *(unset)* | TextBelt API key |
-| `ALERT_PHONE` | `+17145671107` | Destination phone for SMS providers |
+| `ALERT_PHONE` | *(unset)* | Destination phone for SMS providers |
 
 ## Log file
 
