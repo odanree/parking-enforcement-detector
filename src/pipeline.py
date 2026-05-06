@@ -181,10 +181,16 @@ def run(state=None) -> None:
     # Each entry: (future, kind, track_id, snap_frame, bbox, thumb_b64)
     _vlm_jobs: dict[tuple[str, int], tuple[Future, str, int, np.ndarray, tuple, str]] = {}
 
+    _initial_paused = os.getenv("INITIAL_PAUSED", "false").lower() == "true"
+    if video_path and _initial_paused:
+        stream.pause()
+
     stream.start()
     if state:
         state.set_stream(stream)
         state.pipeline_running = True
+        if video_path and _initial_paused:
+            state.paused = True
     logger.info("Pipeline running — press Ctrl-C to stop")
 
     frame_count = 0

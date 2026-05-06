@@ -70,7 +70,7 @@ export function VideoToolbar({ zoneEditing, privEditing, onEnterZoneEdit, onEnte
   return (
     <div className="video-toolbar">
       <button id="btn-pause" className={`btn-pause${paused ? ' paused' : ''}`} onClick={togglePause}>
-        {paused ? '▶ Resume' : '⏸ Pause'}
+        {paused ? (demo ? '▶ Run Demo' : '▶ Resume') : '⏸ Pause'}
       </button>
 
       {!isLive && (
