@@ -357,9 +357,6 @@ def run(state=None) -> None:
                 annotated = _annotate(frame, all_dets, zone_dets, alert_ids)
                 if state.privacy_mode and state.privacy_regions:
                     annotated = _apply_privacy(annotated, state.privacy_regions)
-                if _AUTO_BLUR_PLATES:
-                    car_bboxes = [d.bbox for d in all_dets if d.class_name == "car"]
-                    annotated = _blur_plates(annotated, car_bboxes)
                 _last_jpeg = _encode_jpeg(annotated)
                 state.push_frame(_last_jpeg)
 
@@ -414,37 +411,6 @@ def _apply_privacy(frame: np.ndarray, regions: list[list[int]]) -> np.ndarray:
     fh, fw = out.shape[:2]
     for x1, y1, x2, y2 in regions:
         out[max(0, y1):min(fh, y2), max(0, x1):min(fw, x2)] = 0
-    return out
-
-
-_AUTO_BLUR_PLATES: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
-
-
-def _blur_plates(frame: np.ndarray, car_bboxes: list[tuple[int, int, int, int]]) -> np.ndarray:
-    """Gaussian-blur the estimated license plate region on each car detection.
-
-    Plates are heuristically estimated as the bottom 20% of the car bbox,
-    centered horizontally at 55% of the bbox width — reliable for street-level
-    footage where cars face front-on or rear-on to the camera.
-    """
-    if not car_bboxes:
-        return frame
-    out = frame.copy()
-    fh, fw = out.shape[:2]
-    for x1, y1, x2, y2 in car_bboxes:
-        bw, bh = x2 - x1, y2 - y1
-        pw = max(20, int(bw * 0.55))
-        ph = max(8,  int(bh * 0.18))
-        cx = (x1 + x2) // 2
-        px1 = max(0, cx - pw // 2)
-        py2 = min(fh, y2 - max(2, int(bh * 0.03)))
-        py1 = max(0, py2 - ph)
-        px2 = min(fw, px1 + pw)
-        roi = out[py1:py2, px1:px2]
-        if roi.size == 0:
-            continue
-        ksize = max(15, (min(pw, ph) | 1))   # must be odd
-        out[py1:py2, px1:px2] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
     return out
 
 
