@@ -109,6 +109,32 @@ some portion of the camera's field of view.
 
 ---
 
+## L6 — VLM "confidence" field reflects certainty in the answer, not probability of the event
+
+**Date:** 2026-05-05
+
+**What happened:** The debug drawer showed a frame where a person was standing directly beside a vehicle's rear wheel. The VLM returned `chalking_detected: false, confidence: 1.0`. The intuitive read was "100% confident it's not chalking" — which seemed wrong. But a low-confidence negative (e.g. `confidence: 0.1`) was being interpreted as "90% chance of chalking" which is equally wrong.
+
+**Clarification:** The `confidence` field in the VLM response is the model's self-assessed certainty in whatever answer it gave — positive or negative. `{chalking_detected: false, confidence: 1.0}` means "I'm very sure there's no chalking." `{chalking_detected: false, confidence: 0.1}` means "I said no, but I'm not sure." Neither implies anything about the probability of the opposite.
+
+**Fix:** Do not invert confidence to derive detection probability. Use confidence only to rank the strength of a positive detection for the event log (e.g. "95%" displayed alongside a chalking alert). For negatives, use the debug description to understand why.
+
+**Why it matters:** Misreading the confidence field as an inverse probability leads to incorrect threshold logic and bad prompt tuning hypotheses.
+
+---
+
+## L7 — VLM tool-visibility requirement fails at overhead camera distance
+
+**Date:** 2026-05-05
+
+**What happened:** The chalking prompt required a "visible stick or chalk tool." From 5–10 m overhead, a chalk stick held near the ground is 2–4 px wide — reliably invisible to any 7B VLM. The model returned high-confidence negatives on frames that clearly showed a person adjacent to a rear wheel.
+
+**Fix:** Shift the detection criterion from tool-visibility to behavioral indicators: crouching near a tire, bending toward a wheel, close physical contact with the wheel area. A tool being visible is a sufficient condition but not a necessary one. Updated both the user prompt and the system prompt to communicate this explicitly, and instructed the model to prefer false positives over false negatives.
+
+**Why it matters:** Tool-visible prompts are designed for close-up footage. For overhead surveillance footage, behavior and proximity are the only reliable signals. Always calibrate the VLM prompt against actual camera distance and angle before deployment.
+
+---
+
 ## L5 — Stationary masking needs spread over a window, not per-frame velocity
 
 **Date:** 2026-05-04
@@ -131,3 +157,57 @@ accumulates real spread.
 produces slightly different boxes on each frame due to model non-determinism and
 compression artifacts. Any single-frame velocity measure will misclassify
 stationary objects during low-confidence detection frames.
+
+---
+
+## L8 — `overflow-y: auto` on `body` with `height: auto` silently disables Android page scroll
+
+**Date:** 2026-05-05
+
+**What happened:** The mobile CSS breakpoint set `html, body { height: auto !important; overflow-y: auto }` to unlock page scroll on Android. On a desktop browser narrowed to mobile width, scroll worked. On a Pixel running Chrome for Android, the page did not scroll at all.
+
+**Root cause:** When `body { height: auto; overflow-y: auto }`, the body element becomes its own scroll container and sizes to exactly fit its children. Because body never overflows itself, there is no scrollable content and no scrollbar appears. The browser's native viewport scroll never activates.
+
+**Fix:** Remove `overflow-y` from `html, body` in the mobile breakpoint. Use `overflow: visible !important` instead, which lets the viewport (not body) be the scroll container. The viewport scrolls automatically when body content is taller than the viewport.
+
+**Why it matters:** Setting `overflow-y: auto` on `body` is a common suggestion for enabling mobile scroll but it produces the opposite effect when combined with `height: auto`. The distinction between "body is the scroller" and "viewport is the scroller" is invisible on desktop (mouse wheel bypasses it) but critical on Android (touch scroll goes to whichever element is the scroll container).
+
+---
+
+## L9 — `overflow: hidden` on a parent card swallows touch events on Android, preventing inner element scroll
+
+**Date:** 2026-05-05
+
+**What happened:** The `.events-card` had `overflow: hidden` (to clip content to its border-radius on desktop). Inside it, `.event-list` had `max-height: 60vh; overflow-y: scroll`. On desktop, the event list scrolled correctly. On Android Chrome, touching the event list did nothing — the list did not scroll.
+
+**Root cause:** On Android Chrome, when a user touches a child element whose ancestor has `overflow: hidden`, Chrome locks the touch gesture to the ancestor's scroll context. Since the ancestor (`events-card`) had no scroll (it was a fixed-height clipping container), the touch was consumed and discarded.
+
+**Fix:** On mobile, change `.events-card` to `overflow: visible` and `.event-list` to `max-height: none; overflow-y: visible`. Remove the nested scroll entirely and let the page scroll show all events. Nested scroll containers inside `overflow: hidden` parents are unreliable on Android.
+
+**Why it matters:** Nested scroll is a common desktop pattern that breaks on Android. The reliable mobile pattern is a single scroll container (the page) with content that grows to its natural height.
+
+---
+
+## L10 — Twilio US SMS requires A2P 10DLC registration; toll-free requires org verification
+
+**Date:** 2026-05-05
+
+**What happened:** A Twilio 10DLC long-code number was purchased to send SMS alerts. The first send returned error 30034: message blocked because the number was not associated with an approved A2P 10DLC Campaign. Switching to a toll-free number prompted organization verification in the Twilio console.
+
+**Fix:** For personal/small deployments, bypass carrier-registered SMS entirely. Email via Gmail SMTP (using an App Password) requires no registration and delivers as a push notification on any phone. ntfy.sh is a free push notification alternative. TextBelt paid tier works without A2P registration.
+
+**Why it matters:** US SMS regulations tightened significantly in 2023–2024. Any new Twilio number requires A2P registration (weeks) or toll-free verification before sending to US numbers. Personal projects should default to email or push notifications and treat SMS as a paid/registered-deployment option.
+
+---
+
+## L11 — `fetchEvents` filter set `lastEventTs` before filtering, showing only the newest event on page refresh
+
+**Date:** 2026-05-05
+
+**What happened:** On page refresh, the event log showed only one event (the most recent) even though the server had many stored. During an active session, events accumulated correctly one by one.
+
+**Root cause:** `fetchEvents` updated `lastEventTs = newest` before computing `newOnes = events.filter(e => e.timestamp > (lastEventTs - 0.001))`. After the assignment, `lastEventTs` equaled `newest`, so the filter only passed events within 1 ms of the newest — effectively just one event. On first load (`lastEventTs` starting at 0), all previous events were silently dropped.
+
+**Fix:** Capture `prevLastTs = lastEventTs` before updating it. On first load (`prevLastTs === 0`), render all events. On subsequent polls, filter `e.timestamp > prevLastTs` to add only genuinely new events.
+
+**Why it matters:** A filter that references a variable it just modified is a classic off-by-one class of bug. The symptom (works during session, breaks on refresh) is a strong signal that initial state differs from steady-state — look for variables initialized to 0 or null that are mutated before use.
