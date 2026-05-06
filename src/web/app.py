@@ -214,7 +214,7 @@ async def send_alert(body: AlertPayload):
     from datetime import datetime, timezone
     import httpx
 
-    to = os.getenv("ALERT_PHONE", "+17145671107")
+    to = os.getenv("ALERT_PHONE", "")
     # Strip + for TextBelt (expects digits only)
     to_digits = to.lstrip("+")
 
