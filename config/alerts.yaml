@@ -9,7 +9,7 @@ alerts:
     sweeper: 600    # 10 min — one alert per sweep pass
 
   home_assistant:
-    enabled: true
+    enabled: false
     # Separate webhook IDs so HA automations can distinguish event type
     chalking_webhook_id: parking_chalking_detected
     sweeper_webhook_id: parking_sweeper_detected

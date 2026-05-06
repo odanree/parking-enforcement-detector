@@ -63,7 +63,7 @@ class VideoFileHandler:
 
     def seek(self, frames: int) -> None:
         """Offset playback position by +/- frames. Applied on the next loop tick."""
-        self._seek_frames = frames
+        self._seek_frames += frames
 
     def pause(self) -> None:
         self._paused.set()

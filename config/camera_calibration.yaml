@@ -1,0 +1,29 @@
+# ── Camera calibration ────────────────────────────────────────────────────────
+# PLACEHOLDER values for a generic ~180° fisheye security camera at 1280×720.
+#
+# To get real values:
+#   1. Print docs/calibration_checkerboard.pdf (9×6, 30mm squares)
+#   2. Record 15-20 seconds of the checkerboard held at different angles
+#   3. Run: python scripts/calibrate_camera.py --video <clip.mp4>
+#   4. Paste the printed K and D values below.
+#
+# Until then, tweak `alpha` (0.0–1.0) to control crop vs black-border trade-off.
+# Lower alpha = tighter crop, no black edges. Higher = more scene, black corners.
+
+camera_matrix:
+  fx: 385.0   # horizontal focal length in pixels
+  fy: 385.0   # vertical focal length in pixels
+  cx: 640.0   # principal point x  (usually ~image_width / 2)
+  cy: 360.0   # principal point y  (usually ~image_height / 2)
+
+# Fisheye distortion coefficients [k1, k2, k3, k4]
+# k1 drives most of the barrel correction — typical range −0.1 to −0.5
+distortion_coefficients: [-0.28, 0.06, -0.001, 0.0]
+
+# Output size (keep at detection resolution so no extra resize is needed)
+output_width: 1280
+output_height: 720
+
+# balance / alpha: 0.0 = crop to valid pixels only, 1.0 = keep all pixels
+# (black borders appear at edges with higher values)
+alpha: 0.3

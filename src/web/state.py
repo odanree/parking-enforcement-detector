@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 import threading
 from collections import deque
-from typing import Deque
+from typing import Any, Deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -44,6 +44,9 @@ class AppState:
         self.privacy_regions: list[list[int]] = []  # [[x1,y1,x2,y2], ...]
         self._stream = None   # VideoFileHandler reference, set by pipeline
         self._fps_times: Deque[float] = deque()  # monotonic timestamps of recent frames
+        self._pending_vlm: list[dict[str, Any]] = []  # in-flight VLM jobs
+        self._vlm_sample_counts: dict[str, int] = {}  # job_id → cumulative sample count
+        self._debug_rejected: deque[dict[str, Any]] = deque(maxlen=100)
 
     # ── Playback control ─────────────────────────────────────────────────────
 
@@ -105,6 +108,60 @@ class AppState:
     def get_privacy_regions(self) -> list[list[int]]:
         with self._lock:
             return list(self.privacy_regions)
+
+    # ── VLM pending queue ─────────────────────────────────────────────────────
+
+    def add_pending_vlm(self, kind: str, track_id: int, thumbnail_b64: str) -> None:
+        job_id = f"{kind}_{track_id}"
+        with self._lock:
+            self._vlm_sample_counts[job_id] = self._vlm_sample_counts.get(job_id, 0) + 1
+            self._pending_vlm = [j for j in self._pending_vlm if j["id"] != job_id]
+            self._pending_vlm.append({
+                "id": job_id,
+                "kind": kind,
+                "thumbnail": thumbnail_b64,
+                "submitted_at": time.time(),
+                "sample_num": self._vlm_sample_counts[job_id],
+            })
+
+    def record_rejected_vlm(
+        self, kind: str, thumbnail_b64: str, confidence: float, description: str
+    ) -> None:
+        with self._lock:
+            self._debug_rejected.appendleft({
+                "kind": kind,
+                "thumbnail": thumbnail_b64,
+                "confidence": confidence,
+                "description": description,
+                "timestamp": time.time(),
+            })
+
+    def get_rejected_vlm(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._debug_rejected)
+
+    def clear_rejected_vlm(self) -> None:
+        with self._lock:
+            self._debug_rejected.clear()
+
+    def complete_pending_vlm(self, kind: str, track_id: int, detected: bool) -> None:
+        job_id = f"{kind}_{track_id}"
+        with self._lock:
+            for j in self._pending_vlm:
+                if j["id"] == job_id:
+                    j["completed_at"] = time.time()
+                    j["detected"] = detected
+                    break
+
+    def get_pending_vlm(self) -> list[dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            # Drop entries that completed more than 4 seconds ago
+            self._pending_vlm = [
+                j for j in self._pending_vlm
+                if "completed_at" not in j or now - j["completed_at"] < 4.0
+            ]
+            return list(self._pending_vlm)
 
     # ── Zone ─────────────────────────────────────────────────────────────────
 

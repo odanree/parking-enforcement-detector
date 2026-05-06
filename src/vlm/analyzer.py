@@ -32,11 +32,15 @@ logger = logging.getLogger(__name__)
 
 # Exact prompt from the spec — kept here so it's easy to tune.
 _USER_PROMPT = (
-    'Analyze this street camera frame (wide-angle, person may appear small/distant) '
+    'Analyze this street camera frame (overhead/wide-angle, person appears small) '
     'for three parking-enforcement events:\n'
-    '1. CHALKING: Is a person holding or extending a stick, chalk, or long tool '
-    'toward the ground, a wheel, or tire area of a parked vehicle? At distance the '
-    'person may appear upright — focus on any extended object toward a wheel.\n'
+    '1. CHALKING: Flag TRUE if ANY of these apply — '
+    '(a) a person is crouching, bending, or leaning toward a vehicle\'s wheel or tire area; '
+    '(b) a person is making close physical contact with a wheel or tire; '
+    '(c) a person is holding or extending any object toward a wheel or the ground near a tire; '
+    '(d) a person is standing very close to a parked vehicle\'s rear wheel for more than a moment. '
+    'A visible chalk stick is NOT required — flag on suspicious posture or proximity to a wheel. '
+    'Err toward TRUE when a person is near a vehicle\'s wheel and their intent is ambiguous.\n'
     '2. SWEEPER: Does any vehicle show street sweeper features: oversized side '
     'brushes, water spray nozzles, or yellow caution lights?\n'
     '3. PE_VEHICLE: Does any vehicle show parking enforcement markings: '
@@ -48,11 +52,12 @@ _USER_PROMPT = (
 )
 
 _SYSTEM_PROMPT = (
-    "You are a parking-enforcement detection AI. "
-    "Analyze camera frames strictly for three behaviours: "
-    "(1) a person chalking a vehicle's tire, "
-    "(2) a street sweeper vehicle, "
-    "(3) a parking enforcement vehicle stopped on the street. "
+    "You are a parking-enforcement detection AI analyzing overhead street camera footage. "
+    "A person does not need to hold a visible tool to be chalking — "
+    "crouching near a tire, bending toward a wheel, or extended contact with the wheel area "
+    "is sufficient to flag CHALKING as true. "
+    "When in doubt about chalking, return true with a lower confidence score "
+    "rather than false — missed detections are worse than false positives here. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
 

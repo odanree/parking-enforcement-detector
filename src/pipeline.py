@@ -7,9 +7,11 @@ can read annotated frames and events in real-time.  Pass `None` for headless.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 import cv2
@@ -175,6 +177,10 @@ def run(state=None) -> None:
     if os.getenv("UNDISTORT_FRAME", "false").lower() == "true":
         undistorter = FrameUndistorter("config/camera_calibration.yaml")
 
+    _vlm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm")
+    # Each entry: (future, kind, track_id, snap_frame, bbox, thumb_b64)
+    _vlm_jobs: dict[tuple[str, int], tuple[Future, str, int, np.ndarray, tuple, str]] = {}
+
     stream.start()
     if state:
         state.set_stream(stream)
@@ -249,53 +255,85 @@ def run(state=None) -> None:
             active_ids = {d.track_id for d in zone_dets}
             alert_ids.clear()
 
+            # ── Harvest completed VLM jobs ────────────────────────────────────
+            for job_key in list(_vlm_jobs.keys()):
+                fut, kind, tid, snap_fr, bbox, thumb = _vlm_jobs[job_key]
+                if not fut.done():
+                    continue
+                del _vlm_jobs[job_key]
+                try:
+                    result = fut.result()
+                except Exception:
+                    logger.exception("VLM job (%s #%d) raised", kind, tid)
+                    if state:
+                        state.complete_pending_vlm(kind, tid, detected=False)
+                    continue
+                detected = result.get(f"{kind}_detected", False)
+                if state:
+                    state.complete_pending_vlm(kind, tid, detected=detected)
+                    if not detected:
+                        state.record_rejected_vlm(
+                            kind, thumb,
+                            result.get("confidence", 0.0),
+                            result.get("description", ""),
+                        )
+                if kind == "chalking" and result["chalking_detected"]:
+                    sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
+                    snap = notifier.send("chalking", result, sf, bbox)
+                    if state:
+                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None)
+                    alert_ids.add(tid)
+                    chalking.on_alert(tid)
+                elif kind == "sweeper" and result["sweeper_detected"]:
+                    sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
+                    snap = notifier.send("sweeper", result, sf, bbox)
+                    if state:
+                        state.record_alert("sweeper", result["confidence"], result["description"], snapshot=snap.name if snap else None)
+                    alert_ids.add(tid)
+                elif kind == "pe_vehicle" and result["pe_vehicle_detected"]:
+                    sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
+                    snap = notifier.send("pe_vehicle", result, sf, bbox)
+                    if state:
+                        state.record_alert("pe_vehicle", result["confidence"], result["description"], snapshot=snap.name if snap else None)
+                    alert_ids.add(tid)
+
             for det in zone_dets:
                 # ── Chalking ──────────────────────────────────────────────────
                 if det.class_name == "person":
                     if chalking.update(det.track_id):
-                        # Wide crop: enough context for VLM to see any stick/tool
-                        wide = _crop_wide_bytes(frame, det.bbox)
-                        result = vlm.analyze(wide)
-                        if result["chalking_detected"]:
-                            snap_frame = _apply_privacy(frame, state.privacy_regions) if (state and state.privacy_mode) else frame
-                            snap = notifier.send("chalking", result, snap_frame, det.bbox)
+                        job_key = ("chalking", det.track_id)
+                        if job_key not in _vlm_jobs:
+                            wide = _crop_wide_bytes(frame, det.bbox)
+                            thumb = _thumb_b64_from_jpeg(wide)
+                            fut = _vlm_pool.submit(vlm.analyze, wide)
+                            _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb)
                             if state:
-                                state.record_alert(
-                                    "chalking", result["confidence"], result["description"],
-                                    snapshot=snap.name if snap else None,
-                                )
-                            alert_ids.add(det.track_id)
-                            chalking.on_alert(det.track_id)
+                                state.add_pending_vlm("chalking", det.track_id, thumb)
 
                 # ── Sweeper ───────────────────────────────────────────────────
                 elif det.class_name in {"truck", "motorcycle"} and in_sweep:
                     if sweeper.update(det.track_id, det.center):
-                        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        result = vlm.analyze(buf.tobytes() if ok else b"")
-                        if result["sweeper_detected"]:
-                            snap_frame = _apply_privacy(frame, state.privacy_regions) if (state and state.privacy_mode) else frame
-                            snap = notifier.send("sweeper", result, snap_frame, det.bbox)
+                        job_key = ("sweeper", det.track_id)
+                        if job_key not in _vlm_jobs:
+                            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            sweep_bytes = buf.tobytes() if ok else b""
+                            thumb = _thumb_b64_from_jpeg(sweep_bytes)
+                            fut = _vlm_pool.submit(vlm.analyze, sweep_bytes)
+                            _vlm_jobs[job_key] = (fut, "sweeper", det.track_id, frame.copy(), det.bbox, thumb)
                             if state:
-                                state.record_alert(
-                                    "sweeper", result["confidence"], result["description"],
-                                    snapshot=snap.name if snap else None,
-                                )
-                            alert_ids.add(det.track_id)
+                                state.add_pending_vlm("sweeper", det.track_id, thumb)
 
                 # ── PE Vehicle ────────────────────────────────────────────────
                 elif det.class_name == "car":
                     if pe_vehicle.update(det.track_id, det.center):
-                        crop = _crop_bytes(frame, det.bbox)
-                        result = vlm.analyze(crop)
-                        if result["pe_vehicle_detected"]:
-                            snap_frame = _apply_privacy(frame, state.privacy_regions) if (state and state.privacy_mode) else frame
-                            snap = notifier.send("pe_vehicle", result, snap_frame, det.bbox)
+                        job_key = ("pe_vehicle", det.track_id)
+                        if job_key not in _vlm_jobs:
+                            crop_bytes = _crop_bytes(frame, det.bbox)
+                            thumb = _thumb_b64_from_jpeg(crop_bytes)
+                            fut = _vlm_pool.submit(vlm.analyze, crop_bytes)
+                            _vlm_jobs[job_key] = (fut, "pe_vehicle", det.track_id, frame.copy(), det.bbox, thumb)
                             if state:
-                                state.record_alert(
-                                    "pe_vehicle", result["confidence"], result["description"],
-                                    snapshot=snap.name if snap else None,
-                                )
-                            alert_ids.add(det.track_id)
+                                state.add_pending_vlm("pe_vehicle", det.track_id, thumb)
 
             # Evict gone tracks
             for tid in list(chalking._frame_count.keys()):
@@ -319,6 +357,7 @@ def run(state=None) -> None:
     except KeyboardInterrupt:
         logger.info("Shutting down…")
     finally:
+        _vlm_pool.shutdown(wait=False)
         stream.stop()
         if state:
             state.pipeline_running = False
@@ -367,6 +406,19 @@ def _apply_privacy(frame: np.ndarray, regions: list[list[int]]) -> np.ndarray:
     for x1, y1, x2, y2 in regions:
         out[max(0, y1):min(fh, y2), max(0, x1):min(fw, x2)] = 0
     return out
+
+
+def _thumb_b64_from_jpeg(jpeg_bytes: bytes, width: int = 200) -> str:
+    """Resize a JPEG to a small thumbnail for the pending-jobs UI card."""
+    arr = np.frombuffer(jpeg_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return ""
+    h, w = img.shape[:2]
+    height = max(1, int(h * width / w))
+    thumb = cv2.resize(img, (width, height))
+    ok, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return base64.b64encode(buf.tobytes()).decode() if ok else ""
 
 
 def _crop_wide_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
