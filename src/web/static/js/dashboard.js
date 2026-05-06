@@ -187,6 +187,7 @@ setInterval(fetchStats, 2000);
 const eventList  = document.getElementById('event-list');
 const eventCount = document.getElementById('event-count');
 let lastEventTs  = 0;
+const _eventDataMap = new Map(); // snapshot_url (relative) → event object
 
 function buildEventItem(ev) {
   const li   = document.createElement('li');
@@ -196,6 +197,8 @@ function buildEventItem(ev) {
   const timeStr = new Date(ev.timestamp * 1000).toLocaleTimeString([], {
     hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
+
+  if (ev.snapshot_url) _eventDataMap.set(ev.snapshot_url, ev);
 
   const thumbHtml = ev.snapshot_url
     ? `<img class="event-thumb" src="${ev.snapshot_url}" alt="snapshot" loading="lazy">`
@@ -223,12 +226,16 @@ async function fetchEvents() {
 
     const newest = events[0].timestamp;
     if (newest <= lastEventTs) return;
+
+    const prevLastTs = lastEventTs;
     lastEventTs = newest;
 
     const empty = eventList.querySelector('.event-empty');
     if (empty) empty.remove();
 
-    const newOnes = events.filter(e => e.timestamp > (lastEventTs - 0.001));
+    // prevLastTs === 0 means first load — render all events from server.
+    // Otherwise only add events strictly newer than what's already shown.
+    const newOnes = prevLastTs === 0 ? events : events.filter(e => e.timestamp > prevLastTs);
     newOnes.forEach(ev => {
       eventList.insertBefore(buildEventItem(ev), eventList.firstChild);
     });
@@ -532,19 +539,22 @@ overlay.addEventListener('mouseleave', () => {
 });
 
 // ── Privacy overlay ───────────────────────────────────────────────────────────
-const privacyCanvas   = document.getElementById('privacy-overlay');
-const pctx            = privacyCanvas.getContext('2d');
-const btnPrivacy      = document.getElementById('btn-privacy');
-const privacyControls = document.getElementById('privacy-controls');
-const btnSavePrivacy  = document.getElementById('btn-save-privacy');
+const privacyCanvas    = document.getElementById('privacy-overlay');
+const pctx             = privacyCanvas.getContext('2d');
+const btnPrivacy       = document.getElementById('btn-privacy');
+const btnEditPrivacy   = document.getElementById('btn-edit-privacy');
+const privacyControls  = document.getElementById('privacy-controls');
+const btnSavePrivacy   = document.getElementById('btn-save-privacy');
 const btnCancelPrivacy = document.getElementById('btn-cancel-privacy');
+const btnClearPrivacy  = document.getElementById('btn-clear-privacy');
 
 let _privacyMode    = false;
 let _privacyEditing = false;
-let _privacyRegions = [];   // [[x1,y1,x2,y2], ...]
-let _privacyDrag    = null; // {x0,y0,x1,y1} while drawing
+let _privacyRegions = [];       // saved [[x1,y1,x2,y2], ...]
+let _privacyDraft   = [];       // unsaved copy while editing
+let _privacyDrag    = null;     // {x0,y0,x1,y1} while drawing
 
-// Load saved regions from server
+// Load saved regions from server on startup
 (async () => {
   try {
     const r = await fetch('/api/privacy/regions');
@@ -556,32 +566,33 @@ let _privacyDrag    = null; // {x0,y0,x1,y1} while drawing
 
 function drawPrivacy() {
   pctx.clearRect(0, 0, privacyCanvas.width, privacyCanvas.height);
-  if (!_privacyMode && !_privacyEditing) return;
+  const regions = _privacyEditing ? _privacyDraft : _privacyRegions;
 
-  for (const [x1, y1, x2, y2] of _privacyRegions) {
+  for (const [x1, y1, x2, y2] of regions) {
     if (_privacyEditing) {
+      pctx.fillStyle = 'rgba(179,136,255,0.18)';
+      pctx.fillRect(x1, y1, x2 - x1, y2 - y1);
       pctx.strokeStyle = '#b388ff';
       pctx.lineWidth = 2;
-      pctx.setLineDash([6, 3]);
+      pctx.setLineDash([5, 3]);
       pctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
       pctx.setLineDash([]);
-      pctx.fillStyle = 'rgba(179,136,255,0.15)';
-      pctx.fillRect(x1, y1, x2 - x1, y2 - y1);
-    } else {
+    } else if (_privacyMode) {
       pctx.fillStyle = '#000';
       pctx.fillRect(x1, y1, x2 - x1, y2 - y1);
     }
   }
 
+  // Live drag preview
   if (_privacyDrag) {
     const { x0, y0, x1, y1 } = _privacyDrag;
+    pctx.fillStyle = 'rgba(179,136,255,0.25)';
+    pctx.fillRect(x0, y0, x1 - x0, y1 - y0);
     pctx.strokeStyle = '#b388ff';
     pctx.lineWidth = 2;
     pctx.setLineDash([4, 3]);
     pctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
     pctx.setLineDash([]);
-    pctx.fillStyle = 'rgba(179,136,255,0.2)';
-    pctx.fillRect(x0, y0, x1 - x0, y1 - y0);
   }
 }
 
@@ -593,26 +604,29 @@ function toPrivacyFrame(e) {
   ];
 }
 
+// Privacy toggle — simple on/off
 btnPrivacy.addEventListener('click', async () => {
-  if (!_privacyEditing) {
-    // Simple toggle privacy mode
-    try {
-      const r = await fetch('/api/privacy/toggle', { method: 'POST' });
-      const d = await r.json();
-      _privacyMode = d.privacy_mode;
-      btnPrivacy.classList.toggle('active', _privacyMode);
-      drawPrivacy();
-    } catch (_) {}
-  }
+  try {
+    const r = await fetch('/api/privacy/toggle', { method: 'POST' });
+    const d = await r.json();
+    _privacyMode = d.privacy_mode;
+    btnPrivacy.classList.toggle('active', _privacyMode);
+    drawPrivacy();
+  } catch (_) {}
 });
 
-btnPrivacy.addEventListener('contextmenu', (e) => {
-  e.preventDefault();
-  // Right-click Privacy button → enter edit mode
+// Edit Regions — opens the draw toolbar
+btnEditPrivacy.addEventListener('click', () => {
+  _privacyDraft   = _privacyRegions.map(r => [...r]);
   _privacyEditing = true;
   privacyCanvas.classList.add('editing');
   privacyControls.classList.remove('hidden');
-  btnPrivacy.textContent = '🚫 Editing…';
+  btnEditPrivacy.classList.add('active');
+  drawPrivacy();
+});
+
+btnClearPrivacy.addEventListener('click', () => {
+  _privacyDraft = [];
   drawPrivacy();
 });
 
@@ -621,26 +635,22 @@ btnSavePrivacy.addEventListener('click', async () => {
     await fetch('/api/privacy/regions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ regions: _privacyRegions }),
+      body: JSON.stringify({ regions: _privacyDraft }),
     });
+    _privacyRegions = _privacyDraft;
   } catch (_) {}
   exitPrivacyEdit();
 });
 
-btnCancelPrivacy.addEventListener('click', () => {
-  // Reload from server to discard unsaved changes
-  fetch('/api/privacy/regions').then(r => r.json()).then(d => {
-    _privacyRegions = d.regions || [];
-    exitPrivacyEdit();
-  });
-});
+btnCancelPrivacy.addEventListener('click', exitPrivacyEdit);
 
 function exitPrivacyEdit() {
   _privacyEditing = false;
+  _privacyDrag    = null;
   privacyCanvas.classList.remove('editing');
   privacyCanvas.style.cursor = '';
   privacyControls.classList.add('hidden');
-  btnPrivacy.textContent = '🚫 Privacy';
+  btnEditPrivacy.classList.remove('active');
   drawPrivacy();
 }
 
@@ -663,18 +673,17 @@ privacyCanvas.addEventListener('mouseup', () => {
   const { x0, y0, x1, y1 } = _privacyDrag;
   const rx1 = Math.min(x0, x1), ry1 = Math.min(y0, y1);
   const rx2 = Math.max(x0, x1), ry2 = Math.max(y0, y1);
-  if (rx2 - rx1 > 8 && ry2 - ry1 > 8) {
-    _privacyRegions.push([rx1, ry1, rx2, ry2]);
-  }
+  if (rx2 - rx1 > 8 && ry2 - ry1 > 8) _privacyDraft.push([rx1, ry1, rx2, ry2]);
   _privacyDrag = null;
   drawPrivacy();
 });
 
+// Right-click a drawn box to delete it
 privacyCanvas.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (!_privacyEditing) return;
   const [cx, cy] = toPrivacyFrame(e);
-  _privacyRegions = _privacyRegions.filter(([x1, y1, x2, y2]) =>
+  _privacyDraft = _privacyDraft.filter(([x1, y1, x2, y2]) =>
     !(cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2)
   );
   drawPrivacy();
@@ -689,27 +698,262 @@ function syncPrivacy(mode) {
   }
 }
 
-// ── Snapshot lightbox ─────────────────────────────────────────────────────────
-const lightbox      = document.getElementById('lightbox');
-const lightboxImg   = document.getElementById('lightbox-img');
-const lightboxClose = document.getElementById('lightbox-close');
+// ── VLM processing queue ──────────────────────────────────────────────────────
+const processingCard = document.getElementById('processing-card');
+const vlmJobList     = document.getElementById('vlm-job-list');
+const KIND_LABELS    = { chalking: 'Chalking', sweeper: 'Sweeper', pe_vehicle: 'PE Vehicle' };
 
-function openLightbox(src) {
-  lightboxImg.src = src;
-  lightbox.classList.remove('hidden');
+function renderPending(jobs) {
+  // Remove jobs no longer returned by the server
+  const currentIds = new Set(jobs.map(j => j.id));
+  vlmJobList.querySelectorAll('.vlm-job').forEach(el => {
+    if (!currentIds.has(el.dataset.id)) el.remove();
+  });
+
+  for (const job of jobs) {
+    const done = job.completed_at != null;
+    let li = vlmJobList.querySelector(`[data-id="${job.id}"]`);
+
+    if (!li) {
+      li = document.createElement('li');
+      li.className = 'vlm-job';
+      li.dataset.id = job.id;
+      li.dataset.submittedAt = job.submitted_at;
+      const sampleLabel = job.sample_num > 1 ? ` · Sample #${job.sample_num}` : '';
+      li.innerHTML = `
+        <div class="vlm-thumb-wrap">
+          ${job.thumbnail ? `<img src="data:image/jpeg;base64,${job.thumbnail}" alt="">` : ''}
+          <div class="vlm-spinner"><div class="vlm-spinner-ring"></div></div>
+        </div>
+        <div class="vlm-job-meta">
+          <div class="vlm-kind ${job.kind}">${KIND_LABELS[job.kind] ?? job.kind}${sampleLabel}</div>
+          <div class="vlm-elapsed">0.0s</div>
+          <div class="vlm-result"></div>
+        </div>
+      `;
+      vlmJobList.appendChild(li);
+    }
+
+    // Update result state once completed
+    if (done) {
+      const spinner = li.querySelector('.vlm-spinner');
+      const resultEl = li.querySelector('.vlm-result');
+      if (spinner && !spinner.dataset.resolved) {
+        spinner.dataset.resolved = '1';
+        spinner.innerHTML = job.detected
+          ? '<span style="font-size:16px">✓</span>'
+          : '<span style="font-size:16px;color:#888">✗</span>';
+        spinner.style.background = job.detected ? 'rgba(0,200,80,0.55)' : 'rgba(80,80,80,0.55)';
+      }
+      if (resultEl && !resultEl.textContent) {
+        resultEl.textContent = job.detected ? 'Detected' : 'Not detected';
+        resultEl.style.color = job.detected ? 'var(--green)' : 'var(--muted)';
+        resultEl.style.fontSize = '11px';
+        resultEl.style.marginTop = '2px';
+      }
+    }
+  }
+
+  if (vlmJobList.children.length) {
+    processingCard.classList.remove('hidden');
+  } else {
+    processingCard.classList.add('hidden');
+  }
 }
 
-function closeLightbox() {
-  lightbox.classList.add('hidden');
-  lightboxImg.src = '';
+// Tick elapsed times independently of fetch
+setInterval(() => {
+  vlmJobList.querySelectorAll('.vlm-job').forEach(li => {
+    const el = li.querySelector('.vlm-elapsed');
+    if (el) el.textContent = (Date.now() / 1000 - parseFloat(li.dataset.submittedAt)).toFixed(1) + 's';
+  });
+}, 100);
+
+async function pollPending() {
+  try {
+    const res = await fetch('/api/pending');
+    const d   = await res.json();
+    renderPending(d.jobs || []);
+  } catch (_) {}
 }
 
-lightboxClose.addEventListener('click', closeLightbox);
-lightbox.addEventListener('click', (e) => { if (e.target === lightbox) closeLightbox(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeLightbox(); });
+pollPending();
+setInterval(pollPending, 1000);
+
+// ── Debug drawer ──────────────────────────────────────────────────────────────
+const debugDrawer   = document.getElementById('debug-drawer');
+const debugBackdrop = document.getElementById('debug-backdrop');
+const debugList     = document.getElementById('debug-list');
+const debugCount    = document.getElementById('debug-count');
+const debugBadge    = document.getElementById('debug-badge');
+const btnDebugOpen  = document.getElementById('btn-debug-open');
+const btnDebugClose = document.getElementById('btn-debug-close');
+const btnDebugClear = document.getElementById('btn-debug-clear');
+
+const DEBUG_KIND_LABELS = { chalking: 'Chalking', sweeper: 'Sweeper', pe_vehicle: 'PE Vehicle' };
+
+let _debugOpen = false;
+let _debugItems = [];
+
+function openDebugDrawer()  { _debugOpen = true;  debugDrawer.classList.add('open');  debugBackdrop.classList.add('open'); }
+function closeDebugDrawer() { _debugOpen = false; debugDrawer.classList.remove('open'); debugBackdrop.classList.remove('open'); }
+
+btnDebugOpen.addEventListener('click', () => { openDebugDrawer(); fetchDebug(); });
+btnDebugClose.addEventListener('click', closeDebugDrawer);
+debugBackdrop.addEventListener('click', closeDebugDrawer);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDebugDrawer(); });
+
+btnDebugClear.addEventListener('click', async () => {
+  try {
+    await fetch('/api/debug/rejected', { method: 'DELETE' });
+    _debugItems = [];
+    renderDebug([]);
+  } catch (_) {}
+});
+
+function renderDebug(items) {
+  const n = items.length;
+  debugCount.textContent = n;
+  debugBadge.textContent = n;
+  debugBadge.classList.toggle('visible', n > 0);
+
+  if (!n) {
+    debugList.innerHTML = '<div class="debug-empty">No rejected frames yet</div>';
+    return;
+  }
+
+  // Only re-render if count changed (avoid flash on poll)
+  if (n === _debugItems.length) return;
+  _debugItems = items;
+
+  debugList.innerHTML = '';
+  for (const item of items) {
+    const timeStr = new Date(item.timestamp * 1000).toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const pct = Math.round((item.confidence ?? 0) * 100);
+    const div = document.createElement('div');
+    div.className = 'debug-item';
+    div.innerHTML = `
+      ${item.thumbnail ? `<img src="data:image/jpeg;base64,${item.thumbnail}" alt="" loading="lazy">` : ''}
+      <div class="debug-item-meta">
+        <div class="debug-item-header">
+          <span class="debug-kind ${item.kind}">${DEBUG_KIND_LABELS[item.kind] ?? item.kind}</span>
+          <span class="debug-conf">${pct}%</span>
+          <span class="debug-time">${timeStr}</span>
+        </div>
+        <div class="debug-desc">${item.description || 'No description'}</div>
+      </div>
+    `;
+    debugList.appendChild(div);
+  }
+}
+
+async function fetchDebug() {
+  try {
+    const res = await fetch('/api/debug/rejected');
+    const d   = await res.json();
+    renderDebug(d.items || []);
+  } catch (_) {}
+}
+
+// Poll count every 5s to keep badge fresh; full render only when drawer is open
+setInterval(async () => {
+  try {
+    const res = await fetch('/api/debug/rejected');
+    const d   = await res.json();
+    const items = d.items || [];
+    const n = items.length;
+    debugCount.textContent = n;
+    debugBadge.textContent = n;
+    debugBadge.classList.toggle('visible', n > 0);
+    if (_debugOpen) renderDebug(items);
+  } catch (_) {}
+}, 5000);
+
+fetchDebug();
+
+// ── Event detail modal ────────────────────────────────────────────────────────
+const eventModal      = document.getElementById('event-modal');
+const eventModalImg   = document.getElementById('event-modal-img');
+const eventModalType  = document.getElementById('event-modal-type');
+const eventModalConf  = document.getElementById('event-modal-conf');
+const eventModalTime  = document.getElementById('event-modal-time');
+const eventModalDesc  = document.getElementById('event-modal-desc');
+const eventModalClose = document.getElementById('event-modal-close');
+const btnAlert        = document.getElementById('btn-alert');
+const alertStatus     = document.getElementById('event-modal-alert-status');
+
+let _currentModalEvent = null;
+
+const _TYPE_LABELS = { chalking: 'Chalking', sweeper: 'Sweeper', pe_vehicle: 'PE Vehicle' };
+
+function openEventModal(src, ev) {
+  eventModalImg.src = src;
+  _currentModalEvent = ev;
+
+  if (ev) {
+    const pct = Math.round((ev.confidence ?? 0) * 100);
+    eventModalType.textContent  = _TYPE_LABELS[ev.event_type] ?? ev.event_type;
+    eventModalType.className    = `event-modal-badge ${ev.event_type}`;
+    eventModalConf.textContent  = `${pct}% confidence`;
+    eventModalTime.textContent  = new Date(ev.timestamp * 1000).toLocaleString();
+    eventModalDesc.textContent  = ev.description || 'No description';
+  } else {
+    eventModalType.textContent = '';
+    eventModalConf.textContent = '';
+    eventModalTime.textContent = '';
+    eventModalDesc.textContent = '';
+  }
+
+  alertStatus.textContent = '';
+  alertStatus.className   = 'event-modal-status';
+  btnAlert.disabled       = false;
+  btnAlert.textContent    = '\u{1F4F1} Send Alert';
+  eventModal.classList.remove('hidden');
+}
+
+function closeEventModal() {
+  eventModal.classList.add('hidden');
+  eventModalImg.src      = '';
+  _currentModalEvent     = null;
+}
+
+eventModalClose.addEventListener('click', closeEventModal);
+eventModal.addEventListener('click', (e) => { if (e.target === eventModal) closeEventModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeEventModal(); });
+
+btnAlert.addEventListener('click', async () => {
+  if (!_currentModalEvent) return;
+  btnAlert.disabled    = true;
+  btnAlert.textContent = 'Sending…';
+  alertStatus.textContent = '';
+  alertStatus.className   = 'event-modal-status';
+  try {
+    const res = await fetch('/api/alert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_currentModalEvent),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || 'Send failed');
+    }
+    alertStatus.textContent = '✓ Alert sent';
+    alertStatus.className   = 'event-modal-status ok';
+  } catch (err) {
+    alertStatus.textContent = err.message;
+    alertStatus.className   = 'event-modal-status err';
+    btnAlert.disabled       = false;
+  }
+  btnAlert.textContent = '\u{1F4F1} Send Alert';
+});
 
 // Delegate thumbnail clicks from the event list
 eventList.addEventListener('click', (e) => {
   const thumb = e.target.closest('.event-thumb');
-  if (thumb) openLightbox(thumb.src);
+  if (thumb) {
+    const src = thumb.getAttribute('src');
+    openEventModal(src, _eventDataMap.get(src));
+  }
 });

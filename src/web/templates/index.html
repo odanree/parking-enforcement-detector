@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Parking Enforcement Detector</title>
-  <link rel="stylesheet" href="/static/css/dashboard.css?v=8" />
+  <link rel="stylesheet" href="/static/css/dashboard.css?v=13" />
 </head>
 <body>
   <header>
@@ -13,6 +13,10 @@
       <span class="badge" id="badge-pipeline">&#x25CF; Pipeline</span>
       <span class="badge" id="badge-sweep">&#x25CF; Sweep Window</span>
       <span class="badge badge-ws" id="badge-ws">&#x25CF; Stream</span>
+      <button class="btn-debug-open" id="btn-debug-open">
+        Debug
+        <span class="debug-badge" id="debug-badge"></span>
+      </button>
     </div>
   </header>
 
@@ -48,14 +52,16 @@
         <div class="toolbar-right">
           <button class="btn-motion" id="btn-motion">Motion Detect</button>
           <button class="btn-privacy" id="btn-privacy">&#128683; Privacy</button>
+          <button class="btn-privacy-edit" id="btn-edit-privacy">Edit Regions</button>
           <button class="btn-zone" id="btn-edit-zone">Edit Zone</button>
         </div>
       </div>
 
       <!-- Privacy editing toolbar — shown only while editing privacy boxes -->
       <div class="privacy-toolbar hidden" id="privacy-controls">
-        <span class="zone-hint">Drag to add redaction box &nbsp;·&nbsp; Right-click to remove</span>
+        <span class="zone-hint">&#9632; Drag to draw a redaction box &nbsp;·&nbsp; Right-click a box to delete it</span>
         <div class="zone-actions">
+          <button class="btn-reset" id="btn-clear-privacy">Clear All</button>
           <button class="btn-save" id="btn-save-privacy">Save</button>
           <button class="btn-cancel" id="btn-cancel-privacy">Cancel</button>
         </div>
@@ -102,6 +108,12 @@
         </div>
       </div>
 
+      <!-- ── VLM processing queue ──────────────────────────────────────── -->
+      <div class="card processing-card hidden" id="processing-card">
+        <h2>VLM Processing</h2>
+        <ul class="vlm-job-list" id="vlm-job-list"></ul>
+      </div>
+
       <div class="card events-card">
         <h2>Event Log <span class="event-count" id="event-count">0</span></h2>
         <ul class="event-list" id="event-list">
@@ -112,12 +124,44 @@
     </aside>
   </main>
 
-  <!-- Snapshot lightbox -->
-  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true">
-    <img id="lightbox-img" src="" alt="snapshot fullsize" />
-    <button class="lightbox-close" id="lightbox-close" aria-label="Close">&times;</button>
+  <!-- Debug drawer -->
+  <div class="debug-backdrop" id="debug-backdrop"></div>
+  <aside class="debug-drawer" id="debug-drawer" aria-label="VLM debug">
+    <div class="debug-drawer-header">
+      <h3>Not Detected <span class="debug-count" id="debug-count">0</span></h3>
+      <div class="debug-drawer-actions">
+        <button class="btn-debug-clear" id="btn-debug-clear">Clear</button>
+        <button class="btn-debug-close" id="btn-debug-close" aria-label="Close">&times;</button>
+      </div>
+    </div>
+    <div class="debug-list" id="debug-list">
+      <div class="debug-empty">No rejected frames yet</div>
+    </div>
+  </aside>
+
+  <!-- Event detail modal -->
+  <div id="event-modal" class="event-modal hidden" role="dialog" aria-modal="true">
+    <div class="event-modal-inner">
+      <button class="event-modal-close" id="event-modal-close" aria-label="Close">&times;</button>
+      <div class="event-modal-body">
+        <div class="event-modal-img-wrap">
+          <img id="event-modal-img" src="" alt="event snapshot" />
+        </div>
+        <div class="event-modal-info">
+          <div class="event-modal-header">
+            <span class="event-modal-badge" id="event-modal-type"></span>
+            <span class="event-modal-conf" id="event-modal-conf"></span>
+          </div>
+          <div class="event-modal-timestamp" id="event-modal-time"></div>
+          <div class="event-modal-section-label">LLM Response</div>
+          <div class="event-modal-desc" id="event-modal-desc"></div>
+          <button class="btn-alert" id="btn-alert">&#128241; Send Alert</button>
+          <div class="event-modal-status" id="event-modal-alert-status"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
-  <script src="/static/js/dashboard.js?v=9"></script>
+  <script src="/static/js/dashboard.js?v=15"></script>
 </body>
 </html>
