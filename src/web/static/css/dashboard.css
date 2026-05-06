@@ -79,15 +79,20 @@ main {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  align-items: center;
 }
 
 .canvas-wrap {
   position: relative;
-  flex: 1;
+  aspect-ratio: 16/9;
+  /* Never wider than what the available viewport height can show at 16:9.
+     Keeps the canvas from dominating ultrawide screens. */
+  width: min(100%, calc((100vh - 110px) * 16 / 9));
+  flex: none;
+  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
 }
 
 #feed {
@@ -159,6 +164,8 @@ main {
   background: var(--surface);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .toolbar-right {
@@ -262,6 +269,8 @@ main {
   background: #160a22;
   border-top: 1px solid #b388ff40;
   flex-shrink: 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .privacy-toolbar.hidden { display: none; }
@@ -276,6 +285,8 @@ main {
   background: #071a0f;
   border-top: 1px solid #00e67640;
   flex-shrink: 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .zone-toolbar.hidden { display: none; }
@@ -572,9 +583,9 @@ main {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
-  max-width: 900px;
+  max-width: 1300px;
   width: 100%;
-  max-height: 90vh;
+  max-height: 95vh;
   overflow: auto;
 }
 
@@ -603,13 +614,18 @@ main {
   justify-content: center;
   background: #000;
   border-radius: 12px 0 0 12px;
+  overflow: hidden;
 }
 .event-modal-img-wrap img {
   max-width: 100%;
-  max-height: 60vh;
+  max-height: 78vh;
   border-radius: 6px;
   display: block;
   object-fit: contain;
+  cursor: zoom-in;
+  user-select: none;
+  transform-origin: center center;
+  will-change: transform;
 }
 
 .event-modal-info {

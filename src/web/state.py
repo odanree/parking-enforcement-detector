@@ -238,6 +238,7 @@ class AppState:
                 "uptime_seconds": uptime,
                 "playback_speed": self._stream._speed if self._stream and hasattr(self._stream, '_speed') else 1.0,
                 "playback_direction": self._stream._direction if self._stream and hasattr(self._stream, '_direction') else 1,
+                "is_live": not (self._stream and hasattr(self._stream, '_speed')),
                 "fps": float(len(self._fps_times)),
             }
 
