@@ -23,8 +23,6 @@ load_dotenv()
 
 from src.alerts.notifier import Notifier
 from src.behavior.chalking_analyzer import ChalkingAnalyzer
-from src.behavior.pe_vehicle_analyzer import PEVehicleAnalyzer
-from src.behavior.sweeper_analyzer import SweeperAnalyzer
 from src.detection.motion_detector import MotionDetector
 from src.detection.object_detector import Detection, ObjectDetector
 from src.detection.zone_filter import ZoneFilter
@@ -86,20 +84,22 @@ def _encode_jpeg(frame: np.ndarray) -> bytes:
     return buf.tobytes() if ok else b""
 
 
-def run(state=None) -> None:
-    """Main pipeline loop.  Blocks until KeyboardInterrupt."""
+def run(state=None, stream_url: str | None = None, video_path: str | None = None, zone_key: str = "street_zone", vector_store=None) -> None:
+    """Main pipeline loop.  Blocks until KeyboardInterrupt.
+
+    stream_url:  overrides RTSP_URL env var (RTSP second camera).
+    video_path:  overrides VIDEO_PATH env var (file-based second camera).
+    zone_key:    which zones entry in detection.yaml to use as the initial polygon.
+    """
     cfg_det = _load_yaml("config/detection.yaml")
-    cfg_sched = _load_yaml("config/schedule.yaml")
     cfg_alerts = _load_yaml("config/alerts.yaml")
 
     det_cfg = cfg_det["detector"]
     mask_cfg = cfg_det.get("stationary_mask", {})
     chalk_cfg = cfg_det["chalking"]
-    sweep_cfg = cfg_det["sweeper"]
-    pev_cfg = cfg_det["pe_vehicle"]
     mot_cfg = cfg_det.get("motion_detector", {})
 
-    video_path = os.getenv("VIDEO_PATH", "")
+    video_path = video_path or (os.getenv("VIDEO_PATH", "") if stream_url is None else "")
     if video_path:
         stream = VideoFileHandler(
             path=video_path,
@@ -107,7 +107,8 @@ def run(state=None) -> None:
             speed=float(os.getenv("VIDEO_SPEED", "1.0")),
         )
     else:
-        stream = RTSPHandler(url=os.environ["RTSP_URL"])
+        url = stream_url or os.environ["RTSP_URL"]
+        stream = RTSPHandler(url=url)
 
     _det_w = int(os.getenv("INPUT_WIDTH", det_cfg["input_width"]))
     _det_h = int(os.getenv("INPUT_HEIGHT", det_cfg["input_height"]))
@@ -124,7 +125,7 @@ def run(state=None) -> None:
 
     initial_polygon = (
         state.zone_polygon if (state and state.zone_polygon)
-        else cfg_det["zones"]["street_zone"]["polygon"]
+        else cfg_det["zones"][zone_key]["polygon"]
     )
     zone_filter = ZoneFilter(zones={"street_zone": initial_polygon})
     _zone_version = state.get_zone_version() if state else -1
@@ -133,21 +134,8 @@ def run(state=None) -> None:
         entry_frames=chalk_cfg.get("entry_frames", 10),
         sample_every_n=chalk_cfg.get("sample_every_n", 30),
         cooldown_seconds=chalk_cfg["cooldown_seconds"],
-    )
-
-    sweeper = SweeperAnalyzer(
-        schedule=cfg_sched["sweeper_schedule"],
-        min_velocity=sweep_cfg["min_velocity_px_per_frame"],
-        max_velocity=sweep_cfg["max_velocity_px_per_frame"],
-        sustained_frames=sweep_cfg["sustained_frames"],
-    )
-
-    pe_vehicle = PEVehicleAnalyzer(
-        entry_frames=pev_cfg["entry_frames"],
-        entry_min_px=pev_cfg["entry_min_px"],
-        stop_px_per_frame=pev_cfg["stop_px_per_frame"],
-        sustained_frames=pev_cfg["sustained_frames"],
-        cooldown_seconds=pev_cfg["cooldown_seconds"],
+        frame_buffer_size=chalk_cfg.get("frame_buffer_size", 4),
+        buffer_sample_every_n=chalk_cfg.get("buffer_sample_every_n", 5),
     )
 
     vlm = VLMAnalyzer(
@@ -180,6 +168,7 @@ def run(state=None) -> None:
     _vlm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm")
     # Each entry: (future, kind, track_id, snap_frame, bbox, thumb_b64)
     _vlm_jobs: dict[tuple[str, int], tuple[Future, str, int, np.ndarray, tuple, str]] = {}
+
 
     _initial_paused = os.getenv("INITIAL_PAUSED", "false").lower() == "true"
     if video_path and _initial_paused:
@@ -254,16 +243,14 @@ def run(state=None) -> None:
 
             zone_dets = zone_filter.filter(all_dets, "street_zone")
 
-            in_sweep = sweeper.is_sweep_window()
-            if state:
-                state.sweep_window_active = in_sweep
-
             active_ids = {d.track_id for d in zone_dets}
             alert_ids.clear()
 
             # ── Harvest completed VLM jobs ────────────────────────────────────
             for job_key in list(_vlm_jobs.keys()):
-                fut, kind, tid, snap_fr, bbox, thumb = _vlm_jobs[job_key]
+                job = _vlm_jobs[job_key]
+                fut, kind, tid, snap_fr, bbox, thumb = job[:6]
+                detail_b64 = job[6] if len(job) > 6 else []
                 if not fut.done():
                     continue
                 del _vlm_jobs[job_key]
@@ -282,75 +269,50 @@ def run(state=None) -> None:
                             kind, thumb,
                             result.get("confidence", 0.0),
                             result.get("description", ""),
+                            frames=detail_b64 if kind == "chalking" else [],
                         )
+                if kind == "chalking" and vector_store:
+                    try:
+                        vector_store.add(
+                            description=result.get("description", ""),
+                            detected=detected,
+                            confidence=result.get("confidence", 0.0),
+                            camera_id=state.camera_id if state else 0,
+                            thumbnail_b64=thumb,
+                            frames_b64=detail_b64,
+                        )
+                    except Exception:
+                        logger.exception("vector_store.add failed")
                 if kind == "chalking" and result["chalking_detected"]:
                     sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
                     snap = notifier.send("chalking", result, sf, bbox)
                     if state:
-                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None)
+                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64)
                     alert_ids.add(tid)
                     chalking.on_alert(tid)
-                elif kind == "sweeper" and result["sweeper_detected"]:
-                    sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
-                    snap = notifier.send("sweeper", result, sf, bbox)
-                    if state:
-                        state.record_alert("sweeper", result["confidence"], result["description"], snapshot=snap.name if snap else None)
-                    alert_ids.add(tid)
-                elif kind == "pe_vehicle" and result["pe_vehicle_detected"]:
-                    sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
-                    snap = notifier.send("pe_vehicle", result, sf, bbox)
-                    if state:
-                        state.record_alert("pe_vehicle", result["confidence"], result["description"], snapshot=snap.name if snap else None)
-                    alert_ids.add(tid)
 
             for det in zone_dets:
                 # ── Chalking ──────────────────────────────────────────────────
                 if det.class_name == "person":
+                    crop = _crop_wide_bytes(frame, det.bbox)
+                    chalking.store_frame(det.track_id, crop)
                     if chalking.update(det.track_id):
                         job_key = ("chalking", det.track_id)
                         if job_key not in _vlm_jobs:
-                            wide = _crop_wide_bytes(frame, det.bbox)
-                            thumb = _thumb_b64_from_jpeg(wide)
-                            fut = _vlm_pool.submit(vlm.analyze, wide, "chalking")
-                            _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb)
+                            detail_frames = chalking.get_frame_buffer(det.track_id) or [crop]
+                            scene         = _crop_scene_bytes(frame, det.bbox)
+                            vlm_frames    = [scene] + detail_frames  # scene first for vehicle-state check
+                            thumb  = _thumb_b64_from_jpeg(detail_frames[-1])
+                            detail_b64 = [_thumb_b64_from_jpeg(f) for f in detail_frames]
+                            fut = _vlm_pool.submit(vlm.analyze, vlm_frames, "chalking")
+                            _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64)
                             if state:
                                 state.add_pending_vlm("chalking", det.track_id, thumb)
-
-                # ── Sweeper ───────────────────────────────────────────────────
-                elif det.class_name in {"truck", "motorcycle"} and in_sweep:
-                    if sweeper.update(det.track_id, det.center):
-                        job_key = ("sweeper", det.track_id)
-                        if job_key not in _vlm_jobs:
-                            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                            sweep_bytes = buf.tobytes() if ok else b""
-                            thumb = _thumb_b64_from_jpeg(sweep_bytes)
-                            fut = _vlm_pool.submit(vlm.analyze, sweep_bytes, "sweeper")
-                            _vlm_jobs[job_key] = (fut, "sweeper", det.track_id, frame.copy(), det.bbox, thumb)
-                            if state:
-                                state.add_pending_vlm("sweeper", det.track_id, thumb)
-
-                # ── PE Vehicle ────────────────────────────────────────────────
-                elif det.class_name == "car":
-                    if pe_vehicle.update(det.track_id, det.center):
-                        job_key = ("pe_vehicle", det.track_id)
-                        if job_key not in _vlm_jobs:
-                            crop_bytes = _crop_bytes(frame, det.bbox)
-                            thumb = _thumb_b64_from_jpeg(crop_bytes)
-                            fut = _vlm_pool.submit(vlm.analyze, crop_bytes, "pe_vehicle")
-                            _vlm_jobs[job_key] = (fut, "pe_vehicle", det.track_id, frame.copy(), det.bbox, thumb)
-                            if state:
-                                state.add_pending_vlm("pe_vehicle", det.track_id, thumb)
 
             # Evict gone tracks
             for tid in list(chalking._frame_count.keys()):
                 if tid not in active_ids:
                     chalking.evict(tid)
-            for tid in list(sweeper._centers.keys()):
-                if tid not in active_ids:
-                    sweeper.evict(tid)
-            for tid in list(pe_vehicle._phase.keys()):
-                if tid not in active_ids:
-                    pe_vehicle.evict(tid)
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
@@ -427,16 +389,43 @@ def _thumb_b64_from_jpeg(jpeg_bytes: bytes, width: int = 200) -> str:
     return base64.b64encode(buf.tobytes()).decode() if ok else ""
 
 
-def _crop_wide_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
-    """Wide context crop for distant-camera chalking detection.
-
-    Pads 3× the bbox width horizontally and 2× vertically so the VLM can see
-    the full person, any tool they're holding, and nearby vehicles.
-    """
+def _crop_tight_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
+    """Tight crop for debug thumbnails — person fills most of the image."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = bbox
     bw, bh = max(1, x2 - x1), max(1, y2 - y1)
-    px, py = bw * 3, bh * 2
-    crop = frame[max(0, y1 - py): min(h, y2 + py), max(0, x1 - px): min(w, x2 + px)]
+    pad_x = max(bw, 30)
+    pad_y = max(bh, 30)
+    crop = frame[max(0, y1 - pad_y) : min(h, y2 + pad_y),
+                 max(0, x1 - pad_x) : min(w, x2 + pad_x)]
+    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes() if ok else b""
+
+
+def _crop_wide_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
+    """Close-up crop for per-frame person detail (tool, posture)."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+    pad_x     = max(bw * 3, 120)
+    pad_above = max(bh * 2,  60)
+    pad_below = max(bh,      40)
+    crop = frame[max(0, y1 - pad_above) : min(h, y2 + pad_below),
+                 max(0, x1 - pad_x)     : min(w, x2 + pad_x)]
     ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return buf.tobytes() if ok else b""
+
+
+def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
+    """Wide scene crop showing all nearby vehicles — used as the first frame sent
+    to the VLM so it can assess vehicle state (open trunks, doors) before posture."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+    pad_x     = max(bw * 10, 350)   # wide enough to capture full adjacent vehicles
+    pad_above = max(bh *  4, 150)
+    pad_below = max(bh *  4, 150)
+    crop = frame[max(0, y1 - pad_above) : min(h, y2 + pad_below),
+                 max(0, x1 - pad_x)     : min(w, x2 + pad_x)]
+    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else b""

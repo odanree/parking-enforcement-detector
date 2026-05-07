@@ -11,6 +11,7 @@ ordinary parked vehicles, not an officer who just pulled up.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 logger = logging.getLogger(__name__)
@@ -28,18 +29,34 @@ class PEVehicleAnalyzer:
         stop_px_per_frame: float = 3.0,
         sustained_frames: int = 30,
         cooldown_seconds: float = 120.0,
+        position_cooldown_radius: int = 80,
     ) -> None:
         self._entry_frames = entry_frames
         self._entry_min_px = entry_min_px
         self._stop_px = stop_px_per_frame
         self._sustained = sustained_frames
         self._cooldown = cooldown_seconds
+        self._pos_radius = position_cooldown_radius
 
         self._phase: dict[int, str] = {}
         self._entry_centers: dict[int, list[tuple[int, int]]] = {}
         self._prev_center: dict[int, tuple[int, int]] = {}
         self._stop_count: dict[int, int] = {}
         self._last_alert: dict[int, float] = {}
+        # Position-based cooldown: [(center, expire_monotonic_time), ...]
+        # Survives track-ID resets caused by passing vehicles.
+        self._pos_cooldowns: list[tuple[tuple[int, int], float]] = []
+
+    def _on_pos_cooldown(self, center: tuple[int, int]) -> bool:
+        now = time.monotonic()
+        self._pos_cooldowns = [(c, t) for c, t in self._pos_cooldowns if t > now]
+        return any(
+            math.hypot(center[0] - c[0], center[1] - c[1]) < self._pos_radius
+            for c, _ in self._pos_cooldowns
+        )
+
+    def _record_pos_cooldown(self, center: tuple[int, int]) -> None:
+        self._pos_cooldowns.append((center, time.monotonic() + self._cooldown))
 
     def update(self, track_id: int, center: tuple[int, int]) -> bool:
         """Feed one frame's center position. Returns True when the stopped
@@ -51,6 +68,11 @@ class PEVehicleAnalyzer:
 
         if phase == _ENTRY:
             entry = self._entry_centers.setdefault(track_id, [])
+            if not entry and self._on_pos_cooldown(center):
+                # New track at a location we just analyzed — skip immediately.
+                self._phase[track_id] = _SKIP
+                logger.debug("PE vehicle track=%d position on cooldown — skipping", track_id)
+                return False
             entry.append(center)
             if len(entry) >= self._entry_frames:
                 # Directional displacement: first → last center.
@@ -92,6 +114,7 @@ class PEVehicleAnalyzer:
             if now - self._last_alert.get(track_id, 0) >= self._cooldown:
                 self._last_alert[track_id] = now
                 self._stop_count[track_id] = 0
+                self._record_pos_cooldown(center)
                 logger.info(
                     "PE vehicle signature — track %d stopped for %d frames",
                     track_id, self._sustained,
