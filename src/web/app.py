@@ -144,6 +144,10 @@ app.mount("/dataset",   StaticFiles(directory=str(_DATASET_DIR)),      name="dat
 async def dashboard():
     return FileResponse(str(_DIST / "index.html"))
 
+@app.get("/favicon.svg")
+async def favicon():
+    return FileResponse(str(_DIST / "favicon.svg"), media_type="image/svg+xml")
+
 
 # ── REST ──────────────────────────────────────────────────────────────────────
 
