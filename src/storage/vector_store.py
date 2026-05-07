@@ -142,6 +142,40 @@ class EventVectorStore:
         )
         return self._flatten(result)
 
+    def get_frame_bytes(self, event_id: str) -> list[bytes]:
+        """Load the stored JPEG frames for an event from disk. Returns [] if missing."""
+        result = self._col.get(ids=[event_id], include=["metadatas"])
+        if not result["ids"]:
+            return []
+        frame_files = [
+            f for f in result["metadatas"][0].get("frame_files", "").split(",") if f
+        ]
+        out = []
+        for fname in frame_files:
+            path = self._dataset / fname
+            if path.exists():
+                out.append(path.read_bytes())
+        return out
+
+    def update_reeval(
+        self,
+        event_id: str,
+        backend: str,
+        detected: bool,
+        confidence: float,
+        description: str,
+    ) -> None:
+        """Store a second-opinion VLM result alongside the original evaluation."""
+        existing = self._col.get(ids=[event_id], include=["metadatas"])
+        if not existing["ids"]:
+            raise KeyError(event_id)
+        meta = existing["metadatas"][0]
+        meta["reeval_backend"]     = backend
+        meta["reeval_detected"]    = int(detected)
+        meta["reeval_confidence"]  = float(confidence)
+        meta["reeval_description"] = description
+        self._col.update(ids=[event_id], metadatas=[meta])
+
     def count(self) -> int:
         return self._col.count()
 

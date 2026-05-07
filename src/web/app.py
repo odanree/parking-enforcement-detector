@@ -24,7 +24,7 @@ from pathlib import Path
 import json
 import yaml
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 from src import pipeline
 from src.storage.vector_store import EventVectorStore
+from src.vlm.analyzer import VLMAnalyzer
 from src.web.state import AppState
 
 states = [AppState(0), AppState(1)]
@@ -307,6 +308,100 @@ async def dataset_similar(event_id: str, n: int = 10):
 @app.get("/api/dataset/export")
 async def dataset_export():
     return JSONResponse(vector_store.export_labeled())
+
+
+# ── Re-evaluation (second-opinion) ───────────────────────────────────────────
+
+_reeval_vlm: VLMAnalyzer | None = None
+
+
+def _get_reeval_vlm() -> VLMAnalyzer:
+    global _reeval_vlm
+    if _reeval_vlm is None:
+        backend = os.getenv("REEVAL_BACKEND", "claude")
+        _reeval_vlm = VLMAnalyzer(
+            backend=backend,
+            claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
+            ollama_model=os.getenv("REEVAL_OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "")),
+        )
+        logger.info("Re-eval VLM initialised (backend=%s)", backend)
+    return _reeval_vlm
+
+
+_reeval_progress: dict = {"running": False, "done": 0, "total": 0, "errors": 0}
+
+
+@app.post("/api/dataset/reeval")
+async def reeval_dataset(background_tasks: BackgroundTasks, ids: list[str] | None = None):
+    """Re-evaluate stored events using REEVAL_BACKEND (default: claude).
+
+    POST with no body → re-evaluate all events that have frame files on disk.
+    POST with JSON body ["id1", "id2", ...] → re-evaluate specific events only.
+
+    Runs in the background.  Poll GET /api/dataset/comparison for results.
+    """
+    if _reeval_progress["running"]:
+        raise HTTPException(status_code=409, detail="Re-evaluation already in progress")
+
+    vlm = _get_reeval_vlm()
+    backend = os.getenv("REEVAL_BACKEND", "claude")
+    all_items = vector_store.get_all(limit=10_000)["items"]
+    targets = [e for e in all_items if not ids or e["id"] in ids]
+
+    def _run() -> None:
+        _reeval_progress.update(running=True, done=0, total=len(targets), errors=0)
+        for ev in targets:
+            frames = vector_store.get_frame_bytes(ev["id"])
+            if not frames:
+                _reeval_progress["errors"] += 1
+                continue
+            try:
+                result = vlm.analyze(frames, "chalking")
+                vector_store.update_reeval(
+                    ev["id"],
+                    backend=backend,
+                    detected=result["chalking_detected"],
+                    confidence=result["confidence"],
+                    description=result["description"],
+                )
+            except Exception:
+                logger.exception("reeval failed for event %s", ev["id"])
+                _reeval_progress["errors"] += 1
+            _reeval_progress["done"] += 1
+        _reeval_progress["running"] = False
+        logger.info(
+            "Re-eval complete: %d/%d done, %d errors",
+            _reeval_progress["done"], _reeval_progress["total"], _reeval_progress["errors"],
+        )
+
+    background_tasks.add_task(_run)
+    return {"queued": len(targets), "backend": backend}
+
+
+@app.get("/api/dataset/comparison")
+async def comparison_report():
+    """Return all events that have a re-eval result alongside the original.
+
+    Each item includes:
+      detected / confidence / description   — original model result
+      reeval_detected / reeval_confidence / reeval_description / reeval_backend — second opinion
+      agreement — true if both models agree on detected flag
+    """
+    all_items = vector_store.get_all(limit=10_000)["items"]
+    compared  = [e for e in all_items if "reeval_backend" in e]
+    for ev in compared:
+        ev["agreement"] = bool(ev["detected"]) == bool(ev["reeval_detected"])
+
+    total      = len(compared)
+    agreements = sum(1 for e in compared if e["agreement"])
+    return JSONResponse({
+        "progress":       _reeval_progress,
+        "total":          total,
+        "agreement_rate": round(agreements / total, 3) if total else None,
+        "disagreements":  [e for e in compared if not e["agreement"]],
+        "agreements":     [e for e in compared if e["agreement"]],
+    })
 
 
 class AlertPayload(BaseModel):
