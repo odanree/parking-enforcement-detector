@@ -32,32 +32,47 @@ logger = logging.getLogger(__name__)
 
 # Exact prompt from the spec — kept here so it's easy to tune.
 _USER_PROMPT = (
-    'Analyze this street camera frame (overhead/wide-angle, person appears small) '
-    'for three parking-enforcement events:\n'
-    '1. CHALKING: Flag TRUE if ANY of these apply — '
-    '(a) a person is crouching, bending, or leaning toward a vehicle\'s wheel or tire area; '
-    '(b) a person is making close physical contact with a wheel or tire; '
-    '(c) a person is holding or extending any object toward a wheel or the ground near a tire; '
-    '(d) a person is standing very close to a parked vehicle\'s rear wheel for more than a moment. '
-    'A visible chalk stick is NOT required — flag on suspicious posture or proximity to a wheel. '
-    'Err toward TRUE when a person is near a vehicle\'s wheel and their intent is ambiguous.\n'
-    '2. SWEEPER: Does any vehicle show street sweeper features: oversized side '
-    'brushes, water spray nozzles, or yellow caution lights?\n'
-    '3. PE_VEHICLE: Does any vehicle show parking enforcement markings: '
-    'government/city emblems, "PARKING ENFORCEMENT" text, a small enforcement '
-    'cart or scooter, or an officer in uniform visible near the vehicle?\n'
+    'Analyze this street camera crop (overhead/wide-angle, person appears small) '
+    'for parking-enforcement events:\n'
+    '1. CHALKING — two-step evaluation, follow in order:\n'
+    '   STEP 1 (EXCLUSION CHECK): Look at every vehicle near the person. '
+    'Does ANY vehicle have an open trunk lid, raised hatch, or open door? '
+    'If YES → person is loading/unloading, set chalking_detected: false and skip STEP 2. '
+    'If NO open trunk/hatch/door is visible → the exclusion does NOT apply, PROCEED to STEP 2.\n'
+    '   STEP 2 (EVIDENCE CHECK — run this when STEP 1 found no open trunks): '
+    'Set chalking_detected: true if EITHER condition below is true:\n'
+    '   CONDITION A — TOOL: A long thin object (rod, pole, wand, chalk stick) that is visibly '
+    'held IN the person\'s hand and extends downward or laterally toward the ground or vehicle. '
+    'The object must originate from the hand — do NOT flag backpacks, shoulder bags, items worn '
+    'on the back, or anything not clearly in the hand. '
+    'Do NOT flag a person just because their arm, shadow, or clothing creates a thin line. '
+    'The object must be a distinct item separate from the body, held in the hand, pointing '
+    'downward or toward the wheel/ground level.\n'
+    '   CONDITION B — SUSTAINED WHEEL PRESENCE: You are reviewing multiple frames. '
+    'The person is directly beside the rear wheel of a parked vehicle AND has remained '
+    'stationary at that same wheel position across the majority of the frames in this sequence. '
+    'A brief pass-by or someone who is clearly walking does NOT qualify — '
+    'the person must be lingering/stationary at the rear wheel. '
+    'Any posture qualifies (standing, slightly bent, crouching) as long as they are not moving away.\n'
+    '   IMPORTANT: CONDITION A alone is sufficient (tool visible near hand → flag true, '
+    'regardless of wheel proximity or posture). '
+    'CONDITION B alone requires the sustained stationary presence described above. '
+    'If BOTH conditions are present simultaneously, confidence should be very high.\n'
     'Output only a JSON object with: '
-    '{ "chalking_detected": boolean, "sweeper_detected": boolean, '
-    '"pe_vehicle_detected": boolean, "confidence": float, "description": string }'
+    '{ "chalking_detected": boolean, "sweeper_detected": false, '
+    '"pe_vehicle_detected": false, "confidence": float, "description": string }'
 )
 
 _SYSTEM_PROMPT = (
     "You are a parking-enforcement detection AI analyzing overhead street camera footage. "
-    "A person does not need to hold a visible tool to be chalking — "
-    "crouching near a tire, bending toward a wheel, or extended contact with the wheel area "
-    "is sufficient to flag CHALKING as true. "
-    "When in doubt about chalking, return true with a lower confidence score "
-    "rather than false — missed detections are worse than false positives here. "
+    "For chalking: first check if any vehicle near the person has an open trunk, hatch, or door — "
+    "if yes, that person is loading/unloading, return chalking_detected: false. "
+    "If NO open trunk/door is visible, the exclusion does NOT apply — proceed to look for evidence. "
+    "Flag chalking true if: (A) a long thin object is clearly held IN the person's hand, extending downward "
+    "or toward the ground — backpacks, shoulder bags, arms, shadows, and worn items do NOT qualify; OR "
+    "(B) the person has remained stationary at the rear wheel of a parked vehicle across the "
+    "majority of the provided frames — a PE officer lingers; a car owner briefly passes. "
+    "CONDITION A alone is sufficient to flag. CONDITION B requires sustained stationary presence. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
@@ -128,28 +143,54 @@ class VLMAnalyzer:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def analyze(self, image_bytes: bytes, kind: str = "") -> dict:
-        """Send a JPEG frame to the VLM and return the parsed JSON result."""
+    def analyze(self, image_bytes: bytes | list[bytes], kind: str = "") -> dict:
+        """Send one or more JPEG frames to the VLM and return the parsed JSON result.
+
+        When a list is passed the frames are treated as a chronological sequence
+        (oldest first) so the model can use earlier context to disambiguate.
+        """
         if self._backend == "mock":
             return _MOCK_RESULTS.get(kind, _MOCK_RESULTS["pe_vehicle"])
+        frames = image_bytes if isinstance(image_bytes, list) else [image_bytes]
         try:
             if self._backend == "claude":
-                return self._analyze_claude(image_bytes)
-            return self._analyze_ollama(image_bytes)
+                return self._analyze_claude(frames)
+            return self._analyze_ollama(frames)
         except Exception:
             logger.exception("VLM analysis error")
             return _FALLBACK.copy()
 
     # ── Backends ──────────────────────────────────────────────────────────────
 
-    def _analyze_claude(self, image_bytes: bytes) -> dict:
-        b64 = base64.standard_b64encode(image_bytes).decode()
+    def _analyze_claude(self, frames: list[bytes]) -> dict:
+        content: list[dict] = []
+        for fb in frames:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64.standard_b64encode(fb).decode(),
+                },
+            })
+        prompt = _USER_PROMPT if len(frames) <= 1 else (
+            'You are shown a wide scene image followed by '
+            f'{len(frames) - 1} close-up crop(s) of the same tracked person sampled over ~1 second. '
+            'Image 1 is the SCENE — use it to assess vehicle state (open trunks, doors, hatches). '
+            'Images 2 onwards are DETAIL crops — evaluate them as a sequence to assess posture, '
+            'movement, and any objects the person is carrying. '
+            'Apply STEP 1 (trunk/door gate) using the scene image. '
+            'Apply STEP 2 across all detail frames in totality: '
+            'flag true if a tool is visible in ANY frame, OR if the person is stationary at a rear wheel '
+            'across the MAJORITY of frames (sustained presence = chalking; brief pass-by = not chalking). '
+            'Do NOT dismiss chalking just because one frame looks ambiguous — judge the full sequence.\n\n'
+            + _USER_PROMPT
+        )
+        content.append({"type": "text", "text": prompt})
 
         response = self._claude.messages.create(
             model=self._claude_model,
             max_tokens=256,
-            # Cache the static system prompt — saves ~75 % of input tokens on
-            # repeated calls (cache TTL is 5 min, refreshed each hit).
             system=[
                 {
                     "type": "text",
@@ -157,35 +198,19 @@ class VLMAnalyzer:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": b64,
-                            },
-                        },
-                        {"type": "text", "text": _USER_PROMPT},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         )
         return _parse_json(response.content[0].text)
 
-    def _analyze_ollama(self, image_bytes: bytes) -> dict:
-        b64 = base64.standard_b64encode(image_bytes).decode()
-
+    def _analyze_ollama(self, frames: list[bytes]) -> dict:
         payload = {
             "model": self._ollama_model,
             "prompt": f"{_SYSTEM_PROMPT}\n\n{_USER_PROMPT}",
-            "images": [b64],
+            "images": [base64.standard_b64encode(fb).decode() for fb in frames],
             "stream": False,
             "options": {"temperature": 0.0},
         }
+        logger.debug("Ollama request: %d frame(s)", len(frames))
 
         resp = httpx.post(
             f"{self._ollama_url}/api/generate",

@@ -1,7 +1,9 @@
 chalking:
-  cooldown_seconds: 30
-  entry_frames: 2
-  sample_every_n: 10
+  buffer_sample_every_n: 4
+  cooldown_seconds: 5
+  entry_frames: 9
+  frame_buffer_size: 3
+  sample_every_n: 8
 detector:
   input_height: 720
   input_width: 1280
@@ -23,8 +25,9 @@ motion_detector:
   var_threshold: 25
 pe_vehicle:
   cooldown_seconds: 30
-  entry_frames: 3
-  entry_min_px: 5.0
+  entry_frames: 5
+  entry_min_px: 20.0
+  position_cooldown_radius: 80
   stop_px_per_frame: 3.0
   sustained_frames: 20
 stationary_mask:
@@ -42,7 +45,17 @@ zones:
       - 0
     - - 1280
       - 0
-    - - 1280
-      - 720
+    - - 1275
+      - 264
+    - - 6
+      - 229
+  street_zone_1:
+    polygon:
     - - 0
-      - 720
+      - 0
+    - - 1280
+      - 0
+    - - 1276
+      - 334
+    - - 4
+      - 338
