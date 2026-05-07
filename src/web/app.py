@@ -167,6 +167,23 @@ async def get_events():
     return JSONResponse(events)
 
 
+class VotePayload(BaseModel):
+    vote: str | None   # "up" | "down" | "archive" | null
+
+
+@app.post("/api/events/{cam_id}/vote")
+async def vote_event(cam_id: int, body: VotePayload, timestamp: float):
+    if cam_id not in range(len(states)):
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    try:
+        found = states[cam_id].vote_event(timestamp, body.vote)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not found:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"ok": True}
+
+
 @app.get("/api/zone/{cam_id}")
 async def get_zone(cam_id: int = 0):
     if cam_id not in (0, 1):

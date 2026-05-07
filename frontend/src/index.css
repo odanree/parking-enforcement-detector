@@ -503,6 +503,29 @@ main {
   max-height: 140px;
 }
 
+/* ── Event vote buttons ──────────────────────────────────────────────────── */
+.vote-buttons {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+.vote-btn {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 0;
+  font-size: 14px;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s, border-color 0.15s;
+}
+.vote-btn:hover  { opacity: 0.85; }
+.vote-btn.active { opacity: 1; border-color: var(--blue); }
+.vote-btn:disabled { cursor: not-allowed; }
+
+.event-item.archived { opacity: 0.45; }
+
 @keyframes slide-in {
   from { opacity: 0; transform: translateY(-6px); }
   to   { opacity: 1; transform: translateY(0); }

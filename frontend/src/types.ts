@@ -1,5 +1,7 @@
 export type EventType = 'chalking' | 'sweeper' | 'pe_vehicle';
 
+export type Vote = 'up' | 'down' | 'archive' | null;
+
 export interface AppEvent {
   timestamp: number;
   event_type: EventType;
@@ -8,6 +10,7 @@ export interface AppEvent {
   snapshot_url: string | null;
   camera?: number;
   frames?: string[];
+  vote?: Vote;
 }
 
 export interface Stats {

@@ -6,10 +6,12 @@ async handlers.  All mutations go through a single Lock.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import threading
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -25,6 +27,10 @@ class Event:
     description: str
     snapshot: Optional[str] = None   # filename only, e.g. "chalking_20240101_120000.jpg"
     frames: list = field(default_factory=list)  # base64 JPEGs for animation
+    vote: Optional[str] = None       # "up" | "down" | "archive" | None
+
+
+_LOGS_DIR = Path("logs")
 
 
 class AppState:
@@ -33,6 +39,7 @@ class AppState:
         self._lock = threading.Lock()
         self.latest_frame: Optional[bytes] = None   # JPEG bytes, annotated
         self.events: deque[Event] = deque(maxlen=50)
+        self._events_file = _LOGS_DIR / f"events_{camera_id}.jsonl"
         self._total_chalking: int = 0
         self._total_sweeper: int = 0
         self._last_chalking: Optional[float] = None
@@ -52,6 +59,46 @@ class AppState:
         self._pending_vlm: list[dict[str, Any]] = []  # in-flight VLM jobs
         self._vlm_sample_counts: dict[str, int] = {}  # job_id → cumulative sample count
         self._debug_rejected: deque[dict[str, Any]] = deque(maxlen=30)
+        self._load_events()
+
+    def _load_events(self) -> None:
+        if not self._events_file.exists():
+            return
+        try:
+            lines = [l for l in self._events_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        except Exception:
+            return
+        # Rebuild total counts from full history
+        for line in lines:
+            try:
+                d = json.loads(line)
+                et = d.get("event_type", "")
+                ts = float(d.get("timestamp", 0))
+                if et == "chalking":
+                    self._total_chalking += 1
+                    if self._last_chalking is None or ts > self._last_chalking:
+                        self._last_chalking = ts
+                elif et == "sweeper":
+                    self._total_sweeper += 1
+                    if self._last_sweeper is None or ts > self._last_sweeper:
+                        self._last_sweeper = ts
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+        # Load the most recent 50 into the dashboard deque (frames not persisted)
+        for line in lines[-50:]:
+            try:
+                d = json.loads(line)
+                self.events.appendleft(Event(
+                    timestamp=float(d["timestamp"]),
+                    event_type=d["event_type"],
+                    confidence=float(d["confidence"]),
+                    description=d.get("description", ""),
+                    snapshot=d.get("snapshot"),
+                    frames=[],
+                    vote=d.get("vote"),
+                ))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
 
     # ── Playback control ─────────────────────────────────────────────────────
 
@@ -207,10 +254,11 @@ class AppState:
         snapshot: str | None = None,
         frames: list[str] | None = None,
     ) -> None:
+        ts = time.time()
         with self._lock:
             self.events.appendleft(
                 Event(
-                    timestamp=time.time(),
+                    timestamp=ts,
                     event_type=event_type,
                     confidence=confidence,
                     description=description,
@@ -220,10 +268,24 @@ class AppState:
             )
             if event_type == "chalking":
                 self._total_chalking += 1
-                self._last_chalking = time.time()
+                self._last_chalking = ts
             elif event_type == "sweeper":
                 self._total_sweeper += 1
-                self._last_sweeper = time.time()
+                self._last_sweeper = ts
+        # Persist outside the lock — file I/O should not block the pipeline thread
+        try:
+            _LOGS_DIR.mkdir(exist_ok=True)
+            entry = {
+                "timestamp":  ts,
+                "event_type": event_type,
+                "confidence": confidence,
+                "description": description,
+                "snapshot":   snapshot,
+            }
+            with self._events_file.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass  # non-critical — dashboard still works without persistence
 
     # ── Web reads ─────────────────────────────────────────────────────────────
 
@@ -252,6 +314,43 @@ class AppState:
                 "demo_mode": _DEMO_MODE,
             }
 
+    def vote_event(self, timestamp: float, vote: str | None) -> bool:
+        """Set the vote on the event matching timestamp. Returns True if found."""
+        _VALID_VOTES = {"up", "down", "archive", None}
+        if vote not in _VALID_VOTES:
+            raise ValueError(f"vote must be one of {_VALID_VOTES}")
+        with self._lock:
+            for ev in self.events:
+                if abs(ev.timestamp - timestamp) < 0.001:
+                    ev.vote = vote
+                    break
+            else:
+                return False
+        # Rewrite the JSONL file with the updated vote
+        self._rewrite_events_file()
+        return True
+
+    def _rewrite_events_file(self) -> None:
+        try:
+            with self._lock:
+                snapshot = list(self.events)
+            lines = []
+            for ev in reversed(snapshot):  # file is oldest-first
+                entry: dict = {
+                    "timestamp":  ev.timestamp,
+                    "event_type": ev.event_type,
+                    "confidence": ev.confidence,
+                    "description": ev.description,
+                    "snapshot":   ev.snapshot,
+                }
+                if ev.vote is not None:
+                    entry["vote"] = ev.vote
+                lines.append(json.dumps(entry))
+            _LOGS_DIR.mkdir(exist_ok=True)
+            self._events_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
     def get_events(self, limit: int = 30) -> list[dict]:
         with self._lock:
             return [
@@ -262,6 +361,7 @@ class AppState:
                     "description": e.description,
                     "snapshot_url": f"/snapshots/{e.snapshot}" if e.snapshot else None,
                     "frames": e.frames,
+                    "vote": e.vote,
                 }
                 for e in list(self.events)[:limit]
             ]
