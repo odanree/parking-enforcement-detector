@@ -140,6 +140,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
 
     vlm = VLMAnalyzer(
         backend=os.getenv("VLM_BACKEND", "claude"),
+        claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
         ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
         ollama_model=os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M"),
     )
