@@ -40,13 +40,17 @@ function VoteButtons({ ev, camId }: { ev: AppEvent; camId: number }) {
 
   const cast = async (vote: Vote) => {
     if (pending) return;
-    const next = ev.vote === vote ? null : vote;  // toggle off if same
     setPending(true);
-    await postVote(camId, ev.timestamp, next);
-    // Optimistic update in local store
-    setEvents(allEvents.map((e) =>
-      e.timestamp === ev.timestamp && e.camera === ev.camera ? { ...e, vote: next } : e
-    ));
+    if (vote === 'archive') {
+      await postVote(camId, ev.timestamp, 'archive');
+      setEvents(allEvents.filter((e) => !(e.timestamp === ev.timestamp && e.camera === ev.camera)));
+    } else {
+      const next = ev.vote === vote ? null : vote;  // toggle off if same
+      await postVote(camId, ev.timestamp, next);
+      setEvents(allEvents.map((e) =>
+        e.timestamp === ev.timestamp && e.camera === ev.camera ? { ...e, vote: next } : e
+      ));
+    }
     setPending(false);
   };
 
@@ -85,7 +89,7 @@ function EventItem({ ev }: { ev: AppEvent }) {
   const camId = ev.camera ?? 0;
 
   return (
-    <li className={`event-item ${ev.event_type}${ev.vote === 'archive' ? ' archived' : ''}`}>
+    <li className={`event-item ${ev.event_type}`}>
       <div className="event-header">
         <span className={`event-type ${ev.event_type}`}>{TYPE_LABELS[ev.event_type] ?? ev.event_type}</span>
         {ev.camera != null && ev.camera > 0 && <span className="event-cam">Cam {ev.camera}</span>}

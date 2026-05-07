@@ -315,18 +315,23 @@ class AppState:
             }
 
     def vote_event(self, timestamp: float, vote: str | None) -> bool:
-        """Set the vote on the event matching timestamp. Returns True if found."""
+        """Set the vote on the event matching timestamp. Returns True if found.
+
+        vote='archive' removes the event from both the deque and the JSONL file.
+        """
         _VALID_VOTES = {"up", "down", "archive", None}
         if vote not in _VALID_VOTES:
             raise ValueError(f"vote must be one of {_VALID_VOTES}")
         with self._lock:
-            for ev in self.events:
-                if abs(ev.timestamp - timestamp) < 0.001:
-                    ev.vote = vote
-                    break
-            else:
+            match = next((ev for ev in self.events if abs(ev.timestamp - timestamp) < 0.001), None)
+            if match is None:
                 return False
-        # Rewrite the JSONL file with the updated vote
+            if vote == "archive":
+                # Remove entirely rather than flagging
+                keep = deque((e for e in self.events if e is not match), maxlen=self.events.maxlen)
+                self.events = keep
+            else:
+                match.vote = vote
         self._rewrite_events_file()
         return True
 
