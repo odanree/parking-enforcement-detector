@@ -63,22 +63,35 @@ class RTSPHandler:
         return cap
 
     def _loop(self) -> None:
-        cap = self._open_capture()
-        while not self._stop.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                logger.warning("Stream read failed — reconnecting in %.0fs…", self._reconnect_delay)
-                cap.release()
-                time.sleep(self._reconnect_delay)
-                cap = self._open_capture()
-                continue
+        # Redirect C-level stderr for the entire read loop so FFmpeg's
+        # "Error parsing AU headers" noise (from camera audio streams) doesn't
+        # pollute the console.  Python's logging still reaches the log file
+        # via its FileHandler regardless of fd 2.
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
 
-            # Evict the stale frame so we never block
-            if self._queue.full():
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self._queue.put(frame)
+        try:
+            cap = self._open_capture()
+            while not self._stop.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    logger.warning("Stream read failed — reconnecting in %.0fs…", self._reconnect_delay)
+                    cap.release()
+                    time.sleep(self._reconnect_delay)
+                    cap = self._open_capture()
+                    continue
 
-        cap.release()
+                # Evict the stale frame so we never block
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                self._queue.put(frame)
+
+            cap.release()
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
