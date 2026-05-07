@@ -225,18 +225,64 @@ class VLMAnalyzer:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_json(text: str) -> dict:
-    """Extract and parse the first JSON object in an LLM response."""
-    # Strip markdown code fences if present
+    """Extract and parse the JSON object from an LLM response.
+
+    Handles three cases:
+      1. Bare JSON (ideal)
+      2. JSON wrapped in ```json ... ``` fences (local models)
+      3. Prose reasoning followed by a JSON object (Sonnet with step-by-step output)
+    """
+    # Strip markdown code fences
     text = re.sub(r"```(?:json)?", "", text).strip("`").strip()
+
+    # Fast path — the whole response is valid JSON
     try:
         data = json.loads(text)
-        return {
-            "chalking_detected": bool(data.get("chalking_detected", False)),
-            "sweeper_detected": bool(data.get("sweeper_detected", False)),
-            "pe_vehicle_detected": bool(data.get("pe_vehicle_detected", False)),
-            "confidence": float(data.get("confidence", 0.0)),
-            "description": str(data.get("description", "")),
-        }
+        return _normalize(data)
     except json.JSONDecodeError:
-        logger.warning("Could not parse VLM JSON: %r", text[:200])
-        return _FALLBACK.copy()
+        pass
+
+    # Slow path — find the last { and brace-match to extract the JSON object.
+    # The model writes prose first then the JSON, so the last { is our target.
+    start = text.rfind("{")
+    if start != -1:
+        depth, end = 0, -1
+        in_str, escape = False, False
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end != -1:
+            try:
+                data = json.loads(text[start:end])
+                return _normalize(data)
+            except json.JSONDecodeError:
+                pass
+
+    logger.warning("Could not parse VLM JSON: %r", text[:200])
+    return _FALLBACK.copy()
+
+
+def _normalize(data: dict) -> dict:
+    return {
+        "chalking_detected":  bool(data.get("chalking_detected", False)),
+        "sweeper_detected":   bool(data.get("sweeper_detected", False)),
+        "pe_vehicle_detected": bool(data.get("pe_vehicle_detected", False)),
+        "confidence":         float(data.get("confidence", 0.0)),
+        "description":        str(data.get("description", "")),
+    }
