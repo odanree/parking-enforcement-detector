@@ -190,7 +190,7 @@ class VLMAnalyzer:
 
         response = self._claude.messages.create(
             model=self._claude_model,
-            max_tokens=256,
+            max_tokens=1024,
             system=[
                 {
                     "type": "text",
@@ -200,6 +200,8 @@ class VLMAnalyzer:
             ],
             messages=[{"role": "user", "content": content}],
         )
+        if response.stop_reason == "max_tokens":
+            logger.warning("Claude response truncated at max_tokens — increase max_tokens")
         return _parse_json(response.content[0].text)
 
     def _analyze_ollama(self, frames: list[bytes]) -> dict:
