@@ -6,7 +6,7 @@ Endpoints:
   GET  /api/events    → recent alert events JSON
   GET  /api/zone      → current street_zone polygon
   POST /api/zone      → update zone (persists to config/detection.yaml)
-  WS   /ws/video      → MJPEG-over-WebSocket annotated frame stream (~15 fps)
+  WS   /ws/video/{cam_id}  → MJPEG-over-WebSocket annotated frame stream (~15 fps)
 
 Run with:
     uvicorn src.web.app:app --host 0.0.0.0 --port 8000
@@ -42,12 +42,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from src import pipeline
+from src.storage.vector_store import EventVectorStore
 from src.web.state import AppState
 
-state = AppState()
+states = [AppState(0), AppState(1)]
+state = states[0]   # alias for all cam-0 REST endpoints
 _BASE = Path(__file__).parent
 _DETECTION_CFG = Path("config/detection.yaml")
 _PRIVACY_CFG   = Path("config/privacy.json")
+_DATASET_DIR   = Path("dataset")
+_DATASET_DIR.mkdir(exist_ok=True)
+
+vector_store = EventVectorStore(db_path="data/vectors", dataset_path=str(_DATASET_DIR))
 
 
 def _load_yaml(path: Path) -> dict:
@@ -55,33 +61,68 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(fh)
 
 
+_ZONE_KEYS = ["street_zone", "street_zone_1"]
+
 def _seed_zone() -> None:
     cfg = _load_yaml(_DETECTION_CFG)
-    polygon = cfg.get("zones", {}).get("street_zone", {}).get("polygon", [])
-    state.update_zone(polygon)
+    for cam_id, zone_key in enumerate(_ZONE_KEYS):
+        polygon = cfg.get("zones", {}).get(zone_key, {}).get("polygon", [])
+        states[cam_id].update_zone(polygon)
+
+
+def _privacy_cfg(cam_id: int) -> Path:
+    # cam 0 falls back to legacy privacy.json so existing configs are preserved
+    specific = Path(f"config/privacy_{cam_id}.json")
+    if cam_id == 0 and not specific.exists() and _PRIVACY_CFG.exists():
+        return _PRIVACY_CFG
+    return specific
 
 
 def _seed_privacy() -> None:
-    if _PRIVACY_CFG.exists():
-        try:
-            data = json.loads(_PRIVACY_CFG.read_text(encoding="utf-8"))
-            state.update_privacy_regions(data.get("regions", []))
-        except Exception:
-            logger.warning("Could not load privacy regions from %s", _PRIVACY_CFG)
+    for cam_id in range(len(states)):
+        cfg_path = _privacy_cfg(cam_id)
+        if cfg_path.exists():
+            try:
+                data = json.loads(cfg_path.read_text(encoding="utf-8"))
+                states[cam_id].update_privacy_regions(data.get("regions", []))
+            except Exception:
+                logger.warning("Could not load privacy regions from %s", cfg_path)
 
 
-def _save_privacy(regions: list[list[int]]) -> None:
-    _PRIVACY_CFG.parent.mkdir(exist_ok=True)
-    _PRIVACY_CFG.write_text(json.dumps({"regions": regions}), encoding="utf-8")
+def _save_privacy(cam_id: int, regions: list[list[int]]) -> None:
+    path = Path(f"config/privacy_{cam_id}.json")
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"regions": regions}), encoding="utf-8")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _seed_zone()
     _seed_privacy()
-    t = threading.Thread(target=pipeline.run, args=(state,), daemon=True, name="pipeline")
-    t.start()
-    logger.info("Pipeline thread started")
+    t0 = threading.Thread(target=pipeline.run, args=(states[0],), kwargs={"vector_store": vector_store}, daemon=True, name="pipeline-0")
+    t0.start()
+    logger.info("Pipeline-0 thread started")
+
+    cam1_rtsp  = os.getenv("RTSP_URL_2")
+    cam1_video = os.getenv("VIDEO_PATH_2")
+    if cam1_rtsp or cam1_video:
+        t1 = threading.Thread(
+            target=pipeline.run,
+            kwargs={
+                "state":        states[1],
+                "stream_url":   cam1_rtsp or None,
+                "video_path":   cam1_video or None,
+                "zone_key":     "street_zone_1",
+                "vector_store": vector_store,
+            },
+            daemon=True,
+            name="pipeline-1",
+        )
+        t1.start()
+        logger.info("Pipeline-1 thread started (rtsp=%s video=%s)", cam1_rtsp, cam1_video)
+    else:
+        logger.info("No RTSP_URL_2 / VIDEO_PATH_2 set — camera 1 inactive")
+
     yield
     logger.info("Shutting down")
 
@@ -93,6 +134,7 @@ _DIST = _BASE.parent.parent / "frontend-dist"
 app = FastAPI(title="Parking Enforcement Detector", lifespan=lifespan)
 app.mount("/assets",    StaticFiles(directory=str(_DIST / "assets")),  name="assets")
 app.mount("/snapshots", StaticFiles(directory=str(_SNAPSHOTS_DIR)),    name="snapshots")
+app.mount("/dataset",   StaticFiles(directory=str(_DATASET_DIR)),      name="dataset")
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
@@ -106,17 +148,29 @@ async def dashboard():
 
 @app.get("/api/stats")
 async def get_stats():
-    return JSONResponse(state.get_stats())
+    s = state.get_stats()
+    for cam in states[1:]:
+        other = cam.get_stats()
+        s["total_chalking"] += other["total_chalking"]
+        s["total_sweeper"]  += other["total_sweeper"]
+    return JSONResponse(s)
 
 
 @app.get("/api/events")
 async def get_events():
-    return JSONResponse(state.get_events())
+    events = []
+    for cam_id, s in enumerate(states):
+        for ev in s.get_events():
+            events.append({**ev, "camera": cam_id})
+    events.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    return JSONResponse(events)
 
 
-@app.get("/api/zone")
-async def get_zone():
-    return JSONResponse({"polygon": state.zone_polygon})
+@app.get("/api/zone/{cam_id}")
+async def get_zone(cam_id: int = 0):
+    if cam_id not in (0, 1):
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    return JSONResponse({"polygon": states[cam_id].zone_polygon})
 
 
 class ZonePayload(BaseModel):
@@ -137,29 +191,44 @@ async def toggle_motion():
 
 @app.post("/api/privacy/toggle")
 async def toggle_privacy():
-    enabled = state.toggle_privacy()
+    # Toggle all cameras together — one on/off switch for the whole system
+    enabled = states[0].toggle_privacy()
+    for s in states[1:]:
+        s.privacy_mode = enabled
     return {"privacy_mode": enabled}
 
 
 @app.get("/api/pending")
 async def get_pending():
-    return JSONResponse({"jobs": state.get_pending_vlm()})
+    jobs = []
+    for cam_id, s in enumerate(states):
+        for job in s.get_pending_vlm():
+            jobs.append({**job, "camera": cam_id})
+    return JSONResponse({"jobs": jobs})
 
 
 @app.get("/api/debug/rejected")
 async def get_rejected():
-    return JSONResponse({"items": state.get_rejected_vlm()})
+    items = []
+    for cam_id, s in enumerate(states):
+        for item in s.get_rejected_vlm():
+            items.append({**item, "camera": cam_id})
+    items.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    return JSONResponse({"items": items})
 
 
 @app.delete("/api/debug/rejected")
 async def clear_rejected():
-    state.clear_rejected_vlm()
+    for s in states:
+        s.clear_rejected_vlm()
     return {"ok": True}
 
 
-@app.get("/api/privacy/regions")
-async def get_privacy_regions():
-    return {"regions": state.get_privacy_regions()}
+@app.get("/api/privacy/regions/{cam_id}")
+async def get_privacy_regions(cam_id: int = 0):
+    if cam_id not in range(len(states)):
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    return {"regions": states[cam_id].get_privacy_regions()}
 
 
 class PrivacyRegionsPayload(BaseModel):
@@ -169,13 +238,15 @@ class PrivacyRegionsPayload(BaseModel):
 _DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 
-@app.post("/api/privacy/regions")
-async def update_privacy_regions(body: PrivacyRegionsPayload):
+@app.post("/api/privacy/regions/{cam_id}")
+async def update_privacy_regions(body: PrivacyRegionsPayload, cam_id: int = 0):
+    if cam_id not in range(len(states)):
+        raise HTTPException(status_code=404, detail="Unknown camera")
     if _DEMO_MODE:
         raise HTTPException(status_code=403, detail="Privacy regions are locked in demo mode")
-    state.update_privacy_regions(body.regions)
-    _save_privacy(body.regions)
-    return {"regions": state.get_privacy_regions()}
+    states[cam_id].update_privacy_regions(body.regions)
+    _save_privacy(cam_id, body.regions)
+    return {"regions": states[cam_id].get_privacy_regions()}
 
 
 class SpeedPayload(BaseModel):
@@ -204,6 +275,38 @@ async def set_playback_direction(body: DirectionPayload):
 async def seek_playback(body: SeekPayload):
     state.seek_playback(body.seconds)
     return {"ok": True}
+
+
+# ── Dataset / labeling ────────────────────────────────────────────────────────
+
+@app.get("/api/dataset")
+async def dataset_list(offset: int = 0, limit: int = 50):
+    return JSONResponse(vector_store.get_all(offset=offset, limit=limit))
+
+
+class LabelPayload(BaseModel):
+    label: str   # "true_positive" | "false_positive" | "true_negative" | "false_negative" | ""
+
+
+@app.post("/api/dataset/{event_id}/label")
+async def dataset_label(event_id: str, body: LabelPayload):
+    try:
+        vector_store.update_label(event_id, body.label)
+        return {"ok": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Event not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/dataset/similar/{event_id}")
+async def dataset_similar(event_id: str, n: int = 10):
+    return JSONResponse({"items": vector_store.query_similar(event_id, n=n)})
+
+
+@app.get("/api/dataset/export")
+async def dataset_export():
+    return JSONResponse(vector_store.export_labeled())
 
 
 class AlertPayload(BaseModel):
@@ -315,37 +418,41 @@ async def send_alert(body: AlertPayload):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/api/zone")
-async def update_zone(body: ZonePayload):
+@app.post("/api/zone/{cam_id}")
+async def update_zone(body: ZonePayload, cam_id: int = 0):
+    if cam_id not in (0, 1):
+        raise HTTPException(status_code=404, detail="Unknown camera")
     if len(body.polygon) < 3:
         raise HTTPException(status_code=400, detail="Zone needs at least 3 points")
 
-    # Hot-reload: pipeline picks this up within one frame
-    state.update_zone(body.polygon)
+    states[cam_id].update_zone(body.polygon)
 
-    # Persist to YAML so it survives restart
     cfg = _load_yaml(_DETECTION_CFG)
-    cfg["zones"]["street_zone"]["polygon"] = body.polygon
+    cfg["zones"][_ZONE_KEYS[cam_id]]["polygon"] = body.polygon
     with open(_DETECTION_CFG, "w", encoding="utf-8") as fh:
         yaml.dump(cfg, fh, default_flow_style=False, allow_unicode=True)
 
-    logger.info("Zone updated: %s", body.polygon)
+    logger.info("Zone %d updated: %s", cam_id, body.polygon)
     return {"status": "ok", "polygon": body.polygon}
 
 
 # ── WebSocket video stream ────────────────────────────────────────────────────
 
-@app.websocket("/ws/video")
-async def video_stream(websocket: WebSocket):
+@app.websocket("/ws/video/{cam_id}")
+async def video_stream(websocket: WebSocket, cam_id: int = 0):
+    if cam_id not in (0, 1):
+        await websocket.close(code=1008)
+        return
+    cam_state = states[cam_id]
     await websocket.accept()
-    logger.debug("WS client connected")
+    logger.debug("WS client connected (cam %d)", cam_id)
     try:
         while True:
-            frame = state.get_frame()
+            frame = cam_state.get_frame()
             if frame:
                 await websocket.send_bytes(frame)
             await asyncio.sleep(0.05)
     except WebSocketDisconnect:
-        logger.debug("WS client disconnected")
+        logger.debug("WS client disconnected (cam %d)", cam_id)
     except Exception:
-        logger.exception("WS error")
+        logger.exception("WS error (cam %d)", cam_id)

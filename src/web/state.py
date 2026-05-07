@@ -24,10 +24,12 @@ class Event:
     confidence: float
     description: str
     snapshot: Optional[str] = None   # filename only, e.g. "chalking_20240101_120000.jpg"
+    frames: list = field(default_factory=list)  # base64 JPEGs for animation
 
 
 class AppState:
-    def __init__(self) -> None:
+    def __init__(self, camera_id: int = 0) -> None:
+        self.camera_id = camera_id
         self._lock = threading.Lock()
         self.latest_frame: Optional[bytes] = None   # JPEG bytes, annotated
         self.events: deque[Event] = deque(maxlen=50)
@@ -49,7 +51,7 @@ class AppState:
         self._fps_times: Deque[float] = deque()  # monotonic timestamps of recent frames
         self._pending_vlm: list[dict[str, Any]] = []  # in-flight VLM jobs
         self._vlm_sample_counts: dict[str, int] = {}  # job_id → cumulative sample count
-        self._debug_rejected: deque[dict[str, Any]] = deque(maxlen=100)
+        self._debug_rejected: deque[dict[str, Any]] = deque(maxlen=30)
 
     # ── Playback control ─────────────────────────────────────────────────────
 
@@ -128,7 +130,8 @@ class AppState:
             })
 
     def record_rejected_vlm(
-        self, kind: str, thumbnail_b64: str, confidence: float, description: str
+        self, kind: str, thumbnail_b64: str, confidence: float, description: str,
+        frames: list[str] | None = None,
     ) -> None:
         with self._lock:
             self._debug_rejected.appendleft({
@@ -137,6 +140,7 @@ class AppState:
                 "confidence": confidence,
                 "description": description,
                 "timestamp": time.time(),
+                "frames": frames or [],
             })
 
     def get_rejected_vlm(self) -> list[dict[str, Any]]:
@@ -201,6 +205,7 @@ class AppState:
         confidence: float,
         description: str,
         snapshot: str | None = None,
+        frames: list[str] | None = None,
     ) -> None:
         with self._lock:
             self.events.appendleft(
@@ -210,6 +215,7 @@ class AppState:
                     confidence=confidence,
                     description=description,
                     snapshot=snapshot,
+                    frames=frames or [],
                 )
             )
             if event_type == "chalking":
@@ -255,6 +261,7 @@ class AppState:
                     "confidence": e.confidence,
                     "description": e.description,
                     "snapshot_url": f"/snapshots/{e.snapshot}" if e.snapshot else None,
+                    "frames": e.frames,
                 }
                 for e in list(self.events)[:limit]
             ]
