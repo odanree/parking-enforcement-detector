@@ -240,3 +240,51 @@ To keep P fixed under cursor at `cursorX` (relative to visual center): `panX2 = 
 This is simply `panX += cursorX * (1 - ratio)` — add a delta, never multiply the accumulated pan.
 
 **Why it matters:** The `panX * ratio` form appears intuitive ("scale the existing offset too") but is mathematically wrong. Always derive zoom-to-point formulas from the fixed-point constraint: the image coordinate under the cursor must be identical before and after the zoom step.
+
+---
+
+## L14 — VLM prompt gate phrasing inverted: "no trunk → not chalking" instead of "no trunk → proceed"
+
+**Date:** 2026-05-06
+
+**What happened:** The trunk-exclusion gate was written as "If ANY vehicle has an open trunk, STOP and return false." The VLM correctly applied the gate when a trunk was open but then described negative results as "No open trunks detected, so chalking was not flagged" — inverting the logic. The absence of trunks was treated as a reason *against* chalking rather than clearance to check for it.
+
+**Fix:** Restructured the prompt to make the two outcomes explicit: "If YES (open trunk) → set false, skip STEP 2. If NO open trunk → the exclusion does NOT apply, PROCEED to STEP 2." The positive path ("proceed") was previously implicit and the VLM filled the gap incorrectly.
+
+**Why it matters:** LLMs complete patterns. A gate written as "if X, stop" implies "the absence of X is relevant to the answer" without specifying how. Always spell out both branches of a conditional explicitly, especially for safety gates that must not be inverted.
+
+---
+
+## L15 — `entry_frames` and `buffer_sample_every_n` must be co-designed; mismatched values cause single-frame VLM calls
+
+**Date:** 2026-05-06
+
+**What happened:** `entry_frames` was set to 2 (fire VLM early) and `buffer_sample_every_n` to 5 (store every 5th frame). By the time the VLM fired at count=2, the buffer had only stored one frame (at count=0; count=5 not yet reached). The multi-frame context feature was silently degraded to single-frame on every first call.
+
+**Fix:** Set `entry_frames = (frame_buffer_size - 1) × buffer_sample_every_n + 1`. This ensures the buffer is exactly full at the first VLM trigger. The buffer stores at N=0, B, 2B, …, (F-1)B; the VLM fires when count reaches (F-1)B+1.
+
+**Why it matters:** Two independent config values controlling the same feature create silent misconfiguration. The buffer fill rate and the VLM trigger rate are coupled; deriving one from the other via a documented formula prevents the frame-count mismatch.
+
+---
+
+## L16 — Walking-cane exclusion in CONDITION A was too easy to trigger, suppressing chalk-rod detections
+
+**Date:** 2026-05-06
+
+**What happened:** The prompt excluded a long thin object if it was "unambiguously a vertical walking cane used for body support." At overhead camera distance, a chalk rod held at the side and pointing downward is visually indistinguishable from a walking stick. The VLM regularly applied the walking-cane exclusion to PE officers carrying chalk rods, returning CONDITION A as false.
+
+**Fix:** Raised the exclusion bar significantly: "Do NOT exclude an object as a walking cane unless the person is clearly elderly AND visibly leaning all their body weight on it for balance with each step." A person walking normally while carrying any long thin object near parked vehicles must be flagged.
+
+**Why it matters:** Any exclusion clause in a detection prompt is an escape hatch. The harder it is to trigger, the fewer false negatives it causes. Exclusions should require multiple independent observable features (age + gait + weight-bearing), not a single ambiguous one.
+
+---
+
+## L17 — Removing CONDITION B's posture requirement trades false negatives for false positives
+
+**Date:** 2026-05-07
+
+**What happened:** CONDITION B originally required crouching or bending at a rear wheel. PE officers who chalked while standing were missed. The posture requirement was removed entirely ("any posture at rear wheel → flag"). This immediately caused false positives on car owners standing beside their own vehicles.
+
+**Fix:** Restored a discriminating requirement but shifted it from posture to time: CONDITION B now requires the person to be *stationary* at the rear wheel position across the *majority of frames* in the evaluation window. A PE officer dwells at the wheel for several seconds; a car owner briefly passes it. The multi-frame context window (ADR 020) makes this temporal check possible.
+
+**Why it matters:** Posture and proximity are each individually ambiguous at overhead camera distance. The reliable discriminator is temporal: chalking requires sustained presence at a specific location. Any single-frame criterion (posture, tool, proximity alone) will have unacceptable false-positive or false-negative rates in real street footage.

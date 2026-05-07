@@ -13,3 +13,8 @@ logs/*
 dist/
 frontend-dist/
 *.egg-info/
+dataset/*
+!dataset/.gitkeep
+data/*
+!data/.gitkeep
+config/privacy_*.json
