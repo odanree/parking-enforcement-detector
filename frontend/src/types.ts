@@ -6,6 +6,8 @@ export interface AppEvent {
   confidence: number;
   description: string | null;
   snapshot_url: string | null;
+  camera?: number;
+  frames?: string[];
 }
 
 export interface Stats {
@@ -42,6 +44,7 @@ export interface DebugItem {
   confidence: number;
   description: string | null;
   timestamp: number;
+  frames?: string[];
 }
 
 export type Polygon = [number, number][];

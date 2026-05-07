@@ -81,9 +81,10 @@ interface Props {
   canvasRef: RefObject<HTMLCanvasElement | null>;
   editing:   boolean;
   onDone:    () => void;
+  cameraId:  number;
 }
 
-export function ZoneOverlay({ canvasRef, editing, onDone }: Props) {
+export function ZoneOverlay({ canvasRef, editing, onDone, cameraId }: Props) {
   const pointsRef  = useRef<Polygon>([]);
   const savedRef   = useRef<Polygon>([]);
   const historyRef = useRef<Polygon[]>([]);
@@ -105,7 +106,7 @@ export function ZoneOverlay({ canvasRef, editing, onDone }: Props) {
 
   // Load zone on mount
   useEffect(() => {
-    fetch('/api/zone')
+    fetch(`/api/zone/${cameraId}`)
       .then((r) => r.json())
       .then((d) => {
         pointsRef.current = d.polygon ?? [];
@@ -113,7 +114,7 @@ export function ZoneOverlay({ canvasRef, editing, onDone }: Props) {
         if (c) drawZone(c, pointsRef.current, false, -1, -1);
       })
       .catch(() => {});
-  }, [canvasRef]);
+  }, [canvasRef, cameraId]);
 
   // Initialize when entering edit mode
   useEffect(() => {
@@ -239,7 +240,7 @@ export function ZoneOverlay({ canvasRef, editing, onDone }: Props) {
   async function saveEdit() {
     if (pointsRef.current.length < 3) { alert('Zone needs at least 3 points.'); return; }
     try {
-      const res = await fetch('/api/zone', {
+      const res = await fetch(`/api/zone/${cameraId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ polygon: pointsRef.current }),

@@ -1,13 +1,41 @@
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store';
+import type { DebugItem } from '../types';
 import { TYPE_LABELS } from '../types';
 
+function DebugThumb({ item }: { item: DebugItem }) {
+  const hasFrames = item.kind === 'chalking' && item.frames && item.frames.length > 1;
+  const [idx, setIdx] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (!hasFrames) return;
+    timerRef.current = setInterval(() => {
+      setIdx((i) => (i + 1) % item.frames!.length);
+    }, 500);
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [hasFrames, item.frames]);
+
+  if (hasFrames) {
+    return (
+      <img
+        src={`data:image/jpeg;base64,${item.frames![idx]}`}
+        alt={`frame ${idx + 1}/${item.frames!.length}`}
+        loading="lazy"
+      />
+    );
+  }
+  if (item.thumbnail) {
+    return <img src={`data:image/jpeg;base64,${item.thumbnail}`} alt="" loading="lazy" />;
+  }
+  return null;
+}
+
 export function DebugDrawer() {
-  const debugItems  = useAppStore((s) => s.debugItems);
-  const debugOpen   = useAppStore((s) => s.debugOpen);
+  const debugItems   = useAppStore((s) => s.debugItems);
+  const debugOpen    = useAppStore((s) => s.debugOpen);
   const setDebugOpen = useAppStore((s) => s.setDebugOpen);
 
-  // Close on Escape
   useEffect(() => {
     if (!debugOpen) return;
     function onKey(e: KeyboardEvent) { if (e.key === 'Escape') setDebugOpen(false); }
@@ -51,9 +79,7 @@ export function DebugDrawer() {
                 });
                 return (
                   <div key={i} className="debug-item">
-                    {item.thumbnail && (
-                      <img src={`data:image/jpeg;base64,${item.thumbnail}`} alt="" loading="lazy" />
-                    )}
+                    <DebugThumb item={item} />
                     <div className="debug-item-meta">
                       <div className="debug-item-header">
                         <span className={`debug-kind ${item.kind}`}>{TYPE_LABELS[item.kind] ?? item.kind}</span>

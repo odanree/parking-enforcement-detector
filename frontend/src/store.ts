@@ -8,7 +8,7 @@ interface AppStore {
   debugItems:  DebugItem[];
   debugOpen:   boolean;
   modalEvent:  AppEvent | null;
-  wsStatus:    'connected' | 'disconnected';
+  wsStatuses:  ('connected' | 'disconnected')[];
 
   setStats:      (s: Stats) => void;
   setEvents:     (evs: AppEvent[]) => void;
@@ -17,7 +17,7 @@ interface AppStore {
   setDebugOpen:  (open: boolean) => void;
   openModal:     (ev: AppEvent) => void;
   closeModal:    () => void;
-  setWsStatus:   (s: 'connected' | 'disconnected') => void;
+  setWsStatus:   (cam: number, s: 'connected' | 'disconnected') => void;
 }
 
 export const useAppStore = create<AppStore>((set) => ({
@@ -27,7 +27,7 @@ export const useAppStore = create<AppStore>((set) => ({
   debugItems: [],
   debugOpen:  false,
   modalEvent: null,
-  wsStatus:   'disconnected',
+  wsStatuses: ['disconnected', 'disconnected'],
 
   setStats:      (stats)      => set({ stats }),
   setEvents:     (events)     => set({ events }),
@@ -36,5 +36,9 @@ export const useAppStore = create<AppStore>((set) => ({
   setDebugOpen:  (debugOpen)  => set({ debugOpen }),
   openModal:     (modalEvent) => set({ modalEvent }),
   closeModal:    ()           => set({ modalEvent: null }),
-  setWsStatus:   (wsStatus)   => set({ wsStatus }),
+  setWsStatus:   (cam, s)     => set((state) => {
+    const next = [...state.wsStatuses] as ('connected' | 'disconnected')[];
+    next[cam] = s;
+    return { wsStatuses: next };
+  }),
 }));

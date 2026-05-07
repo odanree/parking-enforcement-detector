@@ -6,13 +6,14 @@ const SEEKS  = [-10, -5, 5, 10];
 function fmtSpeed(s: number) { return s === 0.5 ? '½x' : `${s}x`; }
 
 interface Props {
+  cameraId:        number;
   zoneEditing:     boolean;
   privEditing:     boolean;
   onEnterZoneEdit: () => void;
   onEnterPrivEdit: () => void;
 }
 
-export function VideoToolbar({ zoneEditing, privEditing, onEnterZoneEdit, onEnterPrivEdit }: Props) {
+export function VideoToolbar({ cameraId, zoneEditing, privEditing, onEnterZoneEdit, onEnterPrivEdit }: Props) {
   const stats     = useAppStore((s) => s.stats);
   const isLive    = stats?.is_live ?? true;
   const paused    = stats?.paused ?? false;
@@ -95,9 +96,11 @@ export function VideoToolbar({ zoneEditing, privEditing, onEnterZoneEdit, onEnte
 
       {!demo && (
         <div className="toolbar-right">
-          <button className={`btn-motion${motionOn ? ' active' : ''}`} onClick={toggleMotion}>
-            {motionOn ? 'Motion Detect ON' : 'Motion Detect'}
-          </button>
+          {cameraId === 0 && (
+            <button className={`btn-motion${motionOn ? ' active' : ''}`} onClick={toggleMotion}>
+              {motionOn ? 'Motion Detect ON' : 'Motion Detect'}
+            </button>
+          )}
           <button className={`btn-privacy${privacyOn ? ' active' : ''}`} onClick={togglePrivacy}>
             &#128683; Privacy
           </button>
@@ -108,7 +111,6 @@ export function VideoToolbar({ zoneEditing, privEditing, onEnterZoneEdit, onEnte
             Edit Regions
           </button>
           <button
-            id="btn-edit-zone"
             className={`btn-zone${zoneEditing ? ' active' : ''}`}
             onClick={zoneEditing ? undefined : onEnterZoneEdit}
           >

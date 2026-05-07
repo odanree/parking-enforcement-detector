@@ -1,7 +1,7 @@
 import { useEffect, type RefObject } from 'react';
 import { useAppStore } from '../store';
 
-export function useVideoStream(canvasRef: RefObject<HTMLCanvasElement | null>) {
+export function useVideoStream(canvasRef: RefObject<HTMLCanvasElement | null>, cameraId = 0) {
   const setWsStatus = useAppStore((s) => s.setWsStatus);
 
   useEffect(() => {
@@ -11,10 +11,10 @@ export function useVideoStream(canvasRef: RefObject<HTMLCanvasElement | null>) {
 
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/video`);
+      ws = new WebSocket(`${proto}://${location.host}/ws/video/${cameraId}`);
       ws.binaryType = 'blob';
 
-      ws.onopen = () => { if (!aborted) setWsStatus('connected'); };
+      ws.onopen = () => { if (!aborted) setWsStatus(cameraId, 'connected'); };
 
       ws.onmessage = (e) => {
         if (aborted) return;
@@ -34,7 +34,7 @@ export function useVideoStream(canvasRef: RefObject<HTMLCanvasElement | null>) {
 
       ws.onclose = () => {
         if (aborted) return;
-        setWsStatus('disconnected');
+        setWsStatus(cameraId, 'disconnected');
         reconnectTimer = setTimeout(connect, 3000);
       };
 
@@ -47,5 +47,5 @@ export function useVideoStream(canvasRef: RefObject<HTMLCanvasElement | null>) {
       clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [canvasRef, setWsStatus]);
+  }, [canvasRef, cameraId, setWsStatus]);
 }

@@ -50,9 +50,10 @@ interface Props {
   privacyMode: boolean;
   editing:     boolean;
   onDone:      () => void;
+  cameraId:    number;
 }
 
-export function PrivacyOverlay({ canvasRef, privacyMode, editing, onDone }: Props) {
+export function PrivacyOverlay({ canvasRef, privacyMode, editing, onDone, cameraId }: Props) {
   const regionsRef = useRef<PrivacyRegion[]>([]);
   const draftRef   = useRef<PrivacyRegion[]>([]);
   const dragRef    = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
@@ -64,11 +65,11 @@ export function PrivacyOverlay({ canvasRef, privacyMode, editing, onDone }: Prop
 
   // Load saved regions on mount
   useEffect(() => {
-    fetch('/api/privacy/regions')
+    fetch(`/api/privacy/regions/${cameraId}`)
       .then((r) => r.json())
       .then((d) => { regionsRef.current = d.regions ?? []; redraw(); })
       .catch(() => {});
-  }, [canvasRef]);
+  }, [canvasRef, cameraId]);
 
   // Initialize when entering edit mode
   useEffect(() => {
@@ -141,7 +142,7 @@ export function PrivacyOverlay({ canvasRef, privacyMode, editing, onDone }: Prop
 
   async function saveEdit() {
     try {
-      await fetch('/api/privacy/regions', {
+      await fetch(`/api/privacy/regions/${cameraId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ regions: draftRef.current }),

@@ -72,6 +72,14 @@ main {
   height: calc(100vh - 49px);
 }
 
+.video-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
 /* ── Video panel ─────────────────────────────────────────────────────────── */
 .video-panel {
   background: #000;
@@ -83,10 +91,21 @@ main {
   align-items: center;
 }
 
+.canvas-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  padding: 4px 10px 0;
+  flex-shrink: 0;
+}
+
 .canvas-wrap {
   position: relative;
   aspect-ratio: 16/9;
-  width: min(100%, calc((100vh - 110px) * 16 / 9));
+  /* Two panels stacked: each gets ~half the content height */
+  width: min(100%, calc((50vh - 80px) * 16 / 9));
   flex: none;
   overflow: hidden;
   display: flex;
@@ -97,10 +116,10 @@ main {
 /* When the zone or privacy editing toolbar is open it adds ~44px.
    Shrink the canvas so that second toolbar stays on-screen. */
 .video-panel.editing .canvas-wrap {
-  width: min(100%, calc((100vh - 154px) * 16 / 9));
+  width: min(100%, calc((50vh - 124px) * 16 / 9));
 }
 
-#feed {
+.feed-canvas {
   position: absolute;
   top: 0; left: 0;
   width: 100%;
@@ -108,7 +127,7 @@ main {
   display: block;
 }
 
-#privacy-overlay {
+.privacy-canvas {
   position: absolute;
   top: 0; left: 0;
   width: 100%;
@@ -117,12 +136,12 @@ main {
   z-index: 1;
 }
 
-#privacy-overlay.editing {
+.privacy-canvas.editing {
   pointer-events: all;
   cursor: crosshair;
 }
 
-#zone-overlay {
+.zone-canvas {
   position: absolute;
   top: 0; left: 0;
   width: 100%;
@@ -131,7 +150,7 @@ main {
   z-index: 2;
 }
 
-#zone-overlay.editing {
+.zone-canvas.editing {
   pointer-events: all;
   cursor: crosshair;
 }
@@ -785,6 +804,7 @@ main {
 .debug-list {
   overflow-y: auto;
   flex: 1;
+  min-height: 0;
   padding: 10px;
   display: flex;
   flex-direction: column;
@@ -803,6 +823,7 @@ main {
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .debug-item img {
@@ -888,6 +909,7 @@ main {
   main {
     grid-template-columns: 1fr 240px;
   }
+  .canvas-wrap { width: min(100%, calc((50vh - 80px) * 16 / 9)); }
 
   .btn-seek { display: none; }
   .speed-sep { display: none; }
@@ -936,6 +958,8 @@ main {
     padding: 8px;
     gap: 8px;
   }
+
+  .video-panels { overflow: visible; }
 
   .video-panel { height: auto; }
 

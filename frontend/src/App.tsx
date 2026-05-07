@@ -1,4 +1,3 @@
-import { useRef } from 'react';
 import { Header }      from './components/Header';
 import { VideoPanel }  from './components/VideoPanel/VideoPanel';
 import { SidePanel }   from './components/SidePanel/SidePanel';
@@ -8,7 +7,6 @@ import { useStats }         from './hooks/useStats';
 import { useEvents }        from './hooks/useEvents';
 import { usePending }       from './hooks/usePending';
 import { useDebugRejected } from './hooks/useDebugRejected';
-import { useVideoStream }   from './hooks/useVideoStream';
 
 export default function App() {
   useStats();
@@ -16,14 +14,14 @@ export default function App() {
   usePending();
   useDebugRejected();
 
-  const feedRef = useRef<HTMLCanvasElement>(null);
-  useVideoStream(feedRef);
-
   return (
     <>
       <Header />
       <main>
-        <VideoPanel feedRef={feedRef} />
+        <div className="video-panels">
+          <VideoPanel cameraId={0} />
+          <VideoPanel cameraId={1} />
+        </div>
         <SidePanel />
       </main>
       <DebugDrawer />

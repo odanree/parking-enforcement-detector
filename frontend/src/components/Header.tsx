@@ -2,7 +2,7 @@ import { useAppStore } from '../store';
 
 export function Header() {
   const stats      = useAppStore((s) => s.stats);
-  const wsStatus   = useAppStore((s) => s.wsStatus);
+  const wsStatuses = useAppStore((s) => s.wsStatuses);
   const debugItems = useAppStore((s) => s.debugItems);
   const setDebugOpen = useAppStore((s) => s.setDebugOpen);
   const demo = stats?.demo_mode ?? false;
@@ -17,8 +17,11 @@ export function Header() {
         <span id="badge-sweep" className={`badge ${stats?.sweep_window_active ? 'on' : 'off'}`}>
           &#x25CF; Sweep Window
         </span>
-        <span id="badge-ws" className={`badge badge-ws ${wsStatus}`}>
-          &#x25CF; Stream
+        <span className={`badge badge-ws ${wsStatuses[0]}`}>
+          &#x25CF; Cam 0
+        </span>
+        <span className={`badge badge-ws ${wsStatuses[1]}`}>
+          &#x25CF; Cam 1
         </span>
         {!demo && (
           <button id="btn-debug-open" className="btn-debug-open" onClick={() => setDebugOpen(true)}>

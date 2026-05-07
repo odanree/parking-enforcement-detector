@@ -1,6 +1,29 @@
+import { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../../store';
 import type { AppEvent } from '../../types';
 import { TYPE_LABELS } from '../../types';
+
+function FrameAnimator({ frames, onClick }: { frames: string[]; onClick: () => void }) {
+  const [idx, setIdx] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (frames.length <= 1) return;
+    timerRef.current = setInterval(() => {
+      setIdx((i) => (i + 1) % frames.length);
+    }, 500); // 2 fps
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [frames]);
+
+  return (
+    <img
+      className="event-thumb"
+      src={`data:image/jpeg;base64,${frames[idx]}`}
+      alt={`frame ${idx + 1}/${frames.length}`}
+      onClick={onClick}
+    />
+  );
+}
 
 function EventItem({ ev }: { ev: AppEvent }) {
   const openModal = useAppStore((s) => s.openModal);
@@ -9,24 +32,30 @@ function EventItem({ ev }: { ev: AppEvent }) {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 
+  const hasFrames = ev.frames && ev.frames.length > 0;
+
   return (
     <li className={`event-item ${ev.event_type}`}>
       <div className="event-header">
         <span className={`event-type ${ev.event_type}`}>{TYPE_LABELS[ev.event_type] ?? ev.event_type}</span>
+        {ev.camera != null && ev.camera > 0 && <span className="event-cam">Cam {ev.camera}</span>}
         <span className="event-conf">{pct}%</span>
         <span className="event-time">{timeStr}</span>
       </div>
       <div className="event-desc" title={ev.description ?? ''}>{ev.description || 'No description'}</div>
       <div className="conf-bar"><div className="conf-fill" style={{ width: `${pct}%` }} /></div>
-      {ev.snapshot_url && (
-        <img
-          className="event-thumb"
-          src={ev.snapshot_url}
-          alt="snapshot"
-          loading="lazy"
-          onClick={() => openModal(ev)}
-        />
-      )}
+      {hasFrames
+        ? <FrameAnimator frames={ev.frames!} onClick={() => openModal(ev)} />
+        : ev.snapshot_url && (
+          <img
+            className="event-thumb"
+            src={ev.snapshot_url}
+            alt="snapshot"
+            loading="lazy"
+            onClick={() => openModal(ev)}
+          />
+        )
+      }
     </li>
   );
 }
