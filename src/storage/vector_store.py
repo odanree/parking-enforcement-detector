@@ -26,7 +26,9 @@ _LABELS = {"true_positive", "false_positive", "true_negative", "false_negative"}
 def _try_default_ef():
     try:
         from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-        return DefaultEmbeddingFunction()
+        ef = DefaultEmbeddingFunction()
+        ef(["warmup"])  # trigger model download now so the first add() doesn't fail
+        return ef
     except Exception:
         logger.warning("ChromaDB DefaultEmbeddingFunction unavailable — semantic search disabled")
         return None

@@ -63,6 +63,12 @@ if sys.platform == "win32":
     except Exception:
         pass  # best-effort; noise is cosmetic
 
+# tqdm writes progress bars to stderr.  Since we just redirected the C-level
+# stderr to NUL, tqdm's flush() call hits WinError 1 on the broken fd.
+# Disable tqdm globally — progress bars have no value in a server process.
+import os as _os
+_os.environ.setdefault("TQDM_DISABLE", "1")
+
 import uvicorn
 
 if __name__ == "__main__":
