@@ -36,7 +36,7 @@ COPY config/ ./config/
 COPY --from=frontend-builder /app/frontend-dist/ ./frontend-dist/
 
 # Runtime directories (populated at runtime via volume mounts)
-RUN mkdir -p snapshots logs
+RUN mkdir -p snapshots logs dataset data/vectors
 
 EXPOSE 8000
 CMD ["python", "-m", "src.main_web"]
