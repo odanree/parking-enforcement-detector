@@ -10,9 +10,11 @@ Usage: set VIDEO_PATH=/path/to/clip.mp4 in .env — pipeline.py picks it up.
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -21,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 _VIDEO_EXTS    = {".mp4", ".avi", ".mkv", ".mov", ".ts", ".m4v"}
 _REVERSE_CHUNK = 20
+
+# NVR filename pattern: NVR_ch4_main_20260504111210_20260504111236.mp4
+_NVR_TS_RE = re.compile(r'(\d{14})')
 
 
 class VideoFileHandler:
@@ -41,6 +46,8 @@ class VideoFileHandler:
         self._stop   = threading.Event()
         self._paused = threading.Event()
         self._thread: threading.Thread | None = None
+        self._file_start_ts: float | None = None  # Unix ts of current file's first frame
+        self._file_pos_sec: float = 0.0           # seconds into the current file
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -75,6 +82,28 @@ class VideoFileHandler:
         try:
             return self._queue.get(timeout=timeout)
         except queue.Empty:
+            return None
+
+    def get_current_wall_time(self) -> float | None:
+        """Return estimated wall-clock Unix timestamp of the current frame.
+
+        Parsed from NVR filename (YYYYMMDDHHMMSS) + position within file.
+        Returns None if the filename doesn't match the NVR naming pattern.
+        """
+        start = self._file_start_ts
+        if start is None:
+            return None
+        return start + self._file_pos_sec
+
+    @staticmethod
+    def _parse_file_start_ts(file_path: str) -> float | None:
+        m = _NVR_TS_RE.search(Path(file_path).stem)
+        if not m:
+            return None
+        try:
+            dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+            return dt.astimezone().timestamp()
+        except ValueError:
             return None
 
     def _files(self) -> list[str]:
@@ -121,6 +150,8 @@ class VideoFileHandler:
             return
 
         self._current_fps = fps
+        self._file_start_ts = self._parse_file_start_ts(file_path)
+        self._file_pos_sec  = 0.0
         logger.info("Playing %s  %.0f fps  %d frames  dir=%+d",
                     file_path, fps, total, self._direction)
 
@@ -154,6 +185,8 @@ class VideoFileHandler:
                 ok, frame = cap.read()
                 if not ok:
                     break
+
+                self._file_pos_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
                 # Blocking put — video paces itself to the pipeline instead of
                 # dropping frames.  Frame drops broke ByteTrack continuity and
