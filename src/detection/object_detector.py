@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 
 import cv2
@@ -15,6 +16,11 @@ _TRACKED_CLASSES = {"person", "truck", "motorcycle", "car"}
 # Cars are exempt from stationary masking — a car that *stops* is the signal
 # we want for PE vehicle detection, not noise to suppress.
 _STATIONARY_EXEMPT = {"car"}
+
+# Classes that get position-grid suppression: if a grid cell has been
+# continuously occupied by one of these classes for _GRID_SUPPRESS_FRAMES frames,
+# that cell is permanently blacklisted (survives track-ID churn from the tracker).
+_POSITION_SUPPRESS_CLASSES = {"person"}
 
 
 @dataclass
@@ -57,6 +63,8 @@ class ObjectDetector:
         stationary_px: int = 15,
         stationary_frames: int = 30,
         tracker_config: str = "config/bytetrack.yaml",
+        fp_grid_cell_px: int = 48,
+        fp_suppress_seconds: float = 10.0,
     ) -> None:
         self._model = YOLO(model_path)
         self._threshold = threshold
@@ -77,9 +85,20 @@ class ObjectDetector:
         self._min_px = min_area_fraction * frame_px
         self._max_px = max_area_fraction * frame_px
 
+        # Position-grid false-positive suppressor.
+        # Divides the frame into cells of fp_grid_cell_px × fp_grid_cell_px.
+        # If a _POSITION_SUPPRESS_CLASSES detection occupies the same cell
+        # continuously for fp_suppress_seconds (time-based, FPS-independent),
+        # the cell is permanently blacklisted — fire hydrants / trash cans silenced.
+        self._grid_cell_px = fp_grid_cell_px
+        self._fp_suppress_seconds = fp_suppress_seconds
+        self._grid_first_seen: dict[tuple[int, int], float] = {}  # cell -> monotonic start time
+        self._grid_blocked: set[tuple[int, int]] = set()          # permanently suppressed cells
+
         logger.info(
-            "Detector ready — model=%s high=%.2f low=%.2f tracker=%s",
+            "Detector ready — model=%s high=%.2f low=%.2f tracker=%s fp_grid=%dpx suppress_after=%.1fs",
             model_path, threshold, self._track_low_thresh, tracker_config,
+            fp_grid_cell_px, fp_suppress_seconds,
         )
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
@@ -99,7 +118,10 @@ class ObjectDetector:
         frame_area = self._input_size[0] * self._input_size[1]
 
         if results[0].boxes.id is None:
+            self._update_grid(set())   # no hits → reset all active streaks
             return detections
+
+        hits_this_frame: set[tuple[int, int]] = set()
 
         for box, track_id, conf, cls in zip(
             results[0].boxes.xyxy.cpu().numpy(),
@@ -129,8 +151,16 @@ class ObjectDetector:
             if class_name not in _STATIONARY_EXEMPT and self._is_stationary(det.track_id, det.center):
                 continue
 
+            # Position-grid FP suppression: skip permanently blocked cells.
+            if class_name in _POSITION_SUPPRESS_CLASSES:
+                cell = self._grid_cell(det.center)
+                if cell in self._grid_blocked:
+                    continue
+                hits_this_frame.add(cell)
+
             detections.append(det)
 
+        self._update_grid(hits_this_frame)
         return detections
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -141,6 +171,33 @@ class ObjectDetector:
             for idx, name in self._model.names.items()
             if name in _TRACKED_CLASSES
         ]
+
+    def _grid_cell(self, center: tuple[int, int]) -> tuple[int, int]:
+        return (center[0] // self._grid_cell_px, center[1] // self._grid_cell_px)
+
+    def _update_grid(self, hits: set[tuple[int, int]]) -> None:
+        now = time.monotonic()
+        # Advance clocks for active cells; block those that exceed the threshold.
+        for cell in hits:
+            if cell not in self._grid_first_seen:
+                self._grid_first_seen[cell] = now
+            elif now - self._grid_first_seen[cell] >= self._fp_suppress_seconds:
+                if cell not in self._grid_blocked:
+                    logger.info(
+                        "FP grid cell (%d,%d) blocked after %.1fs — likely static object",
+                        cell[0], cell[1], now - self._grid_first_seen[cell],
+                    )
+                self._grid_blocked.add(cell)
+        # Reset clock for cells that had no hit this frame (object moved away).
+        for cell in list(self._grid_first_seen):
+            if cell not in hits and cell not in self._grid_blocked:
+                del self._grid_first_seen[cell]
+
+    def clear_fp_grid(self) -> None:
+        """Reset all learned FP suppressions (e.g. after camera repositioning)."""
+        self._grid_first_seen.clear()
+        self._grid_blocked.clear()
+        logger.info("FP position grid cleared")
 
     def _is_stationary(self, track_id: int, center: tuple[int, int]) -> bool:
         history = self._position_history.setdefault(track_id, [])

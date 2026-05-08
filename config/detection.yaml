@@ -4,7 +4,10 @@ chalking:
   entry_frames: 9
   frame_buffer_size: 3
   sample_every_n: 8
+  vehicle_proximity_px: 250  # person must be within this many px of a vehicle bbox to accumulate chalking state
 detector:
+  fp_grid_cell_px: 48
+  fp_suppress_seconds: 10.0
   input_height: 720
   input_width: 1280
   max_area_fraction: 0.5
@@ -55,7 +58,7 @@ zones:
       - 0
     - - 1280
       - 0
-    - - 1276
-      - 334
-    - - 4
-      - 338
+    - - 1274
+      - 345
+    - - 2
+      - 331

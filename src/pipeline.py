@@ -27,6 +27,7 @@ from src.detection.motion_detector import MotionDetector
 from src.detection.object_detector import Detection, ObjectDetector
 from src.detection.zone_filter import ZoneFilter
 from src.stream.frame_undistorter import FrameUndistorter
+from src.stream.osd_timestamp import extract_osd_timestamp
 from src.stream.rtsp_handler import RTSPHandler
 from src.stream.video_file_handler import VideoFileHandler
 from src.vlm.analyzer import VLMAnalyzer
@@ -84,7 +85,7 @@ def _encode_jpeg(frame: np.ndarray) -> bytes:
     return buf.tobytes() if ok else b""
 
 
-def run(state=None, stream_url: str | None = None, video_path: str | None = None, zone_key: str = "street_zone", vector_store=None) -> None:
+def run(state=None, stream_url: str | None = None, video_path: str | None = None, zone_key: str = "street_zone", vector_store=None, vlm: "VLMAnalyzer | None" = None, confirm_vlm: "VLMAnalyzer | None" = None) -> None:
     """Main pipeline loop.  Blocks until KeyboardInterrupt.
 
     stream_url:  overrides RTSP_URL env var (RTSP second camera).
@@ -96,7 +97,8 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
 
     det_cfg = cfg_det["detector"]
     mask_cfg = cfg_det.get("stationary_mask", {})
-    chalk_cfg = cfg_det["chalking"]
+    chalk_cfg   = cfg_det["chalking"]
+    _vehicle_proximity_px = int(os.getenv("VEHICLE_PROXIMITY_PX", chalk_cfg.get("vehicle_proximity_px", 250)))
     mot_cfg = cfg_det.get("motion_detector", {})
 
     video_path = video_path or (os.getenv("VIDEO_PATH", "") if stream_url is None else "")
@@ -121,6 +123,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
         max_area_fraction=det_cfg["max_area_fraction"],
         stationary_px=mask_cfg.get("pixel_threshold", 15),
         stationary_frames=mask_cfg.get("frames", 30),
+        tracker_config=os.getenv("TRACKER_CONFIG", "config/botsort.yaml"),
+        fp_grid_cell_px=int(det_cfg.get("fp_grid_cell_px", 48)),
+        fp_suppress_seconds=float(os.getenv("FP_SUPPRESS_SECONDS", det_cfg.get("fp_suppress_seconds", 10.0))),
     )
 
     initial_polygon = (
@@ -138,12 +143,27 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
         buffer_sample_every_n=chalk_cfg.get("buffer_sample_every_n", 5),
     )
 
-    vlm = VLMAnalyzer(
-        backend=os.getenv("VLM_BACKEND", "claude"),
-        claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
-        ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
-        ollama_model=os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M"),
-    )
+    if vlm is None:
+        vlm = VLMAnalyzer(
+            backend=os.getenv("VLM_BACKEND", "claude"),
+            claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
+            ollama_model=os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M"),
+        )
+
+    # Two-stage pipeline: if CONFIRM_BACKEND is set and different from VLM_BACKEND,
+    # positives from the first stage are automatically re-evaluated by the second
+    # before an alert fires. Negatives skip the second stage entirely (zero API cost).
+    if confirm_vlm is None:
+        _confirm_backend = os.getenv("CONFIRM_BACKEND", "")
+        if _confirm_backend and _confirm_backend != os.getenv("VLM_BACKEND", "claude"):
+            confirm_vlm = VLMAnalyzer(
+                backend=_confirm_backend,
+                claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+                ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
+                ollama_model=os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M"),
+            )
+            logger.info("Two-stage VLM: %s → %s (on positive)", os.getenv("VLM_BACKEND"), _confirm_backend)
 
     ha_base = os.getenv("HA_WEBHOOK_URL", "").rsplit("/api/", 1)[0]
     notifier = Notifier(
@@ -252,6 +272,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 job = _vlm_jobs[job_key]
                 fut, kind, tid, snap_fr, bbox, thumb = job[:6]
                 detail_b64 = job[6] if len(job) > 6 else []
+                snap_ts    = job[7] if len(job) > 7 else None
                 if not fut.done():
                     continue
                 del _vlm_jobs[job_key]
@@ -262,6 +283,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                     if state:
                         state.complete_pending_vlm(kind, tid, detected=False)
                     continue
+                usage = result.pop("_usage", None)
+                if state:
+                    state.record_vlm_usage(usage)  # None = Ollama/free, still counts the call
                 detected = result.get(f"{kind}_detected", False)
                 if state:
                     state.complete_pending_vlm(kind, tid, detected=detected)
@@ -272,9 +296,10 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                             result.get("description", ""),
                             frames=detail_b64 if kind == "chalking" else [],
                         )
+                _is_duplicate = False
                 if kind == "chalking" and vector_store:
                     try:
-                        vector_store.add(
+                        _event_id = vector_store.add(
                             description=result.get("description", ""),
                             detected=detected,
                             confidence=result.get("confidence", 0.0),
@@ -282,33 +307,65 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                             thumbnail_b64=thumb,
                             frames_b64=detail_b64,
                         )
+                        _is_duplicate = (_event_id == "")
                     except Exception:
                         logger.exception("vector_store.add failed")
-                if kind == "chalking" and result["chalking_detected"]:
+                if kind == "chalking" and result["chalking_detected"] and not _is_duplicate:
                     sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
                     snap = notifier.send("chalking", result, sf, bbox)
+                    event_ts = snap_ts or extract_osd_timestamp(snap_fr)
                     if state:
-                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64)
+                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64, track_id=tid, timestamp=event_ts)
                     alert_ids.add(tid)
                     chalking.on_alert(tid)
+
+            vehicle_bboxes = [d.bbox for d in all_dets if d.class_name in {"car", "truck", "motorcycle"}]
 
             for det in zone_dets:
                 # ── Chalking ──────────────────────────────────────────────────
                 if det.class_name == "person":
+                    if not _near_vehicle(det.bbox, vehicle_bboxes, _vehicle_proximity_px):
+                        chalking.evict(det.track_id)  # reset state — pedestrian, not near any vehicle
+                        continue
                     crop = _crop_wide_bytes(frame, det.bbox)
                     chalking.store_frame(det.track_id, crop)
                     if chalking.update(det.track_id):
                         job_key = ("chalking", det.track_id)
                         if job_key not in _vlm_jobs:
                             detail_frames = chalking.get_frame_buffer(det.track_id) or [crop]
-                            scene         = _crop_scene_bytes(frame, det.bbox)
-                            vlm_frames    = [scene] + detail_frames  # scene first for vehicle-state check
-                            thumb  = _thumb_b64_from_jpeg(detail_frames[-1])
+                            thumb      = _thumb_b64_from_jpeg(detail_frames[-1])
                             detail_b64 = [_thumb_b64_from_jpeg(f) for f in detail_frames]
-                            fut = _vlm_pool.submit(vlm.analyze, vlm_frames, "chalking")
-                            _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64)
-                            if state:
-                                state.add_pending_vlm("chalking", det.track_id, thumb)
+
+                            suppressed_sid = state.find_open_suppressed_session() if state else None
+                            trusted_sid    = state.find_open_trusted_session()    if state else None
+
+                            if suppressed_sid:
+                                # Skip VLM entirely — record in debug log and set cooldown
+                                if state:
+                                    state.record_rejected_vlm(
+                                        "chalking", thumb, 0.0,
+                                        f"Suppressed — session {suppressed_sid} downvoted by user",
+                                        suppressed_by_session=suppressed_sid,
+                                    )
+                                chalking.on_alert(det.track_id)
+                            elif trusted_sid:
+                                # Auto-confirm — fire alert without a VLM call
+                                auto_desc = f"Auto-confirmed — session {trusted_sid} upvoted by user"
+                                sf = _apply_privacy(frame, state.privacy_regions) if (state and state.privacy_mode) else frame
+                                snap = notifier.send("chalking", {"chalking_detected": True, "confidence": 1.0, "description": auto_desc}, sf, det.bbox)
+                                osd_ts = extract_osd_timestamp(frame)
+                                if state:
+                                    state.record_alert("chalking", 1.0, auto_desc, snapshot=snap.name if snap else None, frames=detail_b64, track_id=det.track_id, timestamp=osd_ts)
+                                alert_ids.add(det.track_id)
+                                chalking.on_alert(det.track_id)
+                            else:
+                                scene      = _crop_scene_bytes(frame, det.bbox)
+                                vlm_frames = [scene] + detail_frames
+                                snap_ts    = getattr(stream, 'get_current_wall_time', lambda: None)()
+                                fut = _vlm_pool.submit(_two_stage, vlm, confirm_vlm, vlm_frames, "chalking")
+                                _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts)
+                                if state:
+                                    state.add_pending_vlm("chalking", det.track_id, thumb)
 
             # Evict gone tracks
             for tid in list(chalking._frame_count.keys()):
@@ -417,6 +474,21 @@ def _crop_wide_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> byte
     return buf.tobytes() if ok else b""
 
 
+def _two_stage(
+    primary: "VLMAnalyzer",
+    confirm: "VLMAnalyzer | None",
+    frames: "list[bytes]",
+    kind: str,
+) -> dict:
+    """Run primary VLM; if positive and a confirm VLM is configured, re-evaluate
+    with the second stage. Negatives skip the confirm stage entirely."""
+    result = primary.analyze(frames, kind)
+    if confirm is None or not result.get(f"{kind}_detected", False):
+        return result
+    logger.debug("Two-stage: %s positive → sending to confirm VLM", kind)
+    return confirm.analyze(frames, kind)
+
+
 def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
     """Wide scene crop showing all nearby vehicles — used as the first frame sent
     to the VLM so it can assess vehicle state (open trunks, doors) before posture."""
@@ -430,3 +502,18 @@ def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> byt
                  max(0, x1 - pad_x)     : min(w, x2 + pad_x)]
     ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else b""
+
+
+def _near_vehicle(
+    person_bbox: tuple[int, int, int, int],
+    vehicle_bboxes: list[tuple[int, int, int, int]],
+    threshold_px: int,
+) -> bool:
+    """Return True if the person bbox is within threshold_px of any vehicle bbox."""
+    px1, py1, px2, py2 = person_bbox
+    for vx1, vy1, vx2, vy2 in vehicle_bboxes:
+        dx = max(0, max(px1, vx1) - min(px2, vx2))
+        dy = max(0, max(py1, vy1) - min(py2, vy2))
+        if (dx * dx + dy * dy) ** 0.5 <= threshold_px:
+            return True
+    return False

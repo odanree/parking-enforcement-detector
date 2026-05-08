@@ -30,15 +30,16 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Exact prompt from the spec — kept here so it's easy to tune.
+# Strict prompt — used by the confirm stage (Claude/Sonnet).
 _USER_PROMPT = (
     'Analyze this street camera crop (overhead/wide-angle, person appears small) '
     'for parking-enforcement events:\n'
     '1. CHALKING — two-step evaluation, follow in order:\n'
     '   STEP 1 (EXCLUSION CHECK): Look at every vehicle near the person. '
-    'Does ANY vehicle have an open trunk lid, raised hatch, or open door? '
-    'If YES → person is loading/unloading, set chalking_detected: false and skip STEP 2. '
-    'If NO open trunk/hatch/door is visible → the exclusion does NOT apply, PROCEED to STEP 2.\n'
+    'Does ANY vehicle have an open trunk lid, raised hatch, or open door — or is the trunk/hatch '
+    'state AMBIGUOUS (a raised or unclear element that could be an open trunk)? '
+    'If YES or AMBIGUOUS → err on the side of caution, set chalking_detected: false and skip STEP 2. '
+    'If the trunk/hatch/doors are CLEARLY closed → the exclusion does NOT apply, PROCEED to STEP 2.\n'
     '   STEP 2 (EVIDENCE CHECK — run this when STEP 1 found no open trunks): '
     'Set chalking_detected: true if EITHER condition below is true:\n'
     '   CONDITION A — TOOL: A long thin object (rod, pole, wand, chalk stick) that is visibly '
@@ -48,16 +49,29 @@ _USER_PROMPT = (
     'Do NOT flag a person just because their arm, shadow, or clothing creates a thin line. '
     'The object must be a distinct item separate from the body, held in the hand, pointing '
     'downward or toward the wheel/ground level.\n'
-    '   CONDITION B — SUSTAINED WHEEL PRESENCE: You are reviewing multiple frames. '
-    'The person is directly beside the rear wheel of a parked vehicle AND has remained '
-    'stationary at that same wheel position across the majority of the frames in this sequence. '
-    'A brief pass-by or someone who is clearly walking does NOT qualify — '
-    'the person must be lingering/stationary at the rear wheel. '
-    'Any posture qualifies (standing, slightly bent, crouching) as long as they are not moving away.\n'
-    '   IMPORTANT: CONDITION A alone is sufficient (tool visible near hand → flag true, '
-    'regardless of wheel proximity or posture). '
-    'CONDITION B alone requires the sustained stationary presence described above. '
-    'If BOTH conditions are present simultaneously, confidence should be very high.\n'
+    '   CONDITION B — PE OFFICER MOVEMENT PATTERN: You are reviewing multiple frames. '
+    'Flag chalking_detected: true ONLY if the person exhibits one of these PE officer behaviors:\n'
+    '   B1 (STRONGEST SIGNAL) — REAR-TO-FRONT PASS: The person is walking from the rear of the '
+    'vehicle toward the front (back-to-front direction) while staying close to the vehicle at '
+    'wheel/door level. PE officers mark efficiently while walking — they do not need to stop long.\n'
+    '   B2 — BRIEF STATIONARY DWELL WITH REAR APPROACH: The person stands or crouches at the '
+    'rear wheel position for a SHORT time AND arrived from the rear/side, NOT from the front. '
+    'PE officers are efficient — a brief stop to mark takes only a moment. '
+    'A LONG dwell (person appears stationary across many frames with no sign of moving) is MORE '
+    'consistent with a vehicle owner using their car, not a PE officer. '
+    'A person who walked front-to-back and then stopped is a vehicle owner — NOT B2 regardless '
+    'of dwell length. B2 only applies when approach was from the rear/side or is not visible, '
+    'AND the dwell is brief, not prolonged.\n'
+    '   B3 — FRONT-TO-BACK STOP WITH CLEAR PIVOT: The person walked front-to-back, stopped at '
+    'the rear wheel, and visibly reversed direction (now moving rear-to-front). Just stopping '
+    'at the rear after a front-to-back walk is NOT B3 — the reversal must be visible.\n'
+    '   EXCLUSIONS (set chalking_detected: false for any of these):\n'
+    '   • Person walked front-to-back and continued past the rear wheel toward the trunk.\n'
+    '   • Person walked front-to-back and stopped/dwelled at the rear wheel — this is a '
+    'vehicle owner pausing before accessing their trunk, NOT a PE officer.\n'
+    '   IMPORTANT: CONDITION A alone is sufficient (tool clearly visible in hand → flag true, '
+    'overrides all direction rules). CONDITION B requires matching B1, B2, or B3 and NOT '
+    'matching any exclusion. If BOTH A and B are present, confidence should be very high.\n'
     'Output only a JSON object with: '
     '{ "chalking_detected": boolean, "sweeper_detected": false, '
     '"pe_vehicle_detected": false, "confidence": float, "description": string }'
@@ -65,14 +79,53 @@ _USER_PROMPT = (
 
 _SYSTEM_PROMPT = (
     "You are a parking-enforcement detection AI analyzing overhead street camera footage. "
-    "For chalking: first check if any vehicle near the person has an open trunk, hatch, or door — "
-    "if yes, that person is loading/unloading, return chalking_detected: false. "
-    "If NO open trunk/door is visible, the exclusion does NOT apply — proceed to look for evidence. "
+    "For chalking: first check if any vehicle near the person has an open trunk, hatch, or door, "
+    "OR if the trunk/hatch state is ambiguous or unclear — if yes or ambiguous, return chalking_detected: false. "
+    "Only proceed if trunks and doors are CLEARLY closed. "
     "Flag chalking true if: (A) a long thin object is clearly held IN the person's hand, extending downward "
     "or toward the ground — backpacks, shoulder bags, arms, shadows, and worn items do NOT qualify; OR "
-    "(B) the person has remained stationary at the rear wheel of a parked vehicle across the "
-    "majority of the provided frames — a PE officer lingers; a car owner briefly passes. "
-    "CONDITION A alone is sufficient to flag. CONDITION B requires sustained stationary presence. "
+    "(B) the person exhibits PE officer movement near the rear wheel — "
+    "B1: walking rear-to-front along the vehicle (strongest signal, PE marks while walking); "
+    "B2: brief stationary dwell at the rear wheel, arrived from the rear/side NOT front-to-back — "
+    "a prolonged dwell or front-to-back arrival that stops is a vehicle owner, not a PE officer; "
+    "B3: walked front-to-back but visibly stopped AND reversed direction (pivot) at the rear wheel. "
+    "EXCLUSIONS: front-to-back walk that continues past → false; front-to-back walk that stops/dwells without reversing → false. "
+    "CONDITION A (tool in hand) alone is always sufficient and overrides all direction rules. "
+    "Respond with valid JSON only — no markdown, no commentary."
+)
+
+# Lenient prompt — used by the first-pass stage (Ollama).
+# Goal: catch any person who MIGHT be chalking; the confirm stage will filter FPs.
+# Key differences from strict: no approach-direction check, no trunk/door exclusion,
+# any walking or dwelling near a rear wheel counts.
+_LENIENT_USER_PROMPT = (
+    'Analyze this street camera crop for possible parking-enforcement tire chalking.\n'
+    'CONTEXT: Tire chalking only happens to vehicles parked along the STREET CURB. '
+    'It never occurs on sidewalks, driveways, or private property. '
+    'A person walking on a sidewalk or driveway — even next to parked cars — is NOT a PE officer.\n'
+    'You are a FIRST-PASS filter — another AI makes the final call. Be permissive but street-aware.\n'
+    'Set chalking_detected: true ONLY if ALL of these apply:\n'
+    '  • A person is physically beside a vehicle parked along the STREET (at the curb), AND\n'
+    '  • The person is at wheel or door level of that vehicle (not just passing nearby), AND\n'
+    '  • At least one of: walking alongside it, pausing near a wheel, crouching, or holding a thin object.\n'
+    'Set chalking_detected: false if:\n'
+    '  • The person is on a sidewalk or driveway with no street-parked vehicle immediately beside them.\n'
+    '  • The person is a pedestrian walking through open space (no vehicle adjacent at arm\'s reach).\n'
+    '  • The person is clearly a driver/passenger entering or exiting their own vehicle.\n'
+    '  • No street-parked vehicle is visible near the person.\n'
+    'When uncertain whether a vehicle is street-parked vs private driveway, set true.\n'
+    'Output only a JSON object with: '
+    '{ "chalking_detected": boolean, "sweeper_detected": false, '
+    '"pe_vehicle_detected": false, "confidence": float, "description": string }'
+)
+
+_LENIENT_SYSTEM_PROMPT = (
+    "You are a parking-enforcement first-pass filter analyzing overhead street camera footage. "
+    "Tire chalking only happens to vehicles parked at the street curb — never to pedestrians on sidewalks, "
+    "people in driveways, or anyone not immediately beside a street-parked car. "
+    "Flag true if a person is adjacent to a street-parked vehicle at wheel level (direction and tool not required). "
+    "Flag false if the person is on a sidewalk or driveway with no street-parked vehicle immediately beside them, "
+    "or if no vehicle is visible near the person. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
@@ -125,10 +178,14 @@ class VLMAnalyzer:
         claude_model: str = "claude-haiku-4-5-20251001",
         ollama_url: str = "http://localhost:11434",
         ollama_model: str = "llava:7b-v1.6-mistral-q4_K_M",
+        user_prompt: str | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self._backend = backend
         self._ollama_url = ollama_url.rstrip("/")
         self._ollama_model = ollama_model
+        self._user_prompt = user_prompt or _USER_PROMPT
+        self._system_prompt = system_prompt or _SYSTEM_PROMPT
 
         if backend == "claude":
             self._claude = anthropic.Anthropic()
@@ -140,6 +197,16 @@ class VLMAnalyzer:
         else:
             self._claude = None  # type: ignore[assignment]
             logger.info("VLM backend: Ollama (%s @ %s)", ollama_model, ollama_url)
+
+    def set_prompts(self, user_prompt: str | None = None, system_prompt: str | None = None) -> None:
+        if user_prompt is not None:
+            self._user_prompt = user_prompt
+        if system_prompt is not None:
+            self._system_prompt = system_prompt
+        logger.info("VLM prompts updated (backend=%s)", self._backend)
+
+    def get_prompts(self) -> dict:
+        return {"user_prompt": self._user_prompt, "system_prompt": self._system_prompt}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -173,7 +240,7 @@ class VLMAnalyzer:
                     "data": base64.standard_b64encode(fb).decode(),
                 },
             })
-        prompt = _USER_PROMPT if len(frames) <= 1 else (
+        prompt = self._user_prompt if len(frames) <= 1 else (
             'You are shown a wide scene image followed by '
             f'{len(frames) - 1} close-up crop(s) of the same tracked person sampled over ~1 second. '
             'Image 1 is the SCENE — use it to assess vehicle state (open trunks, doors, hatches). '
@@ -184,7 +251,7 @@ class VLMAnalyzer:
             'flag true if a tool is visible in ANY frame, OR if the person is stationary at a rear wheel '
             'across the MAJORITY of frames (sustained presence = chalking; brief pass-by = not chalking). '
             'Do NOT dismiss chalking just because one frame looks ambiguous — judge the full sequence.\n\n'
-            + _USER_PROMPT
+            + self._user_prompt
         )
         content.append({"type": "text", "text": prompt})
 
@@ -194,7 +261,7 @@ class VLMAnalyzer:
             system=[
                 {
                     "type": "text",
-                    "text": _SYSTEM_PROMPT,
+                    "text": self._system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -202,12 +269,20 @@ class VLMAnalyzer:
         )
         if response.stop_reason == "max_tokens":
             logger.warning("Claude response truncated at max_tokens — increase max_tokens")
-        return _parse_json(response.content[0].text)
+        parsed = _parse_json(response.content[0].text)
+        parsed["_usage"] = {
+            "model": self._claude_model,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
+            "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
+        }
+        return parsed
 
     def _analyze_ollama(self, frames: list[bytes]) -> dict:
         payload = {
             "model": self._ollama_model,
-            "prompt": f"{_SYSTEM_PROMPT}\n\n{_USER_PROMPT}",
+            "prompt": f"{self._system_prompt}\n\n{self._user_prompt}",
             "images": [base64.standard_b64encode(fb).decode() for fb in frames],
             "stream": False,
             "options": {"temperature": 0.0},

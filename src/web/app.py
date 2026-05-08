@@ -43,11 +43,15 @@ logger = logging.getLogger(__name__)
 
 from src import pipeline
 from src.storage.vector_store import EventVectorStore
-from src.vlm.analyzer import VLMAnalyzer
+from src.vlm.analyzer import VLMAnalyzer, _LENIENT_USER_PROMPT, _LENIENT_SYSTEM_PROMPT
 from src.web.state import AppState
 
 states = [AppState(0), AppState(1)]
 state = states[0]   # alias for all cam-0 REST endpoints
+
+# VLM instances — created once in lifespan, referenced by prompt hot-reload endpoints.
+_primary_vlm: VLMAnalyzer | None = None
+_confirm_vlm: VLMAnalyzer | None = None
 _BASE = Path(__file__).parent
 _DETECTION_CFG = Path("config/detection.yaml")
 _PRIVACY_CFG   = Path("config/privacy.json")
@@ -98,9 +102,45 @@ def _save_privacy(cam_id: int, regions: list[list[int]]) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _primary_vlm, _confirm_vlm
     _seed_zone()
     _seed_privacy()
-    t0 = threading.Thread(target=pipeline.run, args=(states[0],), kwargs={"vector_store": vector_store}, daemon=True, name="pipeline-0")
+
+    _vlm_backend = os.getenv("VLM_BACKEND", "claude")
+    _confirm_backend = os.getenv("CONFIRM_BACKEND", "")
+    _claude_model = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+    _ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    _ollama_model = os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M")
+
+    # Phase-1 (primary) uses the lenient prompt when Ollama is the backend so more
+    # potential positives pass through to Claude for final confirmation.
+    _is_two_stage = bool(_confirm_backend) and _confirm_backend != _vlm_backend
+    _primary_vlm = VLMAnalyzer(
+        backend=_vlm_backend,
+        claude_model=_claude_model,
+        ollama_url=_ollama_url,
+        ollama_model=_ollama_model,
+        user_prompt=_LENIENT_USER_PROMPT if _is_two_stage and _vlm_backend == "ollama" else None,
+        system_prompt=_LENIENT_SYSTEM_PROMPT if _is_two_stage and _vlm_backend == "ollama" else None,
+    )
+    if _is_two_stage:
+        _confirm_vlm = VLMAnalyzer(
+            backend=_confirm_backend,
+            claude_model=_claude_model,
+            ollama_url=_ollama_url,
+            ollama_model=_ollama_model,
+        )
+        logger.info("Two-stage VLM: %s (lenient) → %s (strict)", _vlm_backend, _confirm_backend)
+    else:
+        _confirm_vlm = None
+
+    t0 = threading.Thread(
+        target=pipeline.run,
+        args=(states[0],),
+        kwargs={"vector_store": vector_store, "vlm": _primary_vlm, "confirm_vlm": _confirm_vlm},
+        daemon=True,
+        name="pipeline-0",
+    )
     t0.start()
     logger.info("Pipeline-0 thread started")
 
@@ -115,6 +155,8 @@ async def lifespan(app: FastAPI):
                 "video_path":   cam1_video or None,
                 "zone_key":     "street_zone_1",
                 "vector_store": vector_store,
+                "vlm":          _primary_vlm,
+                "confirm_vlm":  _confirm_vlm,
             },
             daemon=True,
             name="pipeline-1",
@@ -157,7 +199,6 @@ async def get_stats():
     for cam in states[1:]:
         other = cam.get_stats()
         s["total_chalking"] += other["total_chalking"]
-        s["total_sweeper"]  += other["total_sweeper"]
     return JSONResponse(s)
 
 
@@ -218,6 +259,45 @@ async def toggle_privacy():
     for s in states[1:]:
         s.privacy_mode = enabled
     return {"privacy_mode": enabled}
+
+
+@app.get("/api/sessions")
+async def get_sessions():
+    sessions = []
+    for cam_id, s in enumerate(states):
+        for sess in s.get_sessions():
+            sessions.append({**sess, "camera_id": cam_id})
+    sessions.sort(key=lambda x: x["started_at"], reverse=True)
+    return JSONResponse(sessions)
+
+
+@app.get("/api/vlm/prompt")
+async def get_vlm_prompt():
+    return JSONResponse({
+        "primary": _primary_vlm.get_prompts() if _primary_vlm else None,
+        "confirm": _confirm_vlm.get_prompts() if _confirm_vlm else None,
+    })
+
+
+class PromptPayload(BaseModel):
+    stage: str          # "primary" | "confirm"
+    user_prompt: str | None = None
+    system_prompt: str | None = None
+
+
+@app.post("/api/vlm/prompt")
+async def set_vlm_prompt(body: PromptPayload):
+    if body.stage == "primary":
+        if _primary_vlm is None:
+            raise HTTPException(status_code=404, detail="Primary VLM not initialised")
+        _primary_vlm.set_prompts(body.user_prompt, body.system_prompt)
+    elif body.stage == "confirm":
+        if _confirm_vlm is None:
+            raise HTTPException(status_code=404, detail="Confirm VLM not initialised (no two-stage pipeline)")
+        _confirm_vlm.set_prompts(body.user_prompt, body.system_prompt)
+    else:
+        raise HTTPException(status_code=400, detail="stage must be 'primary' or 'confirm'")
+    return {"ok": True, "stage": body.stage}
 
 
 @app.get("/api/pending")
@@ -296,6 +376,26 @@ async def set_playback_direction(body: DirectionPayload):
 @app.post("/api/playback/seek")
 async def seek_playback(body: SeekPayload):
     state.seek_playback(body.seconds)
+    return {"ok": True}
+
+
+class TimestampPayload(BaseModel):
+    timestamp: float   # Unix epoch seconds
+
+
+@app.post("/api/playback/seek-timestamp")
+async def seek_to_timestamp(body: TimestampPayload):
+    result = state.seek_to_timestamp(body.timestamp)
+    if result != 'ok':
+        raise HTTPException(status_code=409, detail=result)
+    return {"ok": True}
+
+
+@app.post("/api/playback/live")
+async def go_live():
+    result = state.go_live()
+    if result != 'ok':
+        raise HTTPException(status_code=409, detail=result)
     return {"ok": True}
 
 
@@ -553,6 +653,48 @@ async def update_zone(body: ZonePayload, cam_id: int = 0):
 
 
 # ── WebSocket video stream ────────────────────────────────────────────────────
+
+def _open_preview_cap(url: str):
+    import cv2
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def _read_preview_frame(cap) -> bytes | None:
+    import cv2
+    ok, frame = cap.read()
+    if not ok:
+        return None
+    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return buf.tobytes()
+
+
+@app.websocket("/ws/playback/preview")
+async def playback_preview_ws(websocket: WebSocket, timestamp: float, camera_id: int = 0):
+    """Stream NVR playback frames directly to the caller without touching the pipeline."""
+    from src.stream.rtsp_handler import build_nvr_playback_url
+    await websocket.accept()
+    base_url = os.getenv("RTSP_URL_2" if camera_id == 1 else "RTSP_URL", "")
+    ch_env   = os.getenv("AMCREST_CHANNEL_2" if camera_id == 1 else "AMCREST_CHANNEL")
+    nvr_ch   = int(ch_env) if ch_env else None
+    playback_url = build_nvr_playback_url(timestamp, base_url, nvr_channel=nvr_ch)
+    loop = asyncio.get_event_loop()
+    cap = await loop.run_in_executor(None, _open_preview_cap, playback_url)
+    try:
+        while True:
+            frame_bytes = await loop.run_in_executor(None, _read_preview_frame, cap)
+            if frame_bytes is None:
+                break
+            await websocket.send_bytes(frame_bytes)
+            await asyncio.sleep(1 / 25)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("Playback preview WS error")
+    finally:
+        await loop.run_in_executor(None, cap.release)
+
 
 @app.websocket("/ws/video/{cam_id}")
 async def video_stream(websocket: WebSocket, cam_id: int = 0):

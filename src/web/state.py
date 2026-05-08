@@ -10,6 +10,8 @@ import json
 import os
 import time
 import threading
+import uuid
+from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque
@@ -17,6 +19,28 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 _DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
+_SESSION_TIMEOUT: float = float(os.getenv("SESSION_WINDOW_MINUTES", "5")) * 60
+
+
+@dataclass
+class Session:
+    session_id: str
+    camera_id: int
+    started_at: float
+    last_seen: float
+    event_count: int = 0
+    track_ids: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id":  self.session_id,
+            "camera_id":   self.camera_id,
+            "started_at":  self.started_at,
+            "last_seen":   self.last_seen,
+            "event_count": self.event_count,
+            "track_ids":   self.track_ids,
+            "duration_seconds": round(self.last_seen - self.started_at),
+        }
 
 
 @dataclass
@@ -28,6 +52,8 @@ class Event:
     snapshot: Optional[str] = None   # filename only, e.g. "chalking_20240101_120000.jpg"
     frames: list = field(default_factory=list)  # base64 JPEGs for animation
     vote: Optional[str] = None       # "up" | "down" | "archive" | None
+    track_id: Optional[int] = None
+    session_id: Optional[str] = None
 
 
 _LOGS_DIR = Path("logs")
@@ -59,6 +85,11 @@ class AppState:
         self._pending_vlm: list[dict[str, Any]] = []  # in-flight VLM jobs
         self._vlm_sample_counts: dict[str, int] = {}  # job_id → cumulative sample count
         self._debug_rejected: deque[dict[str, Any]] = deque(maxlen=30)
+        self._vlm_calls: int = 0
+        self._vlm_cost_usd: float = 0.0
+        self._sessions: dict[str, Session] = {}  # session_id -> Session
+        self._suppressed_sessions: set[str] = set()  # downvoted — skip VLM
+        self._trusted_sessions: set[str] = set()     # upvoted — auto-confirm
         self._load_events()
 
     def _load_events(self) -> None:
@@ -88,7 +119,7 @@ class AppState:
         for line in lines[-50:]:
             try:
                 d = json.loads(line)
-                self.events.appendleft(Event(
+                ev = Event(
                     timestamp=float(d["timestamp"]),
                     event_type=d["event_type"],
                     confidence=float(d["confidence"]),
@@ -96,7 +127,28 @@ class AppState:
                     snapshot=d.get("snapshot"),
                     frames=[],
                     vote=d.get("vote"),
-                ))
+                    track_id=d.get("track_id"),
+                    session_id=d.get("session_id"),
+                )
+                self.events.appendleft(ev)
+                # Rebuild session index from persisted session_id
+                sid = d.get("session_id")
+                if sid:
+                    ts = float(d["timestamp"])
+                    tid = d.get("track_id")
+                    if sid not in self._sessions:
+                        self._sessions[sid] = Session(
+                            session_id=sid,
+                            camera_id=self.camera_id,
+                            started_at=ts,
+                            last_seen=ts,
+                            event_count=0,
+                        )
+                    s = self._sessions[sid]
+                    s.last_seen = max(s.last_seen, ts)
+                    s.event_count += 1
+                    if tid is not None and tid not in s.track_ids:
+                        s.track_ids.append(tid)
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
 
@@ -121,6 +173,29 @@ class AppState:
         if self._stream and hasattr(self._stream, 'seek'):
             fps = getattr(self._stream, '_current_fps', 20.0)
             self._stream.seek(int(seconds * fps))
+
+    def seek_to_timestamp(self, unix_ts: float) -> str:
+        """Jump NVR stream to the given Unix timestamp (RTSP only).
+        Returns 'ok', 'no_stream', or 'not_rtsp'.
+        """
+        if not self._stream:
+            return 'no_stream'
+        if not hasattr(self._stream, 'seek_to_datetime'):
+            return 'not_rtsp'
+        dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone()
+        env_key = 'AMCREST_CHANNEL' if self.camera_id == 0 else f'AMCREST_CHANNEL_{self.camera_id + 1}'
+        nvr_ch_str = os.getenv(env_key)
+        nvr_channel = int(nvr_ch_str) if nvr_ch_str else None
+        self._stream.seek_to_datetime(dt, nvr_channel=nvr_channel)
+        return 'ok'
+
+    def go_live(self) -> str:
+        if not self._stream:
+            return 'no_stream'
+        if not hasattr(self._stream, 'go_live'):
+            return 'not_rtsp'
+        self._stream.go_live()
+        return 'ok'
 
     def set_playback_direction(self, direction: int) -> int:
         direction = 1 if direction >= 0 else -1
@@ -179,6 +254,7 @@ class AppState:
     def record_rejected_vlm(
         self, kind: str, thumbnail_b64: str, confidence: float, description: str,
         frames: list[str] | None = None,
+        suppressed_by_session: str | None = None,
     ) -> None:
         with self._lock:
             self._debug_rejected.appendleft({
@@ -188,6 +264,7 @@ class AppState:
                 "description": description,
                 "timestamp": time.time(),
                 "frames": frames or [],
+                "suppressed_by_session": suppressed_by_session,
             })
 
     def get_rejected_vlm(self) -> list[dict[str, Any]]:
@@ -197,6 +274,62 @@ class AppState:
     def clear_rejected_vlm(self) -> None:
         with self._lock:
             self._debug_rejected.clear()
+
+    def _get_or_create_session(self, ts: float, track_id: int | None) -> str:
+        """Return session_id for this event, joining an open session or starting a new one.
+        Must be called with self._lock held.
+        """
+        open_sessions = [
+            s for s in self._sessions.values()
+            if s.camera_id == self.camera_id and ts - s.last_seen < _SESSION_TIMEOUT
+        ]
+        if open_sessions:
+            session = max(open_sessions, key=lambda s: s.last_seen)
+            session.last_seen = ts
+            session.event_count += 1
+            if track_id is not None and track_id not in session.track_ids:
+                session.track_ids.append(track_id)
+            return session.session_id
+        sid = uuid.uuid4().hex[:6]
+        self._sessions[sid] = Session(
+            session_id=sid,
+            camera_id=self.camera_id,
+            started_at=ts,
+            last_seen=ts,
+            event_count=1,
+            track_ids=[track_id] if track_id is not None else [],
+        )
+        return sid
+
+    def get_sessions(self) -> list[dict]:
+        with self._lock:
+            return [s.to_dict() for s in sorted(self._sessions.values(), key=lambda s: s.started_at, reverse=True)]
+
+    def find_open_suppressed_session(self) -> str | None:
+        """Return session_id if a downvoted session is still within its window."""
+        ts = time.time()
+        with self._lock:
+            for sid in self._suppressed_sessions:
+                s = self._sessions.get(sid)
+                if s and s.camera_id == self.camera_id and ts - s.last_seen < _SESSION_TIMEOUT:
+                    return sid
+        return None
+
+    def find_open_trusted_session(self) -> str | None:
+        """Return session_id if an upvoted session is still within its window."""
+        ts = time.time()
+        with self._lock:
+            for sid in self._trusted_sessions:
+                s = self._sessions.get(sid)
+                if s and s.camera_id == self.camera_id and ts - s.last_seen < _SESSION_TIMEOUT:
+                    return sid
+        return None
+
+    def record_vlm_usage(self, usage: dict | None) -> None:
+        cost = _estimate_cost(usage) if usage else 0.0
+        with self._lock:
+            self._vlm_calls += 1
+            self._vlm_cost_usd += cost
 
     def complete_pending_vlm(self, kind: str, track_id: int, detected: bool) -> None:
         job_id = f"{kind}_{track_id}"
@@ -253,9 +386,12 @@ class AppState:
         description: str,
         snapshot: str | None = None,
         frames: list[str] | None = None,
+        track_id: int | None = None,
+        timestamp: float | None = None,
     ) -> None:
-        ts = time.time()
+        ts = timestamp if timestamp is not None else time.time()
         with self._lock:
+            session_id = self._get_or_create_session(ts, track_id) if event_type == "chalking" else None
             self.events.appendleft(
                 Event(
                     timestamp=ts,
@@ -264,6 +400,8 @@ class AppState:
                     description=description,
                     snapshot=snapshot,
                     frames=frames or [],
+                    track_id=track_id,
+                    session_id=session_id,
                 )
             )
             if event_type == "chalking":
@@ -281,6 +419,8 @@ class AppState:
                 "confidence": confidence,
                 "description": description,
                 "snapshot":   snapshot,
+                "track_id":   track_id,
+                "session_id": session_id,
             }
             with self._events_file.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry) + "\n")
@@ -309,15 +449,20 @@ class AppState:
                 "uptime_seconds": uptime,
                 "playback_speed": self._stream._speed if self._stream and hasattr(self._stream, '_speed') else 1.0,
                 "playback_direction": self._stream._direction if self._stream and hasattr(self._stream, '_direction') else 1,
-                "is_live": not (self._stream and hasattr(self._stream, '_speed')),
+                "is_live": not (self._stream and (hasattr(self._stream, '_speed') or getattr(self._stream, 'is_playback', False))),
+                "is_nvr_playback": getattr(self._stream, 'is_playback', False),
                 "fps": float(len(self._fps_times)),
                 "demo_mode": _DEMO_MODE,
+                "vlm_calls": self._vlm_calls,
+                "vlm_cost_usd": round(self._vlm_cost_usd, 5),
             }
 
     def vote_event(self, timestamp: float, vote: str | None) -> bool:
         """Set the vote on the event matching timestamp. Returns True if found.
 
         vote='archive' removes the event from both the deque and the JSONL file.
+        Downvoting a session marks it suppressed (future VLM calls skipped).
+        Upvoting a session marks it trusted (future detections auto-confirmed).
         """
         _VALID_VOTES = {"up", "down", "archive", None}
         if vote not in _VALID_VOTES:
@@ -327,11 +472,27 @@ class AppState:
             if match is None:
                 return False
             if vote == "archive":
-                # Remove entirely rather than flagging
                 keep = deque((e for e in self.events if e is not match), maxlen=self.events.maxlen)
                 self.events = keep
+                if match.event_type == "chalking":
+                    self._total_chalking = max(0, self._total_chalking - 1)
+                elif match.event_type == "sweeper":
+                    self._total_sweeper = max(0, self._total_sweeper - 1)
+                if match.session_id:
+                    self._suppressed_sessions.discard(match.session_id)
+                    self._trusted_sessions.discard(match.session_id)
             else:
                 match.vote = vote
+                if match.session_id:
+                    if vote == "down":
+                        self._suppressed_sessions.add(match.session_id)
+                        self._trusted_sessions.discard(match.session_id)
+                    elif vote == "up":
+                        self._trusted_sessions.add(match.session_id)
+                        self._suppressed_sessions.discard(match.session_id)
+                    else:  # None — vote toggled off
+                        self._suppressed_sessions.discard(match.session_id)
+                        self._trusted_sessions.discard(match.session_id)
         self._rewrite_events_file()
         return True
 
@@ -347,6 +508,8 @@ class AppState:
                     "confidence": ev.confidence,
                     "description": ev.description,
                     "snapshot":   ev.snapshot,
+                    "track_id":   ev.track_id,
+                    "session_id": ev.session_id,
                 }
                 if ev.vote is not None:
                     entry["vote"] = ev.vote
@@ -355,6 +518,10 @@ class AppState:
             self._events_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         except Exception:
             pass
+
+    def get_vlm_usage(self) -> dict:
+        with self._lock:
+            return {"calls": self._vlm_calls, "cost_usd": round(self._vlm_cost_usd, 5)}
 
     def get_events(self, limit: int = 30) -> list[dict]:
         with self._lock:
@@ -367,6 +534,29 @@ class AppState:
                     "snapshot_url": f"/snapshots/{e.snapshot}" if e.snapshot else None,
                     "frames": e.frames,
                     "vote": e.vote,
+                    "track_id": e.track_id,
+                    "session_id": e.session_id,
+                    "camera_id": self.camera_id,
                 }
                 for e in list(self.events)[:limit]
             ]
+
+
+# Anthropic pricing per million tokens (as of 2025)
+_MODEL_PRICING: dict[str, dict[str, float]] = {
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_creation": 0.80},
+    "claude-sonnet-4-6":         {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_creation": 3.75},
+    "claude-opus-4-7":           {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_creation": 18.75},
+}
+_DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_creation": 3.75}
+
+
+def _estimate_cost(usage: dict) -> float:
+    p = _MODEL_PRICING.get(usage.get("model", ""), _DEFAULT_PRICING)
+    mtok = 1_000_000
+    return (
+        usage.get("input_tokens", 0)              * p["input"]           / mtok
+        + usage.get("output_tokens", 0)           * p["output"]          / mtok
+        + usage.get("cache_read_input_tokens", 0) * p["cache_read"]      / mtok
+        + usage.get("cache_creation_input_tokens", 0) * p["cache_creation"] / mtok
+    )

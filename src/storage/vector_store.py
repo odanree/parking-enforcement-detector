@@ -11,6 +11,7 @@ are kept in ChromaDB metadata to avoid storing large base64 blobs in SQLite.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import time
 import uuid
@@ -50,6 +51,10 @@ class EventVectorStore:
             name="chalking_evals",
             embedding_function=ef,
         )
+        # Session-only dedup: hash set starts empty each run so events are always
+        # visible on first detection after a restart. Within a session the set
+        # grows to block loop duplicates without re-alerting or re-writing to disk.
+        self._thumb_hashes: set[str] = set()
         logger.info("Vector store ready (%d events)", self._col.count())
 
     # ── Write ─────────────────────────────────────────────────────────────────
@@ -63,6 +68,11 @@ class EventVectorStore:
         thumbnail_b64: str = "",
         frames_b64: list[str] | None = None,
     ) -> str:
+        thumb_hash = _hash_b64(thumbnail_b64) if thumbnail_b64 else ""
+        if thumb_hash and thumb_hash in self._thumb_hashes:
+            logger.debug("Skipping duplicate frame (hash %s)", thumb_hash)
+            return ""
+
         event_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
         thumb_file = self._save_image(event_id, thumbnail_b64, "thumb") if thumbnail_b64 else ""
@@ -80,6 +90,7 @@ class EventVectorStore:
             "label":       "",
             "thumb_file":  thumb_file,
             "frame_files": ",".join(frame_files),
+            "thumb_hash":  thumb_hash,
         }
         try:
             self._col.add(
@@ -87,6 +98,8 @@ class EventVectorStore:
                 metadatas=[metadata],
                 ids=[event_id],
             )
+            if thumb_hash:
+                self._thumb_hashes.add(thumb_hash)
         except Exception:
             logger.exception("Failed to add event %s to vector store", event_id)
         return event_id
@@ -200,3 +213,11 @@ class EventVectorStore:
                 result["ids"], result["documents"], result["metadatas"]
             )
         ]
+
+
+def _hash_b64(b64: str) -> str:
+    """MD5 of the raw image bytes (decoded from base64). Used for frame dedup."""
+    try:
+        return hashlib.md5(base64.b64decode(b64)).hexdigest()
+    except Exception:
+        return ""
