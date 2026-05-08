@@ -462,11 +462,12 @@ _reeval_progress: dict = {"running": False, "done": 0, "total": 0, "errors": 0}
 
 
 @app.post("/api/dataset/reeval")
-async def reeval_dataset(background_tasks: BackgroundTasks, ids: list[str] | None = None):
+async def reeval_dataset(background_tasks: BackgroundTasks, ids: list[str] | None = None, detected_only: bool = False):
     """Re-evaluate stored events using REEVAL_BACKEND (default: claude).
 
     POST with no body → re-evaluate all events that have frame files on disk.
     POST with JSON body ["id1", "id2", ...] → re-evaluate specific events only.
+    ?detected_only=true → only re-evaluate events the original model flagged as detected.
 
     Runs in the background.  Poll GET /api/dataset/comparison for results.
     """
@@ -477,6 +478,8 @@ async def reeval_dataset(background_tasks: BackgroundTasks, ids: list[str] | Non
     backend = os.getenv("REEVAL_BACKEND", "claude")
     all_items = vector_store.get_all(limit=10_000)["items"]
     targets = [e for e in all_items if not ids or e["id"] in ids]
+    if detected_only:
+        targets = [e for e in targets if e.get("detected")]
 
     def _run() -> None:
         _reeval_progress.update(running=True, done=0, total=len(targets), errors=0)
