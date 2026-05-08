@@ -318,6 +318,11 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                         state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64, track_id=tid, timestamp=event_ts)
                     alert_ids.add(tid)
                     chalking.on_alert(tid)
+                elif kind == "chalking" and not result["chalking_detected"]:
+                    # High-confidence rejection — put track on cooldown so the same
+                    # pedestrian doesn't re-trigger VLM calls every sample_every_n frames.
+                    if result.get("confidence", 0.0) >= 0.80:
+                        chalking.on_alert(tid)
 
             vehicle_bboxes = [d.bbox for d in all_dets if d.class_name in {"car", "truck", "motorcycle"}]
 
