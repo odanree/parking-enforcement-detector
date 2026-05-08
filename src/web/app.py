@@ -162,7 +162,9 @@ async def lifespan(app: FastAPI):
             name="pipeline-1",
         )
         t1.start()
-        logger.info("Pipeline-1 thread started (rtsp=%s video=%s)", cam1_rtsp, cam1_video)
+        import re as _re
+        safe_rtsp = _re.sub(r'://[^:]+:[^@]+@', '://****:****@', cam1_rtsp or "")
+        logger.info("Pipeline-1 thread started (rtsp=%s video=%s)", safe_rtsp, cam1_video)
     else:
         logger.info("No RTSP_URL_2 / VIDEO_PATH_2 set — camera 1 inactive")
 
