@@ -51,11 +51,14 @@ class EventVectorStore:
             name="chalking_evals",
             embedding_function=ef,
         )
-        # Session-only dedup: hash set starts empty each run so events are always
-        # visible on first detection after a restart. Within a session the set
-        # grows to block loop duplicates without re-alerting or re-writing to disk.
-        self._thumb_hashes: set[str] = set()
-        logger.info("Vector store ready (%d events)", self._col.count())
+        # Persistent dedup: load all known hashes so restarts don't re-add the
+        # same frame if the pipeline replays the same footage.
+        all_meta = self._col.get(include=["metadatas"], limit=100_000).get("metadatas", [])
+        self._thumb_hashes: set[str] = {
+            m["thumb_hash"] for m in all_meta if m.get("thumb_hash")
+        }
+        count = self._col.count()
+        logger.info("Vector store ready (%d events, %d unique thumbs)", count, len(self._thumb_hashes))
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -193,6 +196,25 @@ class EventVectorStore:
 
     def count(self) -> int:
         return self._col.count()
+
+    def deduplicate(self) -> int:
+        """Remove duplicate entries that share the same thumb_hash. Keeps the
+        earliest (lowest ID) entry. Returns the number of records removed."""
+        result = self._col.get(include=["metadatas"], limit=100_000)
+        seen: dict[str, str] = {}   # hash → first event_id
+        to_delete: list[str] = []
+        for eid, meta in zip(result["ids"], result["metadatas"]):
+            h = meta.get("thumb_hash", "")
+            if not h:
+                continue
+            if h in seen:
+                to_delete.append(eid)
+            else:
+                seen[h] = eid
+        if to_delete:
+            self._col.delete(ids=to_delete)
+            logger.info("Deduplicated vector store: removed %d duplicate entries", len(to_delete))
+        return len(to_delete)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

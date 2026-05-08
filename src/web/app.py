@@ -431,6 +431,12 @@ async def dataset_export():
     return JSONResponse(vector_store.export_labeled())
 
 
+@app.post("/api/dataset/deduplicate")
+async def dataset_deduplicate():
+    removed = vector_store.deduplicate()
+    return {"removed": removed, "remaining": vector_store.count()}
+
+
 # ── Re-evaluation (second-opinion) ───────────────────────────────────────────
 
 _reeval_vlm: VLMAnalyzer | None = None
