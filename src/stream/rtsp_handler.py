@@ -102,7 +102,8 @@ class RTSPHandler:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="rtsp-reader")
         self._thread.start()
-        logger.info("RTSP reader started → %s", self._url)
+        safe = re.sub(r'://[^:]+:[^@]+@', '://****:****@', self._url)
+        logger.info("RTSP reader started → %s", safe)
 
     def stop(self) -> None:
         self._stop.set()
