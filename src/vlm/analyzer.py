@@ -54,14 +54,13 @@ _USER_PROMPT = (
     '   B1 (STRONGEST SIGNAL) — REAR-TO-FRONT PASS: The person is walking from the rear of the '
     'vehicle toward the front (back-to-front direction) while staying close to the vehicle at '
     'wheel/door level. PE officers mark efficiently while walking — they do not need to stop long.\n'
-    '   B2 — BRIEF STATIONARY DWELL WITH REAR APPROACH: The person stands or crouches at the '
-    'rear wheel position for a SHORT time AND arrived from the rear/side, NOT from the front. '
-    'PE officers are efficient — a brief stop to mark takes only a moment. '
-    'A LONG dwell (person appears stationary across many frames with no sign of moving) is MORE '
-    'consistent with a vehicle owner using their car, not a PE officer. '
-    'A person who walked front-to-back and then stopped is a vehicle owner — NOT B2 regardless '
-    'of dwell length. B2 only applies when approach was from the rear/side or is not visible, '
-    'AND the dwell is brief, not prolonged.\n'
+    '   B2 — BRIEF STATIONARY DWELL WITH CONFIRMED REAR APPROACH: The person stands or crouches '
+    'at the rear wheel position for a SHORT time, AND ALL THREE of the following must be true:\n'
+    '     (i)  Approach direction is CLEARLY from the rear or side — if it is ambiguous or '
+    'cannot be determined from the frames, B2 does NOT apply.\n'
+    '     (ii) The dwell is brief — a prolonged stationary presence is a vehicle owner, not a PE officer.\n'
+    '     (iii) There is at least partial tool evidence — Condition A is at least tentatively met '
+    '(some object appears to extend from the hand). B2 with zero tool evidence → chalking_detected: false.\n'
     '   B3 — FRONT-TO-BACK STOP WITH CLEAR PIVOT: The person walked front-to-back, stopped at '
     'the rear wheel, and visibly reversed direction (now moving rear-to-front). Just stopping '
     'at the rear after a front-to-back walk is NOT B3 — the reversal must be visible.\n'
@@ -69,9 +68,14 @@ _USER_PROMPT = (
     '   • Person walked front-to-back and continued past the rear wheel toward the trunk.\n'
     '   • Person walked front-to-back and stopped/dwelled at the rear wheel — this is a '
     'vehicle owner pausing before accessing their trunk, NOT a PE officer.\n'
+    '   • Approach direction is ambiguous and no tool is visible.\n'
     '   IMPORTANT: CONDITION A alone is sufficient (tool clearly visible in hand → flag true, '
-    'overrides all direction rules). CONDITION B requires matching B1, B2, or B3 and NOT '
-    'matching any exclusion. If BOTH A and B are present, confidence should be very high.\n'
+    'overrides all direction rules). '
+    'B1 alone (clear rear-to-front direction, no tool visible) → may detect but cap confidence at 0.62. '
+    'B2 requires confirmed rear/side approach AND partial tool evidence — either missing → false. '
+    'A "possible" or "tentative" tool does NOT satisfy Condition A standalone but does satisfy '
+    'the partial-tool requirement for B2. '
+    'If BOTH A (confirmed) and B are present, confidence should be very high.\n'
     'Output only a JSON object with: '
     '{ "chalking_detected": boolean, "sweeper_detected": false, '
     '"pe_vehicle_detected": false, "confidence": float, "description": string }'
@@ -85,12 +89,14 @@ _SYSTEM_PROMPT = (
     "Flag chalking true if: (A) a long thin object is clearly held IN the person's hand, extending downward "
     "or toward the ground — backpacks, shoulder bags, arms, shadows, and worn items do NOT qualify; OR "
     "(B) the person exhibits PE officer movement near the rear wheel — "
-    "B1: walking rear-to-front along the vehicle (strongest signal, PE marks while walking); "
-    "B2: brief stationary dwell at the rear wheel, arrived from the rear/side NOT front-to-back — "
-    "a prolonged dwell or front-to-back arrival that stops is a vehicle owner, not a PE officer; "
-    "B3: walked front-to-back but visibly stopped AND reversed direction (pivot) at the rear wheel. "
-    "EXCLUSIONS: front-to-back walk that continues past → false; front-to-back walk that stops/dwells without reversing → false. "
-    "CONDITION A (tool in hand) alone is always sufficient and overrides all direction rules. "
+    "B1: walking rear-to-front along the vehicle (strongest signal; cap confidence at 0.62 if no tool visible); "
+    "B2: brief dwell at rear wheel with CONFIRMED rear/side approach AND at least partial tool evidence — "
+    "ambiguous approach direction → B2 does not apply; zero tool evidence → B2 does not apply; "
+    "B3: walked front-to-back but visibly reversed direction (pivot) at the rear wheel. "
+    "EXCLUSIONS: front-to-back walk that continues past → false; front-to-back walk that stops without reversing → false; "
+    "ambiguous approach + no tool → false. "
+    "CONDITION A (tool confirmed) alone is always sufficient. "
+    "A 'possible' or 'tentative' tool satisfies B2's partial-tool requirement but NOT standalone Condition A. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
