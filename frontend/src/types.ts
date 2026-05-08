@@ -9,8 +9,11 @@ export interface AppEvent {
   description: string | null;
   snapshot_url: string | null;
   camera?: number;
+  camera_id?: number;
   frames?: string[];
   vote?: Vote;
+  track_id?: number | null;
+  session_id?: string | null;
 }
 
 export interface Stats {
@@ -18,17 +21,17 @@ export interface Stats {
   paused: boolean;
   motion_detect_enabled: boolean;
   privacy_mode: boolean;
-  sweep_window_active: boolean;
   total_chalking: number;
-  total_sweeper: number;
   last_chalking: number | null;
-  last_sweeper: number | null;
   uptime_seconds: number;
   playback_speed: number;
   playback_direction: number;
   is_live: boolean;
+  is_nvr_playback: boolean;
   fps: number;
   demo_mode: boolean;
+  vlm_calls: number;
+  vlm_cost_usd: number;
 }
 
 export interface VlmJob {
@@ -48,10 +51,21 @@ export interface DebugItem {
   description: string | null;
   timestamp: number;
   frames?: string[];
+  suppressed_by_session?: string | null;
 }
 
 export type Polygon = [number, number][];
 export type PrivacyRegion = [number, number, number, number];
+
+export interface Session {
+  session_id: string;
+  camera_id: number;
+  started_at: number;
+  last_seen: number;
+  event_count: number;
+  track_ids: number[];
+  duration_seconds: number;
+}
 
 export const TYPE_LABELS: Record<EventType, string> = {
   chalking:   'Chalking',

@@ -14,8 +14,9 @@ interface Props {
 }
 
 export function VideoToolbar({ cameraId, zoneEditing, privEditing, onEnterZoneEdit, onEnterPrivEdit }: Props) {
-  const stats     = useAppStore((s) => s.stats);
-  const isLive    = stats?.is_live ?? true;
+  const stats        = useAppStore((s) => s.stats);
+  const isLive       = stats?.is_live ?? true;
+  const isNvrPlayback = stats?.is_nvr_playback ?? false;
   const paused    = stats?.paused ?? false;
   const speed     = stats?.playback_speed ?? 1;
   const motionOn  = stats?.motion_detect_enabled ?? false;
@@ -73,6 +74,11 @@ export function VideoToolbar({ cameraId, zoneEditing, privEditing, onEnterZoneEd
       <button id="btn-pause" className={`btn-pause${paused ? ' paused' : ''}`} onClick={togglePause}>
         {paused ? (demo ? '▶ Run Demo' : '▶ Resume') : '⏸ Pause'}
       </button>
+      {isNvrPlayback && (
+        <button className="btn-nvr-live" onClick={() => fetch('/api/playback/live', { method: 'POST' })}>
+          ⏺ Go Live
+        </button>
+      )}
 
       {!isLive && (
         <div className="speed-controls">

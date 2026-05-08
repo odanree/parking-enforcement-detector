@@ -464,6 +464,42 @@ main {
   color: var(--muted);
 }
 
+.event-session {
+  font-size: 10px;
+  font-family: monospace;
+  color: var(--blue);
+  background: rgba(41, 182, 246, 0.12);
+  border-radius: 3px;
+  padding: 1px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.event-session:hover { background: rgba(41, 182, 246, 0.25); }
+.event-session.active { background: rgba(41, 182, 246, 0.35); outline: 1px solid var(--blue); }
+
+.session-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--blue);
+  background: rgba(41, 182, 246, 0.08);
+  border: 1px solid rgba(41, 182, 246, 0.25);
+  border-radius: 4px;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+}
+.session-filter-clear {
+  background: none;
+  border: 1px solid rgba(41, 182, 246, 0.4);
+  color: var(--blue);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.session-filter-clear:hover { background: rgba(41, 182, 246, 0.15); }
+
 .event-desc {
   font-size: 11px;
   color: var(--text);
@@ -1074,4 +1110,72 @@ main {
     border-top: 1px solid var(--border);
     padding: 14px;
   }
+}
+
+/* ── Prompt Editor ────────────────────────────────────────────────────────── */
+.prompt-editor-card h2 { cursor: pointer; }
+.prompt-editor-body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.prompt-stage-row { display: flex; gap: 6px; align-items: center; }
+.prompt-stage-row select {
+  flex: 1;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.prompt-label { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.prompt-ta {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  resize: vertical;
+}
+.prompt-ta:focus { outline: none; border-color: var(--blue); }
+.prompt-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.prompt-btn {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.prompt-btn:hover { border-color: var(--blue); color: var(--blue); }
+.prompt-btn.apply { background: var(--blue); color: #000; border-color: var(--blue); font-weight: 600; }
+.prompt-btn.apply:hover { opacity: 0.85; }
+.prompt-status { font-size: 11px; color: var(--green); }
+.prompt-unavail { font-size: 12px; color: var(--muted); font-style: italic; }
+
+/* ── NVR playback controls ────────────────────────────────────────────────── */
+.event-modal-nvr-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.btn-nvr-play {
+  background: #1a3a1a; color: var(--green);
+  border: 1px solid var(--green); border-radius: 4px;
+  padding: 6px 12px; cursor: pointer; font-size: 13px; font-weight: 600;
+}
+.btn-nvr-play:hover { background: #2a5a2a; }
+.btn-nvr-live {
+  background: #3a1a1a; color: var(--red);
+  border: 1px solid var(--red); border-radius: 4px;
+  padding: 6px 12px; cursor: pointer; font-size: 13px; font-weight: 600;
+}
+.btn-nvr-live:hover { background: #5a2a2a; }
+.nvr-status { font-size: 11px; color: var(--muted); }
+
+/* ── Debug suppressed items ───────────────────────────────────────────────── */
+.debug-item.suppressed { opacity: 0.55; }
+.debug-suppressed-badge {
+  font-size: 10px;
+  color: var(--orange);
+  font-weight: 600;
+  letter-spacing: .02em;
 }

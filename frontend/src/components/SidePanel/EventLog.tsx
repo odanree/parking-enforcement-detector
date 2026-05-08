@@ -79,7 +79,10 @@ function VoteButtons({ ev, camId }: { ev: AppEvent; camId: number }) {
 }
 
 function EventItem({ ev }: { ev: AppEvent }) {
-  const openModal = useAppStore((s) => s.openModal);
+  const openModal       = useAppStore((s) => s.openModal);
+  const sessions        = useAppStore((s) => s.sessions);
+  const sessionFilter   = useAppStore((s) => s.sessionFilter);
+  const setSessionFilter = useAppStore((s) => s.setSessionFilter);
   const pct     = Math.round((ev.confidence ?? 0) * 100);
   const timeStr = new Date(ev.timestamp * 1000).toLocaleTimeString([], {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -87,12 +90,24 @@ function EventItem({ ev }: { ev: AppEvent }) {
 
   const hasFrames = ev.frames && ev.frames.length > 0;
   const camId = ev.camera ?? 0;
+  const session = ev.session_id ? sessions.find((s) => s.session_id === ev.session_id) : null;
+  const isFiltered = sessionFilter === ev.session_id;
 
   return (
     <li className={`event-item ${ev.event_type}`}>
       <div className="event-header">
         <span className={`event-type ${ev.event_type}`}>{TYPE_LABELS[ev.event_type] ?? ev.event_type}</span>
         {ev.camera != null && ev.camera > 0 && <span className="event-cam">Cam {ev.camera}</span>}
+        {ev.track_id != null && <span className="event-cam" title="Track ID">#{ev.track_id}</span>}
+        {session && (
+          <span
+            className={`event-session ${isFiltered ? 'active' : ''}`}
+            title={`Session ${session.session_id} · ${session.event_count} events · ${session.track_ids.length} track IDs — click to filter`}
+            onClick={() => setSessionFilter(isFiltered ? null : session.session_id)}
+          >
+            S:{session.session_id} ×{session.event_count}
+          </span>
+        )}
         <span className="event-conf">{pct}%</span>
         <span className="event-time">{timeStr}</span>
       </div>
@@ -116,18 +131,33 @@ function EventItem({ ev }: { ev: AppEvent }) {
 }
 
 export function EventLog() {
-  const events = useAppStore((s) => s.events);
+  const events          = useAppStore((s) => s.events);
+  const sessions        = useAppStore((s) => s.sessions);
+  const sessionFilter   = useAppStore((s) => s.sessionFilter);
+  const setSessionFilter = useAppStore((s) => s.setSessionFilter);
+
+  const displayed = sessionFilter
+    ? events.filter((ev) => ev.session_id === sessionFilter)
+    : events;
+
+  const filterSession = sessionFilter ? sessions.find((s) => s.session_id === sessionFilter) : null;
 
   return (
     <div className="card events-card">
       <h2>
         Event Log{' '}
-        <span className="event-count">{events.length}</span>
+        <span className="event-count">{displayed.length}</span>
       </h2>
+      {filterSession && (
+        <div className="session-filter-bar">
+          <span>Session {filterSession.session_id} · {filterSession.event_count} events · {filterSession.duration_seconds}s</span>
+          <button className="session-filter-clear" onClick={() => setSessionFilter(null)}>✕ All</button>
+        </div>
+      )}
       <ul className="event-list">
-        {events.length === 0
+        {displayed.length === 0
           ? <li className="event-empty">No alerts yet</li>
-          : events.map((ev) => <EventItem key={`${ev.timestamp}-${ev.event_type}`} ev={ev} />)
+          : displayed.map((ev) => <EventItem key={`${ev.timestamp}-${ev.event_type}`} ev={ev} />)
         }
       </ul>
     </div>

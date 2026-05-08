@@ -77,16 +77,22 @@ export function DebugDrawer() {
                 const timeStr = new Date(item.timestamp * 1000).toLocaleTimeString([], {
                   hour: '2-digit', minute: '2-digit', second: '2-digit',
                 });
+                const isSuppressed = !!item.suppressed_by_session;
                 return (
-                  <div key={i} className="debug-item">
+                  <div key={i} className={`debug-item${isSuppressed ? ' suppressed' : ''}`}>
                     <DebugThumb item={item} />
                     <div className="debug-item-meta">
                       <div className="debug-item-header">
                         <span className={`debug-kind ${item.kind}`}>{TYPE_LABELS[item.kind] ?? item.kind}</span>
-                        <span className="debug-conf">{pct}%</span>
+                        {isSuppressed
+                          ? <span className="debug-suppressed-badge">⛔ S:{item.suppressed_by_session}</span>
+                          : <span className="debug-conf">{pct}%</span>
+                        }
                         <span className="debug-time">{timeStr}</span>
                       </div>
-                      <div className="debug-desc">{item.description || 'No description'}</div>
+                      <div className="debug-desc">
+                        {isSuppressed ? 'Suppressed by user downvote' : (item.description || 'No description')}
+                      </div>
                     </div>
                   </div>
                 );

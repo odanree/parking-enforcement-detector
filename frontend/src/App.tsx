@@ -5,12 +5,14 @@ import { EventModal }  from './components/EventModal';
 import { DebugDrawer } from './components/DebugDrawer';
 import { useStats }         from './hooks/useStats';
 import { useEvents }        from './hooks/useEvents';
+import { useSessions }      from './hooks/useSessions';
 import { usePending }       from './hooks/usePending';
 import { useDebugRejected } from './hooks/useDebugRejected';
 
 export default function App() {
   useStats();
   useEvents();
+  useSessions();
   usePending();
   useDebugRejected();
 

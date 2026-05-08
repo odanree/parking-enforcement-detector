@@ -14,9 +14,6 @@ export function Header() {
         <span id="badge-pipeline" className={`badge ${stats?.pipeline_running ? 'on' : 'off'}`}>
           &#x25CF; Pipeline
         </span>
-        <span id="badge-sweep" className={`badge ${stats?.sweep_window_active ? 'on' : 'off'}`}>
-          &#x25CF; Sweep Window
-        </span>
         <span className={`badge badge-ws ${wsStatuses[0]}`}>
           &#x25CF; Cam 0
         </span>

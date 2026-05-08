@@ -94,12 +94,39 @@ export function EventModal() {
   const demo       = useAppStore((s) => s.stats?.demo_mode ?? false);
   const [alertStatus, setAlertStatus] = useState<{ msg: string; ok: boolean } | null>(null);
   const [alertDisabled, setAlertDisabled] = useState(false);
+  const [previewActive, setPreviewActive] = useState(false);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Reset alert state when modal opens a new event
+  // Reset state when modal opens a new event
   useEffect(() => {
     setAlertStatus(null);
     setAlertDisabled(false);
+    setPreviewActive(false);
   }, [ev]);
+
+  // WebSocket preview — opens its own RTSP capture, never touches the pipeline
+  useEffect(() => {
+    if (!previewActive || !ev) return;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const camId = ev.camera_id ?? ev.camera ?? 0;
+    const ws = new WebSocket(`${proto}://${location.host}/ws/playback/preview?timestamp=${ev.timestamp}&camera_id=${camId}`);
+    ws.binaryType = 'blob';
+    ws.onmessage = (e) => {
+      const url = URL.createObjectURL(e.data as Blob);
+      const img = new Image();
+      img.onload = () => {
+        const canvas = previewCanvasRef.current;
+        if (canvas) {
+          if (canvas.width !== img.naturalWidth)   canvas.width  = img.naturalWidth;
+          if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
+          canvas.getContext('2d')?.drawImage(img, 0, 0);
+        }
+        URL.revokeObjectURL(url);
+      };
+      img.src = url;
+    };
+    return () => ws.close();
+  }, [previewActive, ev]);
 
   // Close on Escape
   useEffect(() => {
@@ -144,9 +171,12 @@ export function EventModal() {
         <button className="event-modal-close" onClick={closeModal} aria-label="Close">&times;</button>
         <div className="event-modal-body">
           <div className="event-modal-img-wrap">
-            {ev.snapshot_url
-              ? <ZoomableImage src={ev.snapshot_url} />
-              : <span style={{ color: 'var(--muted)' }}>No snapshot</span>}
+            {previewActive
+              ? <canvas ref={previewCanvasRef} style={{ maxWidth: '100%', maxHeight: '78vh', display: 'block', borderRadius: '6px' }} />
+              : ev.snapshot_url
+                ? <ZoomableImage src={ev.snapshot_url} />
+                : <span style={{ color: 'var(--muted)' }}>No snapshot</span>
+            }
           </div>
           <div className="event-modal-info">
             <div className="event-modal-header">
@@ -160,6 +190,20 @@ export function EventModal() {
             </div>
             <div className="event-modal-section-label">LLM Response</div>
             <div className="event-modal-desc">{ev.description || 'No description'}</div>
+            <div className="event-modal-nvr-row">
+              {!previewActive
+                ? <button className="btn-nvr-play" onClick={() => setPreviewActive(true)}>▶ Play on NVR</button>
+                : <button className="btn-nvr-live" onClick={() => setPreviewActive(false)}>⏹ Stop Preview</button>
+              }
+            </div>
+            {(() => {
+              const ageMin = (Date.now() / 1000 - ev.timestamp) / 60;
+              if (ageMin < 30)
+                return <div className="nvr-warning">⚠ Recent recording — NVR may not have sealed this file yet</div>;
+              if ((ev.camera_id ?? 0) === 0 && ageMin < 120)
+                return <div className="nvr-warning">⚠ Live-camera event — check cam&nbsp;0 panel after seeking</div>;
+              return null;
+            })()}
             {!demo && (
               <>
                 <button className="btn-alert" onClick={sendAlert} disabled={alertDisabled}>
