@@ -374,20 +374,22 @@ export function PipelineKanban() {
   const [labelFilter, setLabelFilter] = useState<LabelFilter>('unlabeled');
   const [camFilter,   setCamFilter]   = useState<CamFilter>('all');
 
-  const filterUrl = useMemo(() => {
+  const timeWindowSecs = useMemo(() => {
+    if (timeFilter === 'all') return null;
+    return timeFilter === '5m' ? 300 : timeFilter === '1h' ? 3600 : timeFilter === '6h' ? 6 * 3600
+         : timeFilter === '12h' ? 12 * 3600 : timeFilter === '7d' ? 7 * 86400 : 30 * 86400;
+  }, [timeFilter]);
+
+  function buildUrl() {
     const p = new URLSearchParams({ limit: '500' });
-    if (timeFilter !== 'all') {
-      const secs = timeFilter === '5m' ? 300 : timeFilter === '1h' ? 3600 : timeFilter === '6h' ? 6 * 3600 : timeFilter === '12h' ? 12 * 3600 : timeFilter === '7d' ? 7 * 86400 : 30 * 86400;
-      p.set('since', String(Math.floor(Date.now() / 1000) - secs));
-    }
+    if (timeWindowSecs !== null) p.set('since', String(Math.floor(Date.now() / 1000) - timeWindowSecs));
     if (labelFilter === 'unlabeled') p.set('label', '');
-    else if (labelFilter === 'labeled') { /* server returns all; we filter client-side */ }
     if (camFilter !== 'all') p.set('camera_id', String(camFilter));
     return `/api/pipeline/trace?${p}`;
-  }, [timeFilter, labelFilter, camFilter]);
+  }
 
   function fetchCards() {
-    fetch(filterUrl)
+    fetch(buildUrl())
       .then((r) => r.json())
       .then((d) => setCards(d.cards ?? []))
       .catch(() => {});
@@ -396,12 +398,12 @@ export function PipelineKanban() {
   useEffect(() => {
     if (!kanbanOpen) return;
     setLoading(true);
-    fetch(filterUrl)
+    fetch(buildUrl())
       .then((r) => r.json())
       .then((d) => setCards(d.cards ?? []))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [kanbanOpen, filterUrl]);
+  }, [kanbanOpen, timeWindowSecs, labelFilter, camFilter]);
 
   useEffect(() => {
     if (!kanbanOpen || !autoRefresh) {
@@ -410,7 +412,7 @@ export function PipelineKanban() {
     }
     timerRef.current = setInterval(fetchCards, 5000);
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [kanbanOpen, autoRefresh, filterUrl]);
+  }, [kanbanOpen, autoRefresh, timeWindowSecs, labelFilter, camFilter]);
 
   useEffect(() => {
     if (!kanbanOpen) return;
