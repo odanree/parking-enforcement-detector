@@ -80,6 +80,69 @@ main {
   overflow: hidden;
 }
 
+/* ── Picture-in-picture mode (kanban open) ───────────────────────────────── */
+.video-panels.pip {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 55;          /* above kanban board (50), below modal overlay (60) */
+  width: 300px;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.7);
+  animation: pip-enter 0.35s cubic-bezier(0.34, 1.3, 0.64, 1) both;
+}
+
+@keyframes pip-enter {
+  from { opacity: 0; transform: translateY(40px) scale(0.88); }
+  to   { opacity: 1; transform: translateY(0)    scale(1);    }
+}
+
+/* Hide toolbars and editing controls in PiP */
+.video-panels.pip .video-toolbar,
+.video-panels.pip .privacy-toolbar,
+.video-panels.pip .zone-toolbar   { display: none; }
+
+/* Override canvas size to fill the 300px container */
+.video-panels.pip .canvas-wrap {
+  width: 100% !important;
+}
+
+.video-panel-pip-wrap {
+  position: relative;
+}
+
+.pip-controls {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: flex;
+  gap: 4px;
+  z-index: 10;
+}
+
+.pip-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: rgba(0,0,0,0.72);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.15s;
+}
+.pip-btn:hover { background: rgba(0,0,0,0.95); }
+
 /* ── Video panel ─────────────────────────────────────────────────────────── */
 .video-panel {
   background: #000;
