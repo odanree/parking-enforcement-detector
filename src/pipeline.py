@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from typing import Optional
 
 import cv2
@@ -33,6 +34,23 @@ from src.stream.video_file_handler import VideoFileHandler
 from src.vlm.analyzer import VLMAnalyzer
 
 logger = logging.getLogger(__name__)
+
+# ── PE enforcement window (time-of-day gate) ──────────────────────────────────
+_PE_WINDOW_ENABLED = os.getenv("PE_WINDOW_ENABLED", "true").lower() == "true"
+_PE_WINDOW_START   = int(os.getenv("PE_WINDOW_START", "8"))   # 08:00 local time
+_PE_WINDOW_END     = int(os.getenv("PE_WINDOW_END",   "16"))  # 16:00 local time
+# Playback mode: VIDEO_PATH set → skip vector-store duplicate suppression so
+# replaying the same footage always fires alerts.
+_IS_PLAYBACK       = bool(os.getenv("VIDEO_PATH"))
+
+
+def _in_pe_window(ts: float | None = None) -> bool:
+    """True if ts (unix) falls within the PE enforcement window.
+    Falls back to datetime.now() when ts is None (live RTSP or unknown source).
+    """
+    h = datetime.fromtimestamp(ts).hour if ts is not None else datetime.now().hour
+    return _PE_WINDOW_START <= h < _PE_WINDOW_END
+
 
 # Push at most this many frames per second to the WebSocket state.
 _MAX_PUSH_FPS = 20
@@ -263,6 +281,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 all_dets = all_dets + motion_dets
 
             zone_dets = zone_filter.filter(all_dets, "street_zone")
+            # Wall time of this frame: NVR timestamp for video files, None for live RTSP
+            # (None causes _in_pe_window to fall back to datetime.now())
+            _frame_wall_ts = getattr(stream, 'get_current_wall_time', lambda: None)()
 
             active_ids = {d.track_id for d in zone_dets}
             alert_ids.clear()
@@ -273,6 +294,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 fut, kind, tid, snap_fr, bbox, thumb = job[:6]
                 detail_b64 = job[6] if len(job) > 6 else []
                 snap_ts    = job[7] if len(job) > 7 else None
+                yolo_conf  = job[8] if len(job) > 8 else None
                 if not fut.done():
                     continue
                 del _vlm_jobs[job_key]
@@ -283,19 +305,56 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                     if state:
                         state.complete_pending_vlm(kind, tid, detected=False)
                     continue
-                usage = result.pop("_usage", None)
+                usage          = result.pop("_usage", None)
+                rag_neighbors  = result.pop("_rag_neighbors", [])
+                pipeline_trace = result.pop("_pipeline_trace", None)
+                if pipeline_trace is not None and yolo_conf is not None:
+                    pipeline_trace["yolo"] = {
+                        "confidence": round(yolo_conf, 3),
+                        "track_id":   tid,
+                        "bbox":       list(bbox) if bbox else None,
+                    }
                 if state:
                     state.record_vlm_usage(usage)  # None = Ollama/free, still counts the call
                 detected = result.get(f"{kind}_detected", False)
                 if state:
                     state.complete_pending_vlm(kind, tid, detected=detected)
                     if not detected:
+                        # Full-frame thumbnail (with bbox) for the kanban rejected card
+                        _rej_fr = snap_fr.copy()
+                        if bbox:
+                            x1r, y1r, x2r, y2r = bbox
+                            cv2.rectangle(_rej_fr, (x1r, y1r), (x2r, y2r), (0, 0, 255), 2)
+                        _, _enc = cv2.imencode('.jpg', _rej_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        snap_thumb = _thumb_b64_from_jpeg(_enc.tobytes(), width=640)
                         state.record_rejected_vlm(
-                            kind, thumb,
+                            kind, snap_thumb,
                             result.get("confidence", 0.0),
                             result.get("description", ""),
                             frames=detail_b64 if kind == "chalking" else [],
+                            rag_neighbors=rag_neighbors,
+                            pipeline_trace=pipeline_trace,
+                            track_id=tid,
                         )
+                # People-alert phase: record when first-pass VLM was positive.
+                # Fires in two-stage mode regardless of confirm outcome so the
+                # kanban always shows the full funnel (person near vehicle → confirmed chalking).
+                # Single-stage positives land directly in the chalking alert path below.
+                _fp = pipeline_trace.get("first_pass") if pipeline_trace else None
+                _is_two_stage = pipeline_trace is not None and pipeline_trace.get("confirm") is not None
+                if kind == "chalking" and _fp and _fp.get("detected") and _is_two_stage and state:
+                    _pa_ts = snap_ts or extract_osd_timestamp(snap_fr)
+                    state.record_people_alert(
+                        confidence=_fp.get("confidence", 0.0),
+                        description=_fp.get("description", ""),
+                        frames=detail_b64,
+                        timestamp=_pa_ts,
+                        track_id=tid,
+                        rag_neighbors=rag_neighbors,
+                        pipeline_trace=pipeline_trace,
+                        thumbnail=thumb,
+                    )
+
                 _is_duplicate = False
                 if kind == "chalking" and vector_store:
                     try:
@@ -307,7 +366,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                             thumbnail_b64=thumb,
                             frames_b64=detail_b64,
                         )
-                        _is_duplicate = (_event_id == "")
+                        _is_duplicate = (not _IS_PLAYBACK) and (_event_id == "")
                     except Exception:
                         logger.exception("vector_store.add failed")
                 if kind == "chalking" and result["chalking_detected"] and not _is_duplicate:
@@ -315,7 +374,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                     snap = notifier.send("chalking", result, sf, bbox)
                     event_ts = snap_ts or extract_osd_timestamp(snap_fr)
                     if state:
-                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64, track_id=tid, timestamp=event_ts)
+                        state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64, track_id=tid, timestamp=event_ts, rag_neighbors=rag_neighbors, pipeline_trace=pipeline_trace)
                     alert_ids.add(tid)
                     chalking.on_alert(tid)
                 elif kind == "chalking" and not result["chalking_detected"]:
@@ -364,11 +423,26 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 alert_ids.add(det.track_id)
                                 chalking.on_alert(det.track_id)
                             else:
+                                # After-hours low-confidence gate: skip VLM when outside the
+                                # PE window and YOLO confidence is below 25% (not in playback).
+                                _after_hours = not _IS_PLAYBACK and not _in_pe_window(_frame_wall_ts)
+                                if _after_hours and det.confidence < 0.40:
+                                    if state:
+                                        state.record_rejected_vlm(
+                                            "chalking", thumb, det.confidence,
+                                            f"After-hours gate: YOLO {det.confidence:.0%} below 40% threshold",
+                                            rejection_reason="out_of_hours",
+                                            track_id=det.track_id,
+                                        )
+                                    chalking.on_alert(det.track_id)
+                                    continue
                                 scene      = _crop_scene_bytes(frame, det.bbox)
                                 vlm_frames = [scene] + detail_frames
-                                snap_ts    = getattr(stream, 'get_current_wall_time', lambda: None)()
-                                fut = _vlm_pool.submit(_two_stage, vlm, confirm_vlm, vlm_frames, "chalking")
-                                _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts)
+                                snap_ts    = _frame_wall_ts
+                                # confirm_vlm intentionally not passed — Claude is a human-triggered gate only.
+                                # Use /api/dataset/reeval to run Claude on specific items.
+                                fut = _vlm_pool.submit(_two_stage, vlm, None, vlm_frames, "chalking", vector_store)
+                                _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence)
                                 if state:
                                     state.add_pending_vlm("chalking", det.track_id, thumb)
 
@@ -479,19 +553,104 @@ def _crop_wide_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> byte
     return buf.tobytes() if ok else b""
 
 
+_RAG_AUTO_REJECT   = os.getenv("RAG_AUTO_REJECT", "false").lower() == "true"
+_RAG_FP_THRESHOLD  = float(os.getenv("RAG_FP_THRESHOLD", "0.30"))
+_RAG_FP_MIN_VOTES  = int(os.getenv("RAG_FP_MIN_VOTES", "3"))
+
+
 def _two_stage(
     primary: "VLMAnalyzer",
     confirm: "VLMAnalyzer | None",
     frames: "list[bytes]",
     kind: str,
+    rag_store=None,
 ) -> dict:
-    """Run primary VLM; if positive and a confirm VLM is configured, re-evaluate
-    with the second stage. Negatives skip the confirm stage entirely."""
-    result = primary.analyze(frames, kind)
-    if confirm is None or not result.get(f"{kind}_detected", False):
-        return result
-    logger.debug("Two-stage: %s positive → sending to confirm VLM", kind)
-    return confirm.analyze(frames, kind)
+    """Run primary VLM; RAG lookup; optionally skip confirm; run confirm VLM.
+
+    Returns the final result dict plus internal keys:
+      _usage          — token usage from whichever VLM ran last
+      _rag_neighbors  — list of similar labeled events from ChromaDB
+      _pipeline_trace — per-stage breakdown for the kanban view
+    """
+    first = primary.analyze(frames, kind)
+
+    # ── Stage 1 snapshot ─────────────────────────────────────────────────────
+    trace: dict = {
+        "first_pass": {
+            "detected":    first.get(f"{kind}_detected", False),
+            "confidence":  first.get("confidence", 0.0),
+            "description": first.get("description", ""),
+            "backend":     primary._backend,
+        },
+        "rag": None,
+        "confirm": None,
+    }
+
+    # ── RAG lookup ────────────────────────────────────────────────────────────
+    rag_neighbors: list[dict] = []
+    if rag_store is not None and first.get("description"):
+        try:
+            raw = rag_store.query_similar_by_text(first["description"], n=5)
+            rag_neighbors = [
+                {
+                    "id":          n["id"],
+                    "label":       n.get("label", ""),
+                    "distance":    n["distance"],
+                    "description": n["description"][:120],
+                    "detected":    int(n.get("detected", 0)),
+                }
+                for n in raw
+            ]
+        except Exception:
+            logger.debug("RAG lookup failed", exc_info=True)
+
+    labeled    = [n for n in rag_neighbors if n["label"]]
+    fp_close   = [n for n in labeled if n["label"] == "false_positive" and n["distance"] < _RAG_FP_THRESHOLD]
+    tp_close   = [n for n in labeled if n["label"] == "true_positive"  and n["distance"] < _RAG_FP_THRESHOLD]
+    rag_signal = "fp" if fp_close else ("tp" if tp_close else "none")
+
+    trace["rag"] = {
+        "neighbors":      rag_neighbors,
+        "labeled_count":  len(labeled),
+        "fp_close":       len(fp_close),
+        "tp_close":       len(tp_close),
+        "signal":         rag_signal,
+        "skipped_confirm": False,
+    }
+
+    # ── RAG auto-reject (opt-in via RAG_AUTO_REJECT=true) ────────────────────
+    if (
+        _RAG_AUTO_REJECT
+        and confirm is not None
+        and first.get(f"{kind}_detected", False)
+        and len(fp_close) >= _RAG_FP_MIN_VOTES
+    ):
+        first[f"{kind}_detected"] = False
+        first["description"] += f" [RAG: auto-rejected — {len(fp_close)} close FP matches]"
+        trace["rag"]["skipped_confirm"] = True
+        first["_rag_neighbors"]  = rag_neighbors
+        first["_pipeline_trace"] = trace
+        logger.info("RAG auto-reject: %d FP neighbors (dist<%.2f)", len(fp_close), _RAG_FP_THRESHOLD)
+        return first
+
+    first["_rag_neighbors"]  = rag_neighbors
+    first["_pipeline_trace"] = trace
+
+    if confirm is None or not first.get(f"{kind}_detected", False):
+        return first
+
+    # ── Confirm stage ─────────────────────────────────────────────────────────
+    logger.debug("Two-stage: %s positive → confirm VLM", kind)
+    second = confirm.analyze(frames, kind)
+    trace["confirm"] = {
+        "detected":    second.get(f"{kind}_detected", False),
+        "confidence":  second.get("confidence", 0.0),
+        "description": second.get("description", ""),
+        "backend":     confirm._backend,
+    }
+    second["_rag_neighbors"]  = rag_neighbors
+    second["_pipeline_trace"] = trace
+    return second
 
 
 def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:

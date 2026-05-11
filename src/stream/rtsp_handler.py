@@ -22,11 +22,14 @@ def build_nvr_playback_url(
     base_rtsp_url: str = "",
     pre_roll_seconds: int = 30,
     nvr_channel: int | None = None,
+    speed: int = 1,
 ) -> str:
     """Return an NVR RTSP playback URL for the given unix timestamp.
 
     Tries the Dahua RPC2 recording index first; falls back to the time-based
     URL format supported by most Amcrest/Dahua firmware.
+
+    speed: playback multiplier (1, 2, 4, 8) — appended as &speedpara=N.
     """
     from src.stream.amcrest_api import find_recording_rtsp
 
@@ -40,6 +43,8 @@ def build_nvr_playback_url(
     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone()
     url = find_recording_rtsp(host, user, pwd, port, int(ch), dt, pre_roll_seconds)
 
+    speed_suffix = f"&speedpara={speed}" if speed != 1 else ""
+
     if url is None:
         start     = dt - timedelta(seconds=pre_roll_seconds)
         end       = start + timedelta(hours=2)
@@ -47,12 +52,13 @@ def build_nvr_playback_url(
         end_str   = end.strftime("%Y_%m_%d_%H_%M_%S")
         url = (
             f"rtsp://{user}:{pwd}@{host}:{port}"
-            f"/cam/playback?channel={ch}&starttime={start_str}&endtime={end_str}"
+            f"/cam/playback?channel={ch}&starttime={start_str}&endtime={end_str}{speed_suffix}"
         )
-        logger.info("NVR playback (time-based fallback) ch=%s start=%s", ch, start_str)
+        logger.info("NVR playback (time-based fallback) ch=%s start=%s speed=%dx", ch, start_str, speed)
     else:
+        url += speed_suffix
         safe = re.sub(r'://[^:]+:[^@]+@', '://****:****@', url)
-        logger.info("NVR playback → %s", safe)
+        logger.info("NVR playback → %s (speed=%dx)", safe, speed)
 
     return url
 

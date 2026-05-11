@@ -1,10 +1,10 @@
 chalking:
   buffer_sample_every_n: 4
-  cooldown_seconds: 5
-  entry_frames: 9
+  cooldown_seconds: 30
+  entry_frames: 12
   frame_buffer_size: 3
-  sample_every_n: 8
-  vehicle_proximity_px: 250  # person must be within this many px of a vehicle bbox to accumulate chalking state
+  sample_every_n: 12
+  vehicle_proximity_px: 250
 detector:
   fp_grid_cell_px: 48
   fp_suppress_seconds: 10.0
@@ -49,9 +49,9 @@ zones:
     - - 1280
       - 0
     - - 1275
-      - 264
-    - - 6
-      - 229
+      - 245
+    - - 0
+      - 190
   street_zone_1:
     polygon:
     - - 0

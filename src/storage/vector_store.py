@@ -119,6 +119,43 @@ class EventVectorStore:
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
+    def get_filtered(
+        self,
+        since_ts: float | None = None,
+        limit: int = 500,
+        label: str | None = None,
+        camera_id: int | None = None,
+    ) -> list[dict]:
+        """Fetch events with optional server-side filters.
+
+        since_ts  — only return events with timestamp >= this value
+        label     — '' = unlabeled, 'true_positive' etc., None = any label
+        camera_id — filter to a specific camera, None = all cameras
+        """
+        conditions: list[dict] = []
+        if since_ts is not None:
+            conditions.append({"timestamp": {"$gte": since_ts}})
+        if label is not None:
+            conditions.append({"label": {"$eq": label}})
+        if camera_id is not None:
+            conditions.append({"camera_id": {"$eq": camera_id}})
+
+        where: dict | None = None
+        if len(conditions) == 1:
+            where = conditions[0]
+        elif len(conditions) > 1:
+            where = {"$and": conditions}
+
+        kwargs: dict = {"include": ["documents", "metadatas"], "limit": limit}
+        if where:
+            kwargs["where"] = where
+        try:
+            result = self._col.get(**kwargs)
+        except Exception:
+            logger.exception("get_filtered failed — falling back to get_all")
+            result = self._col.get(include=["documents", "metadatas"], limit=limit)
+        return self._flatten(result)
+
     def get_all(self, offset: int = 0, limit: int = 50) -> dict:
         total = self._col.count()
         result = self._col.get(
@@ -128,6 +165,30 @@ class EventVectorStore:
         )
         items = self._flatten(result)
         return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+    def query_similar_by_text(self, text: str, n: int = 5) -> list[dict]:
+        """Find the n most similar events to the given description text.
+
+        Returns all neighbors (labeled and unlabeled) sorted by distance.
+        Callers should filter on ``label`` if they need only labeled events.
+        """
+        total = self._col.count()
+        if total < 1:
+            return []
+        results = self._col.query(
+            query_texts=[text],
+            n_results=min(n, total),
+            include=["documents", "metadatas", "distances"],
+        )
+        return [
+            {"id": eid, "description": doc, "distance": round(dist, 4), **meta}
+            for eid, doc, meta, dist in zip(
+                results["ids"][0],
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0],
+            )
+        ]
 
     def query_similar(self, event_id: str, n: int = 10) -> list[dict]:
         src = self._col.get(ids=[event_id], include=["documents"])

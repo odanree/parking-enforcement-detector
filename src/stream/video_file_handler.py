@@ -34,7 +34,7 @@ class VideoFileHandler:
         path: str,
         loop: bool = True,
         speed: float = 1.0,
-        queue_size: int = 2,
+        queue_size: int = 8,
     ) -> None:
         self._path      = path
         self._loop      = loop

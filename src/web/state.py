@@ -54,6 +54,8 @@ class Event:
     vote: Optional[str] = None       # "up" | "down" | "archive" | None
     track_id: Optional[int] = None
     session_id: Optional[str] = None
+    rag_neighbors: list = field(default_factory=list)   # in-memory only, not persisted
+    pipeline_trace: Optional[dict] = None               # in-memory only, not persisted
 
 
 _LOGS_DIR = Path("logs")
@@ -85,6 +87,7 @@ class AppState:
         self._pending_vlm: list[dict[str, Any]] = []  # in-flight VLM jobs
         self._vlm_sample_counts: dict[str, int] = {}  # job_id → cumulative sample count
         self._debug_rejected: deque[dict[str, Any]] = deque(maxlen=30)
+        self._people_alerts: deque[dict[str, Any]] = deque(maxlen=100)
         self._vlm_calls: int = 0
         self._vlm_cost_usd: float = 0.0
         self._sessions: dict[str, Session] = {}  # session_id -> Session
@@ -255,6 +258,10 @@ class AppState:
         self, kind: str, thumbnail_b64: str, confidence: float, description: str,
         frames: list[str] | None = None,
         suppressed_by_session: str | None = None,
+        rag_neighbors: list | None = None,
+        pipeline_trace: dict | None = None,
+        rejection_reason: str | None = None,
+        track_id: int | None = None,
     ) -> None:
         with self._lock:
             self._debug_rejected.appendleft({
@@ -265,6 +272,10 @@ class AppState:
                 "timestamp": time.time(),
                 "frames": frames or [],
                 "suppressed_by_session": suppressed_by_session,
+                "rag_neighbors": rag_neighbors or [],
+                "pipeline_trace": pipeline_trace,
+                "rejection_reason": rejection_reason,
+                "track_id": track_id,
             })
 
     def get_rejected_vlm(self) -> list[dict[str, Any]]:
@@ -274,6 +285,33 @@ class AppState:
     def clear_rejected_vlm(self) -> None:
         with self._lock:
             self._debug_rejected.clear()
+
+    def record_people_alert(
+        self,
+        confidence: float,
+        description: str,
+        frames: list[str] | None = None,
+        timestamp: float | None = None,
+        track_id: int | None = None,
+        rag_neighbors: list | None = None,
+        pipeline_trace: dict | None = None,
+        thumbnail: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._people_alerts.appendleft({
+                "confidence":    confidence,
+                "description":   description,
+                "frames":        frames or [],
+                "timestamp":     timestamp if timestamp is not None else time.time(),
+                "track_id":      track_id,
+                "rag_neighbors": rag_neighbors or [],
+                "pipeline_trace": pipeline_trace,
+                "thumbnail":     thumbnail,
+            })
+
+    def get_people_alerts(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._people_alerts)[:limit]
 
     def _get_or_create_session(self, ts: float, track_id: int | None) -> str:
         """Return session_id for this event, joining an open session or starting a new one.
@@ -388,6 +426,8 @@ class AppState:
         frames: list[str] | None = None,
         track_id: int | None = None,
         timestamp: float | None = None,
+        rag_neighbors: list | None = None,
+        pipeline_trace: dict | None = None,
     ) -> None:
         ts = timestamp if timestamp is not None else time.time()
         with self._lock:
@@ -402,6 +442,8 @@ class AppState:
                     frames=frames or [],
                     track_id=track_id,
                     session_id=session_id,
+                    rag_neighbors=rag_neighbors or [],
+                    pipeline_trace=pipeline_trace,
                 )
             )
             if event_type == "chalking":
@@ -537,9 +579,20 @@ class AppState:
                     "track_id": e.track_id,
                     "session_id": e.session_id,
                     "camera_id": self.camera_id,
+                    "rag_neighbors": e.rag_neighbors,
+                    "pipeline_trace": e.pipeline_trace,
                 }
                 for e in list(self.events)[:limit]
             ]
+
+    def clear_events(self) -> None:
+        with self._lock:
+            self.events.clear()
+            self._people_alerts.clear()
+            self._total_chalking = 0
+            self._total_sweeper  = 0
+            self._last_chalking  = None
+            self._last_sweeper   = None
 
 
 # Anthropic pricing per million tokens (as of 2025)

@@ -101,37 +101,36 @@ _SYSTEM_PROMPT = (
 )
 
 # Lenient prompt — used by the first-pass stage (Ollama).
-# Goal: catch any person who MIGHT be chalking; the confirm stage will filter FPs.
-# Key differences from strict: no approach-direction check, no trunk/door exclusion,
-# any walking or dwelling near a rear wheel counts.
+# Goal: catch any person who MIGHT be chalking.
+# DO NOT ask the model to classify the environment (street vs driveway vs lot) —
+# the camera angle makes curb-parked vehicles look like lot/driveway vehicles and
+# causes false negatives. Focus only on person + vehicle + wheel-level proximity.
 _LENIENT_USER_PROMPT = (
-    'Analyze this street camera crop for possible parking-enforcement tire chalking.\n'
-    'CONTEXT: Tire chalking only happens to vehicles parked along the STREET CURB. '
-    'It never occurs on sidewalks, driveways, or private property. '
-    'A person walking on a sidewalk or driveway — even next to parked cars — is NOT a PE officer.\n'
-    'You are a FIRST-PASS filter — another AI makes the final call. Be permissive but street-aware.\n'
-    'Set chalking_detected: true ONLY if ALL of these apply:\n'
-    '  • A person is physically beside a vehicle parked along the STREET (at the curb), AND\n'
-    '  • The person is at wheel or door level of that vehicle (not just passing nearby), AND\n'
-    '  • At least one of: walking alongside it, pausing near a wheel, crouching, or holding a thin object.\n'
-    'Set chalking_detected: false if:\n'
-    '  • The person is on a sidewalk or driveway with no street-parked vehicle immediately beside them.\n'
-    '  • The person is a pedestrian walking through open space (no vehicle adjacent at arm\'s reach).\n'
-    '  • The person is clearly a driver/passenger entering or exiting their own vehicle.\n'
-    '  • No street-parked vehicle is visible near the person.\n'
-    'When uncertain whether a vehicle is street-parked vs private driveway, set true.\n'
+    'Analyze this street camera image for people near vehicles.\n'
+    'CAMERA NOTE: This is a fixed overhead/angled camera. Do NOT reject based on whether '
+    'the background looks like a street, driveway, or parking lot — all look similar at this angle.\n'
+    'Set chalking_detected: true if ALL of these apply:\n'
+    '  • A person is visible in the frame, AND\n'
+    '  • A vehicle is immediately adjacent to the person (within arm\'s reach).\n'
+    'Set chalking_detected: false ONLY if:\n'
+    '  • No person is visible.\n'
+    '  • No vehicle is visible near the person.\n'
+    '  • The person is clearly inside a vehicle as driver or passenger.\n'
+    '  • The person is far from any vehicle (more than 2–3 metres away).\n'
+    'This is a people-detection pass only — do NOT assess chalk tools, crouching posture, '
+    'or any specific enforcement activity. Simply confirm: is a person present next to a vehicle?\n'
     'Output only a JSON object with: '
     '{ "chalking_detected": boolean, "sweeper_detected": false, '
     '"pe_vehicle_detected": false, "confidence": float, "description": string }'
 )
 
 _LENIENT_SYSTEM_PROMPT = (
-    "You are a parking-enforcement first-pass filter analyzing overhead street camera footage. "
-    "Tire chalking only happens to vehicles parked at the street curb — never to pedestrians on sidewalks, "
-    "people in driveways, or anyone not immediately beside a street-parked car. "
-    "Flag true if a person is adjacent to a street-parked vehicle at wheel level (direction and tool not required). "
-    "Flag false if the person is on a sidewalk or driveway with no street-parked vehicle immediately beside them, "
-    "or if no vehicle is visible near the person. "
+    "You are a people-detection filter for an overhead street camera. "
+    "Your only job is to confirm whether a person is present immediately next to a vehicle. "
+    "Do not assess what the person is doing, whether they are chalking, or any enforcement activity — "
+    "that is handled by a later stage. "
+    "Flag chalking_detected: true if a person and a nearby vehicle are both visible. "
+    "Flag false only if no person is visible, no nearby vehicle, or the person is clearly inside a vehicle. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
