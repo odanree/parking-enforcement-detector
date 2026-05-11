@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../store';
 import type { PipelineStage, RagNeighbor, RagStage } from '../types';
 
@@ -89,6 +89,90 @@ function NeighborList({ neighbors }: { neighbors: RagNeighbor[] }) {
           <span className="nb-desc">{n.description.slice(0, 60)}…</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function ZoomableImage({ src }: { src: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const zoomRef      = useRef({ scale: 1, tx: 0, ty: 0 });
+  const dragRef      = useRef<{ x: number; y: number } | null>(null);
+  const [xform, setXform] = useState({ scale: 1, tx: 0, ty: 0 });
+
+  // Reset whenever the image changes (prev/next navigation)
+  useEffect(() => {
+    const z = { scale: 1, tx: 0, ty: 0 };
+    zoomRef.current = z;
+    setXform(z);
+  }, [src]);
+
+  // Wheel handler — must be non-passive to call preventDefault
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const rect = el!.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const { scale, tx, ty } = zoomRef.current;
+      const factor   = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const newScale = Math.min(Math.max(scale * factor, 1), 10);
+      if (newScale <= 1) {
+        const z = { scale: 1, tx: 0, ty: 0 };
+        zoomRef.current = z; setXform(z); return;
+      }
+      const ratio = newScale / scale;
+      const z = { scale: newScale, tx: cx - (cx - tx) * ratio, ty: cy - (cy - ty) * ratio };
+      zoomRef.current = z; setXform(z);
+    }
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (zoomRef.current.scale <= 1) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    dragRef.current = { x: e.clientX, y: e.clientY };
+  }, []);
+
+  const onPointerMove = useCallback((e: React.PointerEvent) => {
+    if (!dragRef.current) return;
+    const dx = e.clientX - dragRef.current.x;
+    const dy = e.clientY - dragRef.current.y;
+    dragRef.current = { x: e.clientX, y: e.clientY };
+    const { scale, tx, ty } = zoomRef.current;
+    const z = { scale, tx: tx + dx, ty: ty + dy };
+    zoomRef.current = z; setXform(z);
+  }, []);
+
+  const onPointerUp = useCallback(() => { dragRef.current = null; }, []);
+
+  const onDoubleClick = useCallback(() => {
+    const z = { scale: 1, tx: 0, ty: 0 };
+    zoomRef.current = z; setXform(z);
+  }, []);
+
+  return (
+    <div
+      ref={containerRef}
+      className="kanban-zoom-wrap"
+      style={{ cursor: xform.scale > 1 ? 'grab' : 'zoom-in' }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onDoubleClick={onDoubleClick}
+    >
+      <img
+        src={src}
+        alt=""
+        draggable={false}
+        className="kanban-zoom-img"
+        style={{ transformOrigin: '0 0', transform: `translate(${xform.tx}px,${xform.ty}px) scale(${xform.scale})` }}
+      />
+      {xform.scale > 1 && (
+        <span className="kanban-zoom-hint">double-click to reset</span>
+      )}
     </div>
   );
 }
@@ -221,30 +305,17 @@ function StageDetailModal({ cards: allCards, startIndex, onClose }: { cards: Tra
             {card.outcome === 'chalking' ? '✓ Chalking' : card.outcome === 'people_alert' || card.outcome === 'detected' ? '✓ People Alert' : '✗ Rejected'}
           </span>
           <span className="kanban-modal-time">Cam {card.camera_id} · {timeStr}</span>
-          {total > 1 && (
-            <span className="kanban-modal-group-count">{idx + 1} / {total} grouped</span>
-          )}
         </div>
 
-        {thumbSrc(card) && (
-          <div className="kanban-modal-thumb-wrap">
-            {total > 1 && (
-              <button
-                className="kanban-modal-nav kanban-modal-nav-prev"
-                onClick={() => setIdx((i) => (i - 1 + total) % total)}
-                disabled={total <= 1}
-              >&#8592;</button>
-            )}
-            <img src={thumbSrc(card)!} alt="" className="kanban-modal-thumb" />
-            {total > 1 && (
-              <button
-                className="kanban-modal-nav kanban-modal-nav-next"
-                onClick={() => setIdx((i) => (i + 1) % total)}
-                disabled={total <= 1}
-              >&#8594;</button>
-            )}
+        {total > 1 && (
+          <div className="kanban-modal-nav-row">
+            <button className="kanban-modal-nav-btn" onClick={() => setIdx((i) => (i - 1 + total) % total)}>&#8592;</button>
+            <span className="kanban-modal-nav-count">{idx + 1} / {total}</span>
+            <button className="kanban-modal-nav-btn" onClick={() => setIdx((i) => (i + 1) % total)}>&#8594;</button>
           </div>
         )}
+
+        {thumbSrc(card) && <ZoomableImage src={thumbSrc(card)!} />}
 
         {card.label && (
           <div style={{ marginBottom: 8 }}>
