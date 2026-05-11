@@ -7,21 +7,25 @@ interface AppStore {
   sessions:    Session[];
   pending:     VlmJob[];
   debugItems:  DebugItem[];
-  debugOpen:     boolean;
+  debugOpen:        boolean;
+  comparisonOpen:   boolean;
+  kanbanOpen:       boolean;
   modalEvent:    AppEvent | null;
   wsStatuses:    ('connected' | 'disconnected')[];
   sessionFilter: string | null;
 
-  setStats:         (s: Stats) => void;
-  setEvents:        (evs: AppEvent[]) => void;
-  setSessions:      (sessions: Session[]) => void;
-  setPending:       (jobs: VlmJob[]) => void;
-  setDebugItems:    (items: DebugItem[]) => void;
-  setDebugOpen:     (open: boolean) => void;
-  openModal:        (ev: AppEvent) => void;
-  closeModal:       () => void;
-  setWsStatus:      (cam: number, s: 'connected' | 'disconnected') => void;
-  setSessionFilter: (id: string | null) => void;
+  setStats:            (s: Stats) => void;
+  setEvents:           (evs: AppEvent[]) => void;
+  setSessions:         (sessions: Session[]) => void;
+  setPending:          (jobs: VlmJob[]) => void;
+  setDebugItems:       (items: DebugItem[]) => void;
+  setDebugOpen:        (open: boolean) => void;
+  setComparisonOpen:   (open: boolean) => void;
+  setKanbanOpen:       (open: boolean) => void;
+  openModal:           (ev: AppEvent) => void;
+  closeModal:          () => void;
+  setWsStatus:         (cam: number, s: 'connected' | 'disconnected') => void;
+  setSessionFilter:    (id: string | null) => void;
 }
 
 export const useAppStore = create<AppStore>((set) => ({
@@ -30,21 +34,25 @@ export const useAppStore = create<AppStore>((set) => ({
   sessions:   [],
   pending:    [],
   debugItems: [],
-  debugOpen:     false,
+  debugOpen:        false,
+  comparisonOpen:   false,
+  kanbanOpen:       false,
   modalEvent:    null,
   wsStatuses:    ['disconnected', 'disconnected'],
   sessionFilter: null,
 
-  setStats:         (stats)      => set({ stats }),
-  setEvents:        (events)     => set({ events }),
-  setSessions:      (sessions)   => set({ sessions }),
-  setPending:       (pending)    => set({ pending }),
-  setDebugItems:    (debugItems) => set({ debugItems }),
-  setDebugOpen:     (debugOpen)  => set({ debugOpen }),
-  openModal:        (modalEvent) => set({ modalEvent }),
-  closeModal:       ()           => set({ modalEvent: null }),
-  setSessionFilter: (sessionFilter) => set({ sessionFilter }),
-  setWsStatus:      (cam, s)    => set((state) => {
+  setStats:            (stats)      => set({ stats }),
+  setEvents:           (events)     => set({ events }),
+  setSessions:         (sessions)   => set({ sessions }),
+  setPending:          (pending)    => set({ pending }),
+  setDebugItems:       (debugItems) => set({ debugItems }),
+  setDebugOpen:        (debugOpen)  => set({ debugOpen }),
+  setComparisonOpen:   (comparisonOpen) => set({ comparisonOpen }),
+  setKanbanOpen:       (kanbanOpen)     => set({ kanbanOpen }),
+  openModal:           (modalEvent) => set({ modalEvent }),
+  closeModal:          ()           => set({ modalEvent: null }),
+  setSessionFilter:    (sessionFilter) => set({ sessionFilter }),
+  setWsStatus:         (cam, s)    => set((state) => {
     const next = [...state.wsStatuses] as ('connected' | 'disconnected')[];
     next[cam] = s;
     return { wsStatuses: next };

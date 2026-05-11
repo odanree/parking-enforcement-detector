@@ -95,6 +95,7 @@ export function EventModal() {
   const [alertStatus, setAlertStatus] = useState<{ msg: string; ok: boolean } | null>(null);
   const [alertDisabled, setAlertDisabled] = useState(false);
   const [previewActive, setPreviewActive] = useState(false);
+  const [previewSpeed, setPreviewSpeed]   = useState(4);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Reset state when modal opens a new event
@@ -109,7 +110,7 @@ export function EventModal() {
     if (!previewActive || !ev) return;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const camId = ev.camera_id ?? ev.camera ?? 0;
-    const ws = new WebSocket(`${proto}://${location.host}/ws/playback/preview?timestamp=${ev.timestamp}&camera_id=${camId}`);
+    const ws = new WebSocket(`${proto}://${location.host}/ws/playback/preview?timestamp=${ev.timestamp}&camera_id=${camId}&speed=${previewSpeed}`);
     ws.binaryType = 'blob';
     ws.onmessage = (e) => {
       const url = URL.createObjectURL(e.data as Blob);
@@ -126,7 +127,7 @@ export function EventModal() {
       img.src = url;
     };
     return () => ws.close();
-  }, [previewActive, ev]);
+  }, [previewActive, ev, previewSpeed]);
 
   // Close on Escape
   useEffect(() => {
@@ -195,6 +196,15 @@ export function EventModal() {
                 ? <button className="btn-nvr-play" onClick={() => setPreviewActive(true)}>▶ Play on NVR</button>
                 : <button className="btn-nvr-live" onClick={() => setPreviewActive(false)}>⏹ Stop Preview</button>
               }
+              <div className="nvr-speed-btns">
+                {[1, 2, 4, 8].map((s) => (
+                  <button
+                    key={s}
+                    className={`btn-nvr-speed${previewSpeed === s ? ' active' : ''}`}
+                    onClick={() => { setPreviewSpeed(s); if (previewActive) { setPreviewActive(false); setTimeout(() => setPreviewActive(true), 50); } }}
+                  >{s}×</button>
+                ))}
+              </div>
             </div>
             {(() => {
               const ageMin = (Date.now() / 1000 - ev.timestamp) / 60;

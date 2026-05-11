@@ -1,8 +1,10 @@
-import { Header }      from './components/Header';
-import { VideoPanel }  from './components/VideoPanel/VideoPanel';
-import { SidePanel }   from './components/SidePanel/SidePanel';
-import { EventModal }  from './components/EventModal';
-import { DebugDrawer } from './components/DebugDrawer';
+import { Header }            from './components/Header';
+import { VideoPanel }        from './components/VideoPanel/VideoPanel';
+import { SidePanel }         from './components/SidePanel/SidePanel';
+import { EventModal }        from './components/EventModal';
+import { DebugDrawer }       from './components/DebugDrawer';
+import { ComparisonDrawer }  from './components/ComparisonDrawer';
+import { PipelineKanban }   from './components/PipelineKanban';
 import { useStats }         from './hooks/useStats';
 import { useEvents }        from './hooks/useEvents';
 import { useSessions }      from './hooks/useSessions';
@@ -27,6 +29,8 @@ export default function App() {
         <SidePanel />
       </main>
       <DebugDrawer />
+      <ComparisonDrawer />
+      <PipelineKanban />
       <EventModal />
     </>
   );

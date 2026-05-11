@@ -1,10 +1,12 @@
 import { useAppStore } from '../store';
 
 export function Header() {
-  const stats      = useAppStore((s) => s.stats);
-  const wsStatuses = useAppStore((s) => s.wsStatuses);
-  const debugItems = useAppStore((s) => s.debugItems);
-  const setDebugOpen = useAppStore((s) => s.setDebugOpen);
+  const stats             = useAppStore((s) => s.stats);
+  const wsStatuses        = useAppStore((s) => s.wsStatuses);
+  const debugItems        = useAppStore((s) => s.debugItems);
+  const setDebugOpen      = useAppStore((s) => s.setDebugOpen);
+  const setComparisonOpen = useAppStore((s) => s.setComparisonOpen);
+  const setKanbanOpen     = useAppStore((s) => s.setKanbanOpen);
   const demo = stats?.demo_mode ?? false;
 
   return (
@@ -21,12 +23,20 @@ export function Header() {
           &#x25CF; Cam 1
         </span>
         {!demo && (
-          <button id="btn-debug-open" className="btn-debug-open" onClick={() => setDebugOpen(true)}>
-            Debug
-            {debugItems.length > 0 && (
-              <span className="debug-badge visible">{debugItems.length}</span>
-            )}
-          </button>
+          <>
+            <button className="btn-debug-open" onClick={() => setKanbanOpen(true)}>
+              Pipeline
+            </button>
+            <button className="btn-debug-open" onClick={() => setComparisonOpen(true)}>
+              Comparison
+            </button>
+            <button id="btn-debug-open" className="btn-debug-open" onClick={() => setDebugOpen(true)}>
+              Debug
+              {debugItems.length > 0 && (
+                <span className="debug-badge visible">{debugItems.length}</span>
+              )}
+            </button>
+          </>
         )}
       </div>
     </header>

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../../store';
 import type { AppEvent, Vote } from '../../types';
-import { TYPE_LABELS } from '../../types';
 
 function FrameAnimator({ frames, onClick }: { frames: string[]; onClick: () => void }) {
   const [idx, setIdx] = useState(0);
@@ -96,7 +95,6 @@ function EventItem({ ev }: { ev: AppEvent }) {
   return (
     <li className={`event-item ${ev.event_type}`}>
       <div className="event-header">
-        <span className={`event-type ${ev.event_type}`}>{TYPE_LABELS[ev.event_type] ?? ev.event_type}</span>
         {ev.camera != null && ev.camera > 0 && <span className="event-cam">Cam {ev.camera}</span>}
         {ev.track_id != null && <span className="event-cam" title="Track ID">#{ev.track_id}</span>}
         {session && (
@@ -131,9 +129,10 @@ function EventItem({ ev }: { ev: AppEvent }) {
 }
 
 export function EventLog() {
-  const events          = useAppStore((s) => s.events);
-  const sessions        = useAppStore((s) => s.sessions);
-  const sessionFilter   = useAppStore((s) => s.sessionFilter);
+  const events           = useAppStore((s) => s.events);
+  const setEvents        = useAppStore((s) => s.setEvents);
+  const sessions         = useAppStore((s) => s.sessions);
+  const sessionFilter    = useAppStore((s) => s.sessionFilter);
   const setSessionFilter = useAppStore((s) => s.setSessionFilter);
 
   const displayed = sessionFilter
@@ -142,11 +141,20 @@ export function EventLog() {
 
   const filterSession = sessionFilter ? sessions.find((s) => s.session_id === sessionFilter) : null;
 
+  async function clearAll() {
+    await fetch('/api/events', { method: 'DELETE' });
+    setEvents([]);
+    setSessionFilter(null);
+  }
+
   return (
     <div className="card events-card">
       <h2>
         Event Log{' '}
         <span className="event-count">{displayed.length}</span>
+        {events.length > 0 && (
+          <button className="event-clear-btn" onClick={clearAll} title="Clear all events">Clear</button>
+        )}
       </h2>
       {filterSession && (
         <div className="session-filter-bar">

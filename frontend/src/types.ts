@@ -2,6 +2,36 @@ export type EventType = 'chalking' | 'sweeper' | 'pe_vehicle';
 
 export type Vote = 'up' | 'down' | 'archive' | null;
 
+export interface RagNeighbor {
+  id: string;
+  label: string;        // 'true_positive' | 'false_positive' | ''
+  distance: number;
+  description: string;
+  detected: number;
+}
+
+export interface PipelineStage {
+  detected: boolean;
+  confidence: number;
+  description: string;
+  backend: string;
+}
+
+export interface RagStage {
+  neighbors: RagNeighbor[];
+  labeled_count: number;
+  fp_close: number;
+  tp_close: number;
+  signal: 'fp' | 'tp' | 'none';
+  skipped_confirm: boolean;
+}
+
+export interface PipelineTrace {
+  first_pass: PipelineStage | null;
+  rag: RagStage | null;
+  confirm: PipelineStage | null;
+}
+
 export interface AppEvent {
   timestamp: number;
   event_type: EventType;
@@ -14,6 +44,8 @@ export interface AppEvent {
   vote?: Vote;
   track_id?: number | null;
   session_id?: string | null;
+  rag_neighbors?: RagNeighbor[];
+  pipeline_trace?: PipelineTrace | null;
 }
 
 export interface Stats {
@@ -52,6 +84,9 @@ export interface DebugItem {
   timestamp: number;
   frames?: string[];
   suppressed_by_session?: string | null;
+  rejection_reason?: string | null;
+  rag_neighbors?: RagNeighbor[];
+  pipeline_trace?: PipelineTrace | null;
 }
 
 export type Polygon = [number, number][];

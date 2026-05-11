@@ -50,6 +50,10 @@ export function DebugDrawer() {
     } catch { /* ignore */ }
   }
 
+  const offHoursCount = debugItems.filter((i) => i.rejection_reason === 'out_of_hours').length;
+  const vlmCount      = debugItems.filter((i) => i.rejection_reason !== 'out_of_hours' && !i.suppressed_by_session).length;
+  const suppressedCount = debugItems.filter((i) => !!i.suppressed_by_session).length;
+
   return (
     <>
       <div
@@ -69,29 +73,41 @@ export function DebugDrawer() {
             </button>
           </div>
         </div>
+        {debugItems.length > 0 && (
+          <div className="debug-breakdown">
+            {offHoursCount > 0 && <span className="dbk-offhours">⏰ {offHoursCount} off-hours</span>}
+            {vlmCount > 0      && <span className="dbk-vlm">🔍 {vlmCount} VLM</span>}
+            {suppressedCount > 0 && <span className="dbk-suppressed">⛔ {suppressedCount} suppressed</span>}
+          </div>
+        )}
         <div className="debug-list">
           {debugItems.length === 0
             ? <div className="debug-empty">No rejected frames yet</div>
             : debugItems.map((item, i) => {
-                const pct     = Math.round((item.confidence ?? 0) * 100);
-                const timeStr = new Date(item.timestamp * 1000).toLocaleTimeString([], {
+                const pct          = Math.round((item.confidence ?? 0) * 100);
+                const timeStr      = new Date(item.timestamp * 1000).toLocaleTimeString([], {
                   hour: '2-digit', minute: '2-digit', second: '2-digit',
                 });
                 const isSuppressed = !!item.suppressed_by_session;
+                const isOffHours   = item.rejection_reason === 'out_of_hours';
                 return (
-                  <div key={i} className={`debug-item${isSuppressed ? ' suppressed' : ''}`}>
+                  <div key={i} className={`debug-item${isSuppressed ? ' suppressed' : ''}${isOffHours ? ' off-hours' : ''}`}>
                     <DebugThumb item={item} />
                     <div className="debug-item-meta">
                       <div className="debug-item-header">
                         <span className={`debug-kind ${item.kind}`}>{TYPE_LABELS[item.kind] ?? item.kind}</span>
-                        {isSuppressed
-                          ? <span className="debug-suppressed-badge">⛔ S:{item.suppressed_by_session}</span>
-                          : <span className="debug-conf">{pct}%</span>
+                        {isOffHours
+                          ? <span className="debug-offhours-badge">⏰ Off Hours</span>
+                          : isSuppressed
+                            ? <span className="debug-suppressed-badge">⛔ S:{item.suppressed_by_session}</span>
+                            : <span className="debug-conf">{pct}%</span>
                         }
                         <span className="debug-time">{timeStr}</span>
                       </div>
                       <div className="debug-desc">
-                        {isSuppressed ? 'Suppressed by user downvote' : (item.description || 'No description')}
+                        {isOffHours   ? (item.description || 'Outside PE enforcement window') :
+                         isSuppressed ? 'Suppressed by user downvote' :
+                                        (item.description || 'No description')}
                       </div>
                     </div>
                   </div>
