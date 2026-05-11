@@ -21,8 +21,12 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import base64 as _b64
 import json
 import yaml
+import numpy as _np
+import cv2 as _cv2
+from datetime import datetime as _dt
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,6 +34,44 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 load_dotenv()
+
+
+def _phash(thumbnail_b64: str | None) -> str | None:
+    """8×8 average perceptual hash → 16-char hex string. Returns None on failure."""
+    if not thumbnail_b64:
+        return None
+    try:
+        data = _b64.b64decode(thumbnail_b64)
+        arr  = _np.frombuffer(data, _np.uint8)
+        img  = _cv2.imdecode(arr, _cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        small = _cv2.resize(img, (8, 8), interpolation=_cv2.INTER_AREA).flatten()
+        bits  = small > small.mean()
+        return f'{int("".join("1" if b else "0" for b in bits), 2):016x}'
+    except Exception:
+        return None
+
+
+# ── PE enforcement window (mirrors pipeline.py — used for kanban routing) ─────
+_PE_WINDOW_ENABLED = os.getenv("PE_WINDOW_ENABLED", "false").lower() == "true"
+_PE_WINDOW_START   = int(os.getenv("PE_WINDOW_START", "8"))
+_PE_WINDOW_END     = int(os.getenv("PE_WINDOW_END",   "16"))
+# Playback mode: VIDEO_PATH is set → footage timestamps are historical, skip off-hours gate
+_IS_PLAYBACK       = bool(os.getenv("VIDEO_PATH"))
+
+
+def _is_out_of_hours(ts: float) -> bool:
+    """Return True if the event timestamp falls outside the PE enforcement window.
+
+    Always False in playback mode — footage timestamps are historical and shouldn't
+    be filtered by the live enforcement window.
+    """
+    if _IS_PLAYBACK:
+        return False
+    h = _dt.fromtimestamp(ts).hour
+    return not (_PE_WINDOW_START <= h < _PE_WINDOW_END)
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -321,11 +363,213 @@ async def get_rejected():
     return JSONResponse({"items": items})
 
 
+@app.delete("/api/events")
+async def clear_events():
+    for s in states:
+        s.clear_events()
+    return {"ok": True}
+
+
 @app.delete("/api/debug/rejected")
 async def clear_rejected():
     for s in states:
         s.clear_rejected_vlm()
     return {"ok": True}
+
+
+@app.get("/api/pipeline/trace")
+async def pipeline_trace(
+    limit: int = 500,
+    since: float | None = None,
+    label: str | None = None,
+    camera_id: int | None = None,
+):
+    """Return pipeline trace cards for the kanban view — historical + live.
+
+    Filters (all optional, default = last 7 days + unlabeled):
+      since     — unix timestamp; only events at or after this time
+      label     — '' = unlabeled only, 'true_positive' etc., omit = any
+      camera_id — 0 or 1; omit = both cameras
+    """
+    # ── 1. Vector-store baseline (filtered historical events) ─────────────────
+    stored = vector_store.get_filtered(
+        since_ts=since,
+        limit=limit,
+        label=label,
+        camera_id=camera_id,
+    )
+    stored.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+
+    vs_cards: dict[str, dict] = {}
+    for ev in stored:
+        first_pass = {
+            "detected":    bool(ev.get("detected")),
+            "confidence":  float(ev.get("confidence", 0)),
+            "description": ev.get("description", ""),
+            "backend":     "primary",
+        }
+        confirm = None
+        if ev.get("reeval_backend"):
+            confirm = {
+                "detected":    bool(ev.get("reeval_detected")),
+                "confidence":  float(ev.get("reeval_confidence", 0)),
+                "description": ev.get("reeval_description", ""),
+                "backend":     ev["reeval_backend"],
+            }
+        thumb_file = ev.get("thumb_file", "")
+        ev_ts      = float(ev.get("timestamp", 0))
+        card: dict = {
+            "id":               ev["id"],
+            "source":           "historical",
+            "outcome":          "detected" if ev.get("detected") else "rejected",
+            "timestamp":        ev_ts,
+            "camera_id":        int(ev.get("camera_id", 0)),
+            "confidence":       float(ev.get("confidence", 0)),
+            "description":      ev.get("description", ""),
+            "thumb_url":        f"/dataset/{thumb_file}" if thumb_file else None,
+            "thumbnail":        None,
+            "track_id":         ev.get("track_id"),
+            "rag_neighbors":    [],
+            "rag":              None,
+            "first_pass":       first_pass,
+            "confirm":          confirm,
+            "label":            ev.get("label", ""),
+            "rejection_reason": None,
+        }
+        vs_cards[ev["id"]] = card
+
+    # ── 2. Live in-memory events (post-restart, have full pipeline_trace) ────
+    live_ids: set[str] = set()
+    live_cards: list[dict] = []
+
+    for cam_id, s in enumerate(states):
+        if camera_id is not None and cam_id != camera_id:
+            continue
+        for ev in s.get_events(limit=50):
+            trace = ev.get("pipeline_trace")
+            if trace is None:
+                continue
+            ev_ts = ev["timestamp"]
+            if since is not None and ev_ts < since:
+                continue
+            live_cards.append({
+                "id":               f"live-ev-{ev_ts}-{cam_id}",
+                "source":           "live",
+                "outcome":          "detected",
+                "timestamp":        ev_ts,
+                "camera_id":        cam_id,
+                "confidence":       ev["confidence"],
+                "description":      ev["description"],
+                "thumb_url":        ev.get("snapshot_url"),
+                "thumbnail":        ev["frames"][0] if ev.get("frames") else None,
+                "phash":            _phash(ev["frames"][0] if ev.get("frames") else None),
+                "rag_neighbors":    ev.get("rag_neighbors", []),
+                "track_id":         ev.get("track_id"),
+                "yolo":             trace.get("yolo"),
+                "first_pass":       trace.get("first_pass"),
+                "rag":              trace.get("rag"),
+                "confirm":          trace.get("confirm"),
+                "label":            "",
+                "rejection_reason": None,
+            })
+        for item in s.get_rejected_vlm():
+            item_ts = item["timestamp"]
+            if since is not None and item_ts < since:
+                continue
+            trace = item.get("pipeline_trace")
+            # Use only the explicitly recorded rejection_reason — no retroactive timestamp guessing.
+            rejection_reason = item.get("rejection_reason")
+            thumbnail = item.get("thumbnail") or ""
+            # Include if: has VLM trace, is out-of-hours, or has a snapshot thumbnail
+            if trace is None and rejection_reason != "out_of_hours" and not thumbnail:
+                continue
+            live_cards.append({
+                "id":               f"live-rej-{item_ts}-{cam_id}",
+                "source":           "live",
+                "outcome":          "rejected",
+                "timestamp":        item_ts,
+                "camera_id":        cam_id,
+                "confidence":       item["confidence"],
+                "description":      item["description"],
+                "thumb_url":        None,
+                "thumbnail":        thumbnail or None,
+                "phash":            _phash(thumbnail or None),
+                "rag_neighbors":    item.get("rag_neighbors", []),
+                "track_id":         item.get("track_id"),
+                "yolo":             trace.get("yolo") if trace else None,
+                "first_pass":       trace.get("first_pass") if trace else None,
+                "rag":              trace.get("rag") if trace else None,
+                "confirm":          trace.get("confirm") if trace else None,
+                "label":            "",
+                "rejection_reason": rejection_reason,
+            })
+
+    # ── 3. People-alert cards (two-stage: first-pass positive, pre-confirm) ──────
+    for cam_id, s in enumerate(states):
+        if camera_id is not None and cam_id != camera_id:
+            continue
+        for item in s.get_people_alerts():
+            item_ts = item["timestamp"]
+            if since is not None and item_ts < since:
+                continue
+            trace = item.get("pipeline_trace")
+            live_cards.append({
+                "id":               f"live-pa-{item_ts}-{cam_id}",
+                "source":           "live",
+                "outcome":          "people_alert",
+                "timestamp":        item_ts,
+                "camera_id":        cam_id,
+                "confidence":       item["confidence"],
+                "description":      item["description"],
+                "thumb_url":        None,
+                "thumbnail":        item.get("thumbnail"),
+                "phash":            _phash(item.get("thumbnail")),
+                "rag_neighbors":    item.get("rag_neighbors", []),
+                "track_id":         item.get("track_id"),
+                "yolo":             trace.get("yolo") if trace else None,
+                "first_pass":       trace.get("first_pass") if trace else None,
+                "rag":              trace.get("rag") if trace else None,
+                "confirm":          trace.get("confirm") if trace else None,
+                "label":            "",
+                "rejection_reason": None,
+            })
+
+    # Merge: live cards take priority (have base64 thumbnails); vs_cards fill the rest.
+    # Deduplicate by (camera_id, rounded timestamp) so the live version wins when both exist.
+    live_keys = {(c["camera_id"], round(c["timestamp"])) for c in live_cards}
+    all_cards = list(live_cards)
+    for vc in vs_cards.values():
+        if (vc["camera_id"], round(vc["timestamp"])) not in live_keys:
+            all_cards.append(vc)
+
+    all_cards.sort(key=lambda c: c["timestamp"], reverse=True)
+    return JSONResponse({
+        "cards":      all_cards[:limit],
+        "total":      len(all_cards),
+        "_debug": {
+            "vs_count":   len(vs_cards),
+            "live_count": len(live_cards),
+            "limit":      limit,
+            "since":      since,
+            "label":      label,
+            "camera_id":  camera_id,
+        },
+    })
+
+
+@app.get("/api/pipeline/trace/debug")
+async def pipeline_trace_debug():
+    """Quick diagnostic — returns vector store count and first 3 item IDs."""
+    try:
+        count = vector_store.count()
+        sample = vector_store.get_all(limit=3)["items"]
+        return JSONResponse({
+            "count": count,
+            "sample_ids": [e["id"] for e in sample],
+            "sample_timestamps": [e.get("timestamp") for e in sample],
+        })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/privacy/regions/{cam_id}")
@@ -682,28 +926,58 @@ def _read_preview_frame(cap) -> bytes | None:
 
 
 @app.websocket("/ws/playback/preview")
-async def playback_preview_ws(websocket: WebSocket, timestamp: float, camera_id: int = 0):
-    """Stream NVR playback frames directly to the caller without touching the pipeline."""
+async def playback_preview_ws(websocket: WebSocket, timestamp: float, camera_id: int = 0, speed: int = 1):
+    """Stream NVR playback frames directly to the caller without touching the pipeline.
+
+    Speed is achieved client-side: a background thread drains the NVR stream as fast as
+    the NVR allows; the WS loop skips (speed-1) frames per displayed frame at 25 fps.
+    speedpara is still passed to the NVR URL in case the firmware honours it.
+    """
+    import collections
     from src.stream.rtsp_handler import build_nvr_playback_url
     await websocket.accept()
     base_url = os.getenv("RTSP_URL_2" if camera_id == 1 else "RTSP_URL", "")
     ch_env   = os.getenv("AMCREST_CHANNEL_2" if camera_id == 1 else "AMCREST_CHANNEL")
     nvr_ch   = int(ch_env) if ch_env else None
-    playback_url = build_nvr_playback_url(timestamp, base_url, nvr_channel=nvr_ch)
+    speed    = max(1, min(8, speed))
+    playback_url = build_nvr_playback_url(timestamp, base_url, nvr_channel=nvr_ch, speed=speed)
     loop = asyncio.get_event_loop()
-    cap = await loop.run_in_executor(None, _open_preview_cap, playback_url)
+    cap  = await loop.run_in_executor(None, _open_preview_cap, playback_url)
+
+    # Background thread reads frames as fast as the NVR sends them into a bounded deque.
+    # The display loop then skips (speed-1) frames per send, giving client-side speedup.
+    buf      = collections.deque(maxlen=speed * 12)
+    stop_evt = threading.Event()
+
+    def _fill_buf():
+        while not stop_evt.is_set():
+            fb = _read_preview_frame(cap)
+            if fb is None:
+                break
+            buf.append(fb)
+
+    reader = threading.Thread(target=_fill_buf, daemon=True)
+    reader.start()
+
     try:
         while True:
-            frame_bytes = await loop.run_in_executor(None, _read_preview_frame, cap)
-            if frame_bytes is None:
-                break
-            await websocket.send_bytes(frame_bytes)
+            # Wait for at least one frame
+            if not buf:
+                await asyncio.sleep(0.005)
+                continue
+            # Discard speed-1 frames to advance content faster
+            for _ in range(speed - 1):
+                if buf:
+                    buf.popleft()
+            if buf:
+                await websocket.send_bytes(buf.popleft())
             await asyncio.sleep(1 / 25)
     except WebSocketDisconnect:
         pass
     except Exception:
         logger.exception("Playback preview WS error")
     finally:
+        stop_evt.set()
         await loop.run_in_executor(None, cap.release)
 
 
