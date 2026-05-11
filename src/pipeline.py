@@ -433,6 +433,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                             f"After-hours gate: YOLO {det.confidence:.0%} below 40% threshold",
                                             rejection_reason="out_of_hours",
                                             track_id=det.track_id,
+                                            bbox=list(det.bbox) if det.bbox else None,
                                         )
                                     chalking.on_alert(det.track_id)
                                     continue

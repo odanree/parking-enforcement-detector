@@ -262,6 +262,7 @@ class AppState:
         pipeline_trace: dict | None = None,
         rejection_reason: str | None = None,
         track_id: int | None = None,
+        bbox: list | None = None,
     ) -> None:
         with self._lock:
             self._debug_rejected.appendleft({
@@ -276,6 +277,7 @@ class AppState:
                 "pipeline_trace": pipeline_trace,
                 "rejection_reason": rejection_reason,
                 "track_id": track_id,
+                "bbox": bbox,
             })
 
     def get_rejected_vlm(self) -> list[dict[str, Any]]:

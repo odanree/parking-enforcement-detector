@@ -496,7 +496,11 @@ async def pipeline_trace(
                 "phash":            _phash(thumbnail or None),
                 "rag_neighbors":    item.get("rag_neighbors", []),
                 "track_id":         item.get("track_id"),
-                "yolo":             trace.get("yolo") if trace else None,
+                "yolo":             trace.get("yolo") if trace else {
+                    "confidence": item["confidence"],
+                    "track_id":   item.get("track_id"),
+                    "bbox":       item.get("bbox"),
+                },
                 "first_pass":       trace.get("first_pass") if trace else None,
                 "rag":              trace.get("rag") if trace else None,
                 "confirm":          trace.get("confirm") if trace else None,
