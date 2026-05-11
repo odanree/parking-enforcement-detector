@@ -86,7 +86,7 @@ main {
   bottom: 20px;
   right: 20px;
   z-index: 55;          /* above kanban board (50), below modal overlay (60) */
-  width: 300px;
+  width: 600px;
   flex-direction: column;
   gap: 6px;
   background: var(--surface);
