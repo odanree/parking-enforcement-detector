@@ -242,6 +242,62 @@ main {
   letter-spacing: 0.03em;
 }
 
+/* ── PTZ overlay ─────────────────────────────────────────────────────────── */
+.ptz-overlay {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 10;
+  animation: ptz-fade-in 0.2s ease both;
+}
+
+@keyframes ptz-fade-in {
+  from { opacity: 0; transform: scale(0.9); }
+  to   { opacity: 1; transform: scale(1);   }
+}
+
+.ptz-dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 32px);
+  grid-template-rows:    repeat(3, 32px);
+  gap: 3px;
+}
+
+.ptz-zoom {
+  display: grid;
+  grid-template-columns: repeat(2, 32px);
+  gap: 3px;
+}
+
+.ptz-btn {
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 5px;
+  background: rgba(0,0,0,0.65);
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 0.1s, transform 0.05s;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+.ptz-btn:hover  { background: rgba(40,40,40,0.85); }
+.ptz-btn:active { background: rgba(80,120,200,0.8); transform: scale(0.93); }
+
+.ptz-center { width: 32px; height: 32px; }
+
+.btn-ptz        { font-size: 11px; }
+.btn-ptz.active { background: var(--blue); color: #000; }
+
 /* ── Video toolbar ───────────────────────────────────────────────────────── */
 .video-toolbar {
   display: flex;

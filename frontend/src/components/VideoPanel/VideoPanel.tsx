@@ -4,6 +4,7 @@ import { useVideoStream } from '../../hooks/useVideoStream';
 import { VideoToolbar } from './VideoToolbar';
 import { ZoneOverlay } from './ZoneOverlay';
 import { PrivacyOverlay } from './PrivacyOverlay';
+import { PtzOverlay } from './PtzOverlay';
 
 interface Props { cameraId: number }
 
@@ -20,6 +21,7 @@ export function VideoPanel({ cameraId }: Props) {
 
   const [zoneEditing, setZoneEditing] = useState(false);
   const [privEditing, setPrivEditing] = useState(false);
+  const [ptzActive,   setPtzActive]   = useState(false);
 
   const privacyOn = stats?.privacy_mode ?? false;
   const fps       = Math.round(stats?.fps ?? 0);
@@ -36,14 +38,17 @@ export function VideoPanel({ cameraId }: Props) {
           <div className="no-signal">Waiting for stream&hellip;</div>
         )}
         <div className="fps-badge">{fps} fps</div>
+        {ptzActive && <PtzOverlay cameraId={cameraId} />}
       </div>
 
       <VideoToolbar
         cameraId={cameraId}
         zoneEditing={zoneEditing}
         privEditing={privEditing}
+        ptzActive={ptzActive}
         onEnterZoneEdit={() => setZoneEditing(true)}
         onEnterPrivEdit={() => setPrivEditing(true)}
+        onTogglePtz={() => setPtzActive((v) => !v)}
       />
       <PrivacyOverlay
         canvasRef={privRef}

@@ -656,6 +656,35 @@ async def dataset_list(offset: int = 0, limit: int = 50):
     return JSONResponse(vector_store.get_all(offset=offset, limit=limit))
 
 
+# ── PTZ control ───────────────────────────────────────────────────────────────
+
+class PTZMovePayload(BaseModel):
+    direction: str        # up / down / left / right / up_left / … / zoom_in / zoom_out
+    speed: int = 4        # 1–8
+
+
+class PTZStopPayload(BaseModel):
+    direction: str | None = None
+
+
+@app.post("/api/camera/{camera_id}/ptz/move")
+async def api_ptz_move(camera_id: int, body: PTZMovePayload):
+    from src.stream.ptz import ptz_move
+    ok = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: ptz_move(camera_id, body.direction, body.speed)
+    )
+    return {"ok": ok}
+
+
+@app.post("/api/camera/{camera_id}/ptz/stop")
+async def api_ptz_stop(camera_id: int, body: PTZStopPayload = PTZStopPayload()):
+    from src.stream.ptz import ptz_stop
+    ok = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: ptz_stop(camera_id, body.direction)
+    )
+    return {"ok": ok}
+
+
 class LabelPayload(BaseModel):
     label: str   # "true_positive" | "false_positive" | "true_negative" | "false_negative" | ""
 

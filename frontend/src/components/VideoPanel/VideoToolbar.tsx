@@ -9,11 +9,13 @@ interface Props {
   cameraId:        number;
   zoneEditing:     boolean;
   privEditing:     boolean;
+  ptzActive:       boolean;
   onEnterZoneEdit: () => void;
   onEnterPrivEdit: () => void;
+  onTogglePtz:     () => void;
 }
 
-export function VideoToolbar({ cameraId, zoneEditing, privEditing, onEnterZoneEdit, onEnterPrivEdit }: Props) {
+export function VideoToolbar({ cameraId, zoneEditing, privEditing, ptzActive, onEnterZoneEdit, onEnterPrivEdit, onTogglePtz }: Props) {
   const stats        = useAppStore((s) => s.stats);
   const isLive       = stats?.is_live ?? true;
   const isNvrPlayback = stats?.is_nvr_playback ?? false;
@@ -121,6 +123,13 @@ export function VideoToolbar({ cameraId, zoneEditing, privEditing, onEnterZoneEd
             onClick={zoneEditing ? undefined : onEnterZoneEdit}
           >
             {zoneEditing ? 'Editing…' : 'Edit Zone'}
+          </button>
+          <button
+            className={`btn-ptz${ptzActive ? ' active' : ''}`}
+            onClick={onTogglePtz}
+            title="Toggle PTZ controls"
+          >
+            ✛ PTZ
           </button>
         </div>
       )}
