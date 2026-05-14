@@ -29,7 +29,7 @@ import cv2 as _cv2
 from datetime import datetime as _dt
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -51,6 +51,16 @@ def _phash(thumbnail_b64: str | None) -> str | None:
         return f'{int("".join("1" if b else "0" for b in bits), 2):016x}'
     except Exception:
         return None
+
+
+def _parse_model_evals(raw: str | None) -> list[dict]:
+    """Deserialise the model_evals JSON string stored in ChromaDB metadata."""
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
 
 
 # ── PE enforcement window (mirrors pipeline.py — used for kanban routing) ─────
@@ -155,8 +165,15 @@ async def lifespan(app: FastAPI):
     _ollama_model = os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M")
 
     # Phase-1 (primary) uses the lenient prompt when Ollama is the backend so more
-    # potential positives pass through to Claude for final confirmation.
-    _is_two_stage = bool(_confirm_backend) and _confirm_backend != _vlm_backend
+    # potential positives pass through to the confirm model.
+    # Two-stage is active when confirm backend differs OR when both use ollama but
+    # with different models (e.g. gemma4 → qwen2.5vl).
+    _confirm_ollama_model = os.getenv("CONFIRM_OLLAMA_MODEL", _ollama_model)
+    _same_backend_diff_model = (
+        _confirm_backend == _vlm_backend == "ollama"
+        and _confirm_ollama_model != _ollama_model
+    )
+    _is_two_stage = bool(_confirm_backend) and (_confirm_backend != _vlm_backend or _same_backend_diff_model)
     _primary_vlm = VLMAnalyzer(
         backend=_vlm_backend,
         claude_model=_claude_model,
@@ -170,11 +187,15 @@ async def lifespan(app: FastAPI):
             backend=_confirm_backend,
             claude_model=_claude_model,
             ollama_url=_ollama_url,
-            ollama_model=_ollama_model,
+            ollama_model=_confirm_ollama_model,
         )
-        logger.info("Two-stage VLM: %s (lenient) → %s (strict)", _vlm_backend, _confirm_backend)
+        logger.info(
+            "Two-stage VLM: %s/%s (lenient people-detect) → %s/%s (strict chalking)",
+            _vlm_backend, _ollama_model, _confirm_backend, _confirm_ollama_model,
+        )
     else:
         _confirm_vlm = None
+        logger.info("Single-stage VLM: %s/%s (strict chalking)", _vlm_backend, _ollama_model)
 
     t0 = threading.Thread(
         target=pipeline.run,
@@ -377,6 +398,18 @@ async def clear_rejected():
     return {"ok": True}
 
 
+@app.delete("/api/pipeline/history")
+async def clear_pipeline_history():
+    """Clear in-memory pipeline state (live kanban cards, events deque, alerts).
+
+    Does NOT touch the persistent vector store / dataset — use DELETE /api/dataset
+    for that.  This only clears the live view so the kanban resets to empty.
+    """
+    for s in states:
+        s.clear_all_history()
+    return {"ok": True}
+
+
 @app.get("/api/pipeline/trace")
 async def pipeline_trace(
     limit: int = 500,
@@ -397,16 +430,19 @@ async def pipeline_trace(
         limit=limit,
         label=label,
         camera_id=camera_id,
+        capture_source="chalking",
     )
     stored.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
 
     vs_cards: dict[str, dict] = {}
     for ev in stored:
+        _model_primary = ev.get("model_primary", "") or "primary"
+        _model_confirm = ev.get("model_confirm", "")
         first_pass = {
             "detected":    bool(ev.get("detected")),
             "confidence":  float(ev.get("confidence", 0)),
             "description": ev.get("description", ""),
-            "backend":     "primary",
+            "backend":     _model_primary,
         }
         confirm = None
         if ev.get("reeval_backend"):
@@ -416,8 +452,13 @@ async def pipeline_trace(
                 "description": ev.get("reeval_description", ""),
                 "backend":     ev["reeval_backend"],
             }
-        thumb_file = ev.get("thumb_file", "")
-        ev_ts      = float(ev.get("timestamp", 0))
+        elif _model_confirm:
+            confirm = None  # confirm stage was original pipeline — already captured in first_pass progression
+        thumb_file   = ev.get("thumb_file", "")
+        hires_file   = ev.get("hires_file", "")
+        thumb_phash  = ev.get("thumb_phash") or None
+        ev_ts        = float(ev.get("timestamp", 0))
+        yolo_conf_ev = ev.get("yolo_confidence")
         card: dict = {
             "id":               ev["id"],
             "source":           "historical",
@@ -427,14 +468,22 @@ async def pipeline_trace(
             "confidence":       float(ev.get("confidence", 0)),
             "description":      ev.get("description", ""),
             "thumb_url":        f"/dataset/{thumb_file}" if thumb_file else None,
+            "hires_url":        f"/dataset/{hires_file}" if hires_file else None,
             "thumbnail":        None,
+            "phash":            thumb_phash,
             "track_id":         ev.get("track_id"),
             "rag_neighbors":    [],
             "rag":              None,
+            "yolo":             {"confidence": yolo_conf_ev} if yolo_conf_ev is not None and yolo_conf_ev >= 0 else None,
             "first_pass":       first_pass,
             "confirm":          confirm,
             "label":            ev.get("label", ""),
+            "person_type":      ev.get("person_type", ""),
+            "capture_source":   ev.get("capture_source", "chalking"),
             "rejection_reason": None,
+            "model_primary":    _model_primary,
+            "model_confirm":    _model_confirm,
+            "model_evals":      _parse_model_evals(ev.get("model_evals")),
         }
         vs_cards[ev["id"]] = card
 
@@ -453,7 +502,7 @@ async def pipeline_trace(
             if since is not None and ev_ts < since:
                 continue
             live_cards.append({
-                "id":               f"live-ev-{ev_ts}-{cam_id}",
+                "id":               ev.get("db_id") or f"live-ev-{ev_ts}-{cam_id}",
                 "source":           "live",
                 "outcome":          "detected",
                 "timestamp":        ev_ts,
@@ -480,11 +529,11 @@ async def pipeline_trace(
             # Use only the explicitly recorded rejection_reason — no retroactive timestamp guessing.
             rejection_reason = item.get("rejection_reason")
             thumbnail = item.get("thumbnail") or ""
-            # Include if: has VLM trace, is out-of-hours, or has a snapshot thumbnail
-            if trace is None and rejection_reason != "out_of_hours" and not thumbnail:
+            # Include if: has VLM trace, has a known rejection reason, or has a snapshot thumbnail
+            if trace is None and rejection_reason not in ("out_of_hours", "suppressed") and not thumbnail:
                 continue
             live_cards.append({
-                "id":               f"live-rej-{item_ts}-{cam_id}",
+                "id":               item.get("db_id") or f"live-rej-{item_ts}-{cam_id}",
                 "source":           "live",
                 "outcome":          "rejected",
                 "timestamp":        item_ts,
@@ -492,6 +541,7 @@ async def pipeline_trace(
                 "confidence":       item["confidence"],
                 "description":      item["description"],
                 "thumb_url":        None,
+                "hires_url":        item.get("hires_url"),
                 "thumbnail":        thumbnail or None,
                 "phash":            _phash(thumbnail or None),
                 "rag_neighbors":    item.get("rag_neighbors", []),
@@ -539,11 +589,24 @@ async def pipeline_trace(
             })
 
     # Merge: live cards take priority (have base64 thumbnails); vs_cards fill the rest.
-    # Deduplicate by (camera_id, rounded timestamp) so the live version wins when both exist.
-    live_keys = {(c["camera_id"], round(c["timestamp"])) for c in live_cards}
+    # Deduplicate by (camera_id, rounded timestamp) so the live version wins when both exist,
+    # but backfill vs-only fields (hires_url, model info, person_type) into the live card.
+    vs_by_key: dict[tuple, dict] = {
+        (vc["camera_id"], round(vc["timestamp"])): vc for vc in vs_cards.values()
+    }
+    _VS_BACKFILL = ("hires_url", "model_primary", "model_confirm", "person_type", "model_evals", "capture_source", "label")
+    for lc in live_cards:
+        vc = vs_by_key.get((lc["camera_id"], round(lc["timestamp"])))
+        if vc:
+            lc["id"] = vc["id"]  # promote to real DB id so the live-dot clears
+            for field in _VS_BACKFILL:
+                if lc.get(field) is None and vc.get(field) is not None:
+                    lc[field] = vc[field]
+    live_keys     = {(c["camera_id"], round(c["timestamp"])) for c in live_cards}
+    live_real_ids = {c["id"] for c in live_cards if not c["id"].startswith("live-")}
     all_cards = list(live_cards)
     for vc in vs_cards.values():
-        if (vc["camera_id"], round(vc["timestamp"])) not in live_keys:
+        if (vc["camera_id"], round(vc["timestamp"])) not in live_keys and vc["id"] not in live_real_ids:
             all_cards.append(vc)
 
     all_cards.sort(key=lambda c: c["timestamp"], reverse=True)
@@ -652,8 +715,40 @@ async def go_live():
 # ── Dataset / labeling ────────────────────────────────────────────────────────
 
 @app.get("/api/dataset")
-async def dataset_list(offset: int = 0, limit: int = 50):
-    return JSONResponse(vector_store.get_all(offset=offset, limit=limit))
+async def dataset_list(
+    offset: int = 0,
+    limit: int = 50,
+    label: str | None = None,
+    camera_id: int | None = None,
+    capture_source: str | None = None,
+    detected: int | None = None,
+):
+    result = vector_store.get_filtered(
+        offset=offset,
+        limit=limit,
+        label=label,
+        camera_id=camera_id,
+        capture_source=capture_source,
+        detected=detected,
+    )
+    if isinstance(result, list):
+        return JSONResponse({"total": len(result), "offset": offset, "limit": limit, "items": result})
+    return JSONResponse(result)
+
+
+@app.delete("/api/dataset")
+async def dataset_clear_all():
+    removed = vector_store.clear_all()
+    return {"ok": True, "removed": removed}
+
+
+@app.delete("/api/dataset/{event_id}")
+async def dataset_delete(event_id: str):
+    try:
+        vector_store.delete(event_id)
+        return {"ok": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Event not found")
 
 
 # ── PTZ control ───────────────────────────────────────────────────────────────
@@ -685,12 +780,23 @@ async def api_ptz_stop(camera_id: int, body: PTZStopPayload = PTZStopPayload()):
     return {"ok": ok}
 
 
+@app.post("/api/camera/{camera_id}/ptz/preset/{preset}")
+async def api_ptz_preset(camera_id: int, preset: int):
+    from src.stream.ptz import ptz_preset
+    ok = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: ptz_preset(camera_id, preset)
+    )
+    return {"ok": ok}
+
+
 class LabelPayload(BaseModel):
     label: str   # "true_positive" | "false_positive" | "true_negative" | "false_negative" | ""
 
 
 @app.post("/api/dataset/{event_id}/label")
 async def dataset_label(event_id: str, body: LabelPayload):
+    if event_id.startswith("live-"):
+        raise HTTPException(status_code=422, detail="Card not yet persisted — wait for database index")
     try:
         vector_store.update_label(event_id, body.label)
         return {"ok": True}
@@ -698,6 +804,144 @@ async def dataset_label(event_id: str, body: LabelPayload):
         raise HTTPException(status_code=404, detail="Event not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class PersonTypePayload(BaseModel):
+    person_type: str  # pedestrian | occupant | worker_landscape | worker_delivery | chalker | ""
+
+
+@app.post("/api/dataset/{event_id}/person-type")
+async def dataset_person_type(event_id: str, body: PersonTypePayload):
+    try:
+        vector_store.update_person_type(event_id, body.person_type)
+        return {"ok": True, "person_type": body.person_type}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Event not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/timeline")
+async def api_timeline():
+    """Return lightweight [{t, cam, det, people}] for every stored record, sorted oldest-first.
+
+    det=1    → confirmed chalking
+    people=1 → person detected by first-pass VLM but not confirmed as chalking
+               (model_confirm is set = confirm stage ran = first pass was positive)
+    both=0   → rejected with no person detected
+    """
+    result = vector_store._col.get(include=["metadatas"], limit=100_000)
+    rows = []
+    for meta in (result.get("metadatas") or []):
+        t   = meta.get("timestamp")
+        cam = meta.get("camera_id")
+        det = meta.get("detected")
+        if t is None or cam is None or det is None:
+            continue
+        # person detected if: confirm stage ran (two-stage) OR zone_pedestrian capture
+        people = 1 if (
+            meta.get("model_confirm") or
+            meta.get("capture_source") == "zone_pedestrian"
+        ) else 0
+        yc = meta.get("yolo_confidence", -1.0)
+        rows.append({"t": float(t), "cam": int(cam), "det": int(det), "people": people, "yc": float(yc)})
+    rows.sort(key=lambda r: r["t"])
+    return JSONResponse(rows)
+
+
+class _TimelineAnalyzeRequest(BaseModel):
+    rows: list[dict]
+
+
+@app.post("/api/timeline/analyze")
+async def api_timeline_analyze(req: _TimelineAnalyzeRequest):
+    """Stream a Claude security-expert analysis of the timeline data via SSE."""
+    import anthropic
+
+    rows = req.rows
+    if not rows:
+        return JSONResponse({"error": "No timeline data provided"}, status_code=400)
+
+    # Build a concise statistical summary for the prompt
+    total = len(rows)
+    chalking = sum(1 for r in rows if r.get("det"))
+    people   = sum(1 for r in rows if not r.get("det") and r.get("people"))
+    high_yolo = sum(1 for r in rows if not r.get("det") and r.get("yc", -1) >= 0.70)
+    rejected  = total - chalking - people - high_yolo
+
+    # Time range
+    ts_sorted = sorted(r["t"] for r in rows)
+    from datetime import datetime as _datetime
+    t_start = _datetime.fromtimestamp(ts_sorted[0]).strftime("%Y-%m-%d %H:%M:%S")
+    t_end   = _datetime.fromtimestamp(ts_sorted[-1]).strftime("%Y-%m-%d %H:%M:%S")
+    span_h  = (ts_sorted[-1] - ts_sorted[0]) / 3600
+
+    # Gap detection (>30 min)
+    GAP_MIN = 30 * 60
+    gaps = []
+    for i in range(1, len(ts_sorted)):
+        dur = ts_sorted[i] - ts_sorted[i - 1]
+        if dur > GAP_MIN:
+            gaps.append({
+                "start": _datetime.fromtimestamp(ts_sorted[i - 1]).strftime("%Y-%m-%d %H:%M"),
+                "end":   _datetime.fromtimestamp(ts_sorted[i]).strftime("%Y-%m-%d %H:%M"),
+                "dur_h": round(dur / 3600, 1),
+            })
+
+    # Camera breakdown
+    cams: dict[int, dict] = {}
+    for r in rows:
+        c = int(r.get("cam", 0))
+        bucket = cams.setdefault(c, {"total": 0, "chalking": 0})
+        bucket["total"] += 1
+        if r.get("det"):
+            bucket["chalking"] += 1
+
+    cam_lines = "\n".join(
+        f"  Camera {c}: {v['total']} snapshots, {v['chalking']} chalking events"
+        for c, v in sorted(cams.items())
+    )
+    gap_lines = "\n".join(
+        f"  {g['start']} → {g['end']} ({g['dur_h']}h gap)"
+        for g in gaps
+    ) or "  None detected"
+
+    summary = f"""Timeline data summary:
+- Period: {t_start} to {t_end} ({span_h:.1f} hours)
+- Total snapshots: {total}
+- Confirmed chalking events: {chalking}
+- People detected (VLM positive, no chalking): {people}
+- High-confidence YOLO detections (≥70%, not chalking): {high_yolo}
+- Rejected / no person: {rejected}
+- Cameras:
+{cam_lines}
+- Coverage gaps (>30 min with no snapshots):
+{gap_lines}"""
+
+    system_prompt = (
+        "You are a parking enforcement timeline security expert. "
+        "You analyze snapshot detection data from a dual-camera parking enforcement system "
+        "that uses YOLO object detection and a VLM (Vision Language Model) to identify chalk-marking events. "
+        "Your job is to interpret detection patterns, flag anomalies, estimate system health, "
+        "and surface any operational concerns — such as coverage gaps, unusual detection ratios, "
+        "potential camera issues, or suspicious activity windows. "
+        "Be direct, specific, and concise. Use bullet points. Avoid generic advice."
+    )
+
+    async def stream_response():
+        client = anthropic.Anthropic()
+        with client.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": summary}],
+        ) as stream:
+            for text in stream.text_stream:
+                # SSE format: data: <chunk>\n\n
+                yield f"data: {json.dumps({'text': text})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
 
 
 @app.get("/api/dataset/similar/{event_id}")
@@ -788,6 +1032,109 @@ async def reeval_dataset(background_tasks: BackgroundTasks, ids: list[str] | Non
     return {"queued": len(targets), "backend": backend}
 
 
+class ModelEvalRequest(BaseModel):
+    model_name: str                       # e.g. "qwen2.5vl:7b"
+    backend: str = "ollama"               # "ollama" | "claude"
+    task: str = "detect"                  # "detect" = chalking yes/no | "classify" = person_type
+    ids: list[str] | None = None          # None = all events with frames on disk
+    detected_only: bool = False           # only re-run events primary model flagged
+    person_type_filter: str | None = None # only re-run events with this person_type label
+
+
+_model_eval_progress: dict = {
+    "running": False, "done": 0, "total": 0, "errors": 0, "model": "", "task": "",
+}
+
+
+@app.post("/api/dataset/model-eval")
+async def run_model_eval(body: ModelEvalRequest, background_tasks: BackgroundTasks):
+    """Retroactively score stored events with any named model.
+
+    task="detect"   — asks model "is this chalking?" → stores detected/confidence/description
+    task="classify" — asks model "what type of person?" → stores person_type/confidence/description
+
+    Results are appended to each event's model_evals list (idempotent per model+task key).
+    Poll GET /api/dataset/model-eval/progress for status.
+    """
+    if _model_eval_progress["running"]:
+        raise HTTPException(status_code=409, detail="Model eval already in progress")
+    if body.task not in ("detect", "classify"):
+        raise HTTPException(status_code=400, detail="task must be 'detect' or 'classify'")
+
+    ollama_url   = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    claude_model = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+    eval_vlm = VLMAnalyzer(
+        backend=body.backend,
+        claude_model=claude_model,
+        ollama_url=ollama_url,
+        ollama_model=body.model_name if body.backend == "ollama" else "",
+        # Use lenient detection prompt for detect task; classify_person() overrides prompts itself
+        user_prompt=_LENIENT_USER_PROMPT if body.task == "detect" and body.backend == "ollama" else None,
+        system_prompt=_LENIENT_SYSTEM_PROMPT if body.task == "detect" and body.backend == "ollama" else None,
+    )
+
+    all_items = vector_store.get_all(limit=10_000)["items"]
+    targets = [e for e in all_items if not body.ids or e["id"] in body.ids]
+    if body.detected_only:
+        targets = [e for e in targets if e.get("detected")]
+    if body.person_type_filter is not None:
+        targets = [e for e in targets if e.get("person_type", "") == body.person_type_filter]
+
+    # Key used in model_evals to distinguish detect vs classify runs of the same model
+    eval_key = f"{body.model_name}:{body.task}"
+
+    def _run() -> None:
+        _model_eval_progress.update(
+            running=True, done=0, total=len(targets), errors=0,
+            model=body.model_name, task=body.task,
+        )
+        for ev in targets:
+            frames = vector_store.get_frame_bytes(ev["id"])
+            if not frames:
+                _model_eval_progress["done"] += 1
+                continue
+            try:
+                if body.task == "classify":
+                    result = eval_vlm.classify_person(frames)
+                    vector_store.add_model_eval(
+                        ev["id"],
+                        model_name=eval_key,
+                        backend=body.backend,
+                        detected=int(result.get("person_type", "unknown") not in ("unknown", "")),
+                        confidence=result["confidence"],
+                        description=f'[{result["person_type"]}] {result["description"]}',
+                    )
+                else:
+                    result = eval_vlm.analyze(frames, "chalking")
+                    vector_store.add_model_eval(
+                        ev["id"],
+                        model_name=eval_key,
+                        backend=body.backend,
+                        detected=result["chalking_detected"],
+                        confidence=result["confidence"],
+                        description=result["description"],
+                    )
+            except Exception:
+                logger.exception("model-eval failed for event %s", ev["id"])
+                _model_eval_progress["errors"] += 1
+            _model_eval_progress["done"] += 1
+        _model_eval_progress["running"] = False
+        logger.info(
+            "Model eval %s (%s) complete: %d/%d done, %d errors",
+            body.model_name, body.task,
+            _model_eval_progress["done"], _model_eval_progress["total"], _model_eval_progress["errors"],
+        )
+
+    background_tasks.add_task(_run)
+    return {"queued": len(targets), "model": body.model_name, "backend": body.backend, "task": body.task}
+
+
+@app.get("/api/dataset/model-eval/progress")
+async def model_eval_progress():
+    return JSONResponse(_model_eval_progress)
+
+
 @app.get("/api/dataset/comparison")
 async def comparison_report():
     """Return all events that have a re-eval result alongside the original.
@@ -810,6 +1157,133 @@ async def comparison_report():
         "agreement_rate": round(agreements / total, 3) if total else None,
         "disagreements":  [e for e in compared if not e["agreement"]],
         "agreements":     [e for e in compared if e["agreement"]],
+    })
+
+
+@app.get("/api/pipeline/model-stats")
+async def model_stats():
+    """Per-model performance statistics vs YOLO detections.
+
+    Returns a breakdown per model name showing:
+      - total events processed
+      - detection rate (how often the model confirmed a person/event)
+      - average VLM confidence
+      - label breakdown (TP/FP/TN/FN/unlabeled) when manually labeled
+      - YOLO confidence buckets vs VLM detection rate
+    """
+    all_items = vector_store.get_all(limit=10_000)["items"]
+
+    from collections import defaultdict
+
+    def _model_bucket(items: list[dict]) -> dict:
+        total = len(items)
+        if not total:
+            return {"total": 0}
+        detected  = sum(1 for e in items if e.get("detected"))
+        avg_conf  = sum(float(e.get("confidence", 0)) for e in items) / total
+
+        label_counts: dict[str, int] = defaultdict(int)
+        for e in items:
+            label_counts[e.get("label") or "unlabeled"] += 1
+
+        person_type_counts: dict[str, int] = defaultdict(int)
+        for e in items:
+            person_type_counts[e.get("person_type") or "unlabeled"] += 1
+
+        # Detection rate broken down by human-assigned person_type
+        by_person_type: dict[str, dict] = {}
+        for pt in set(e.get("person_type") or "" for e in items):
+            bucket = [e for e in items if (e.get("person_type") or "") == pt]
+            if not bucket:
+                continue
+            b_det = sum(1 for e in bucket if e.get("detected"))
+            by_person_type[pt or "unlabeled"] = {
+                "total":          len(bucket),
+                "detected":       b_det,
+                "detection_rate": round(b_det / len(bucket), 3),
+                "avg_confidence": round(sum(float(e.get("confidence", 0)) for e in bucket) / len(bucket), 3),
+            }
+
+        # YOLO confidence buckets vs VLM detection rate
+        yolo_buckets: dict[str, dict] = {}
+        for lo, hi, name in [
+            (0.0, 0.30, "<0.30"),
+            (0.30, 0.50, "0.30–0.50"),
+            (0.50, 0.70, "0.50–0.70"),
+            (0.70, 0.90, "0.70–0.90"),
+            (0.90, 1.01, "≥0.90"),
+        ]:
+            bucket = [
+                e for e in items
+                if e.get("yolo_confidence") is not None
+                and float(e["yolo_confidence"]) >= 0
+                and lo <= float(e["yolo_confidence"]) < hi
+            ]
+            if bucket:
+                b_det = sum(1 for e in bucket if e.get("detected"))
+                yolo_buckets[name] = {
+                    "total":          len(bucket),
+                    "detected":       b_det,
+                    "detection_rate": round(b_det / len(bucket), 3),
+                }
+
+        return {
+            "total":           total,
+            "detected":        detected,
+            "detection_rate":  round(detected / total, 3),
+            "avg_confidence":  round(avg_conf, 3),
+            "labels":          dict(label_counts),
+            "person_types":    dict(person_type_counts),
+            "by_person_type":  by_person_type,
+            "yolo_buckets":    yolo_buckets,
+        }
+
+    import json as _json
+
+    by_model: dict[str, list[dict]] = defaultdict(list)
+    for ev in all_items:
+        model = ev.get("model_primary") or "unknown"
+        by_model[model].append(ev)
+
+    by_confirm: dict[str, list[dict]] = defaultdict(list)
+    for ev in all_items:
+        cm = ev.get("model_confirm") or ""
+        if cm:
+            by_confirm[cm].append(ev)
+
+    # Retroactive model evals — build synthetic event dicts so _model_bucket() works
+    by_eval_model: dict[str, list[dict]] = defaultdict(list)
+    for ev in all_items:
+        try:
+            evals = _json.loads(ev.get("model_evals") or "[]")
+        except Exception:
+            evals = []
+        for entry in evals:
+            mn = entry.get("model") or "unknown"
+            by_eval_model[mn].append({
+                "detected":        entry.get("detected", 0),
+                "confidence":      entry.get("confidence", 0.0),
+                "label":           ev.get("label", ""),
+                "person_type":     ev.get("person_type", ""),
+                "yolo_confidence": ev.get("yolo_confidence"),
+            })
+
+    # Dataset composition summary
+    person_type_summary: dict[str, int] = defaultdict(int)
+    capture_source_summary: dict[str, int] = defaultdict(int)
+    for ev in all_items:
+        person_type_summary[ev.get("person_type") or "unlabeled"] += 1
+        capture_source_summary[ev.get("capture_source") or "chalking"] += 1
+
+    return JSONResponse({
+        "total_events":         len(all_items),
+        "dataset_composition":  {
+            "by_person_type":   dict(person_type_summary),
+            "by_capture_source": dict(capture_source_summary),
+        },
+        "primary_models":       {m: _model_bucket(items) for m, items in by_model.items()},
+        "confirm_models":       {m: _model_bucket(items) for m, items in by_confirm.items()},
+        "eval_models":          {m: _model_bucket(items) for m, items in by_eval_model.items()},
     })
 
 
