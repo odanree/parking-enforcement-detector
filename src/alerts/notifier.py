@@ -47,6 +47,7 @@ class Notifier:
         vlm_result: dict,
         frame: np.ndarray,
         bbox: tuple[int, int, int, int] | None = None,
+        yolo_conf: float | None = None,
     ) -> Path | None:
         """Save a snapshot and fire external alert channels.
 
@@ -58,7 +59,7 @@ class Notifier:
         # Always save snapshot for the event log thumbnail
         snapshot_path = None
         if self._cfg.get("save_snapshot", True):
-            snapshot_path = self._save_snapshot(event_type, frame, bbox)
+            snapshot_path = self._save_snapshot(event_type, frame, bbox, yolo_conf=yolo_conf)
 
         # Gate external notifications on confidence + cooldown
         if vlm_result.get("confidence", 0.0) < self._cfg.get("min_confidence", 0.70):
@@ -130,21 +131,19 @@ class Notifier:
         event_type: str,
         frame: np.ndarray,
         bbox: tuple[int, int, int, int] | None,
+        yolo_conf: float | None = None,
     ) -> Path:
         annotated = frame.copy()
         if bbox:
             x1, y1, x2, y2 = bbox
             color = (0, 0, 255) if event_type == "chalking" else (0, 165, 255)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(
-                annotated,
-                event_type.upper(),
-                (x1, max(y1 - 10, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                color,
-                2,
-            )
+            label = f"person {yolo_conf:.2f}" if yolo_conf is not None else event_type.upper()
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), _ = cv2.getTextSize(label, font, 0.7, 2)
+            ty = max(y1 - 6, th + 8)
+            cv2.rectangle(annotated, (x1, ty - th - 8), (x1 + tw + 8, ty + 2), color, -1)
+            cv2.putText(annotated, label, (x1 + 4, ty - 2), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self._snapshot_dir / f"{event_type}_{ts}.jpg"

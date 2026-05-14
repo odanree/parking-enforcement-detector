@@ -23,12 +23,15 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 
 import anthropic
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 # Strict prompt — used by the confirm stage (Claude/Sonnet).
 _USER_PROMPT = (
@@ -100,39 +103,72 @@ _SYSTEM_PROMPT = (
     "Respond with valid JSON only — no markdown, no commentary."
 )
 
-# Lenient prompt — used by the first-pass stage (Ollama).
-# Goal: catch any person who MIGHT be chalking.
-# DO NOT ask the model to classify the environment (street vs driveway vs lot) —
-# the camera angle makes curb-parked vehicles look like lot/driveway vehicles and
-# causes false negatives. Focus only on person + vehicle + wheel-level proximity.
+# First-pass prompt — used by the primary stage.
+# Goal: confirm the YOLO bbox is actually a person, nothing else.
+# No vehicle context, no chalking assessment, no movement patterns.
+# A later confirm stage handles all of that.
 _LENIENT_USER_PROMPT = (
-    'Analyze this street camera image for people near vehicles.\n'
-    'CAMERA NOTE: This is a fixed overhead/angled camera. Do NOT reject based on whether '
-    'the background looks like a street, driveway, or parking lot — all look similar at this angle.\n'
-    'Set chalking_detected: true if ALL of these apply:\n'
-    '  • A person is visible in the frame, AND\n'
-    '  • A vehicle is immediately adjacent to the person (within arm\'s reach).\n'
-    'Set chalking_detected: false ONLY if:\n'
-    '  • No person is visible.\n'
-    '  • No vehicle is visible near the person.\n'
-    '  • The person is clearly inside a vehicle as driver or passenger.\n'
-    '  • The person is far from any vehicle (more than 2–3 metres away).\n'
-    'This is a people-detection pass only — do NOT assess chalk tools, crouching posture, '
-    'or any specific enforcement activity. Simply confirm: is a person present next to a vehicle?\n'
+    'A YOLO object detector flagged a person in this image. '
+    'Confirm whether a human being is clearly visible.\n'
+    'Set chalking_detected: true if a person is present in the frame.\n'
+    'Set chalking_detected: false ONLY if the detection is a false alarm — '
+    'e.g. a shadow, an animal, a mannequin, or no person at all.\n'
+    'Do NOT evaluate vehicles, tools, movement, or anything else — '
+    'that is handled by a later stage.\n'
     'Output only a JSON object with: '
     '{ "chalking_detected": boolean, "sweeper_detected": false, '
-    '"pe_vehicle_detected": false, "confidence": float, "description": string }'
+    '"pe_vehicle_detected": false, "confidence": float, "description": string }\n'
+    'The "description" should be one short sentence describing only whether '
+    'a person is visible (e.g. "Person visible near left edge of frame." or '
+    '"No person detected — appears to be a shadow.").'
 )
 
 _LENIENT_SYSTEM_PROMPT = (
-    "You are a people-detection filter for an overhead street camera. "
-    "Your only job is to confirm whether a person is present immediately next to a vehicle. "
-    "Do not assess what the person is doing, whether they are chalking, or any enforcement activity — "
-    "that is handled by a later stage. "
-    "Flag chalking_detected: true if a person and a nearby vehicle are both visible. "
-    "Flag false only if no person is visible, no nearby vehicle, or the person is clearly inside a vehicle. "
+    "You are a YOLO detection validator for a street camera. "
+    "Your only job: confirm whether the flagged region contains a real human being. "
+    "Ignore vehicles, surroundings, and context entirely. "
+    "Set chalking_detected: true if a person is present, false if it is a false alarm. "
     "Respond with valid JSON only — no markdown, no commentary."
 )
+
+_CLASSIFY_SYSTEM_PROMPT = (
+    "You are a person-type classifier for an overhead street camera. "
+    "Classify the person visible in the image into exactly one of these categories:\n"
+    "  pedestrian      — walking past on the sidewalk or street, no interaction with any vehicle\n"
+    "  occupant        — getting in or out of a parked vehicle, loading/unloading bags or groceries\n"
+    "  worker_landscape — gardener, landscaper, or maintenance worker (mowing, trimming, cleaning)\n"
+    "  worker_delivery — delivery driver carrying packages (UPS, FedEx, USPS, Amazon, food delivery)\n"
+    "  chalker         — parking enforcement officer marking tires or writing a ticket\n"
+    "  unknown         — cannot determine from this image\n"
+    "Respond with valid JSON only — no markdown, no commentary."
+)
+
+_CLASSIFY_USER_PROMPT = (
+    "CAMERA NOTE: This is a fixed overhead/angled street camera. Vehicles may appear from above. "
+    "Classify the person visible in this image.\n"
+    "Consider: posture, carried items, proximity to vehicle, clothing/uniform, direction of movement.\n"
+    "Output only JSON: "
+    '{ "person_type": "<category>", "confidence": <0.0–1.0>, "description": "<one sentence>" }'
+)
+
+_CLASSIFY_FALLBACK = {
+    "person_type": "unknown",
+    "confidence":  0.0,
+    "description": "Classification failed",
+}
+
+
+def _normalize_classify(data: dict) -> dict:
+    valid = {"pedestrian", "occupant", "worker_landscape", "worker_delivery", "chalker", "unknown"}
+    pt = str(data.get("person_type", "unknown")).lower().strip()
+    if pt not in valid:
+        pt = "unknown"
+    return {
+        "person_type": pt,
+        "confidence":  float(data.get("confidence", 0.0)),
+        "description": str(data.get("description", "")),
+    }
+
 
 _MOCK_RESULTS: dict[str, dict] = {
     "chalking": {
@@ -203,6 +239,15 @@ class VLMAnalyzer:
             self._claude = None  # type: ignore[assignment]
             logger.info("VLM backend: Ollama (%s @ %s)", ollama_model, ollama_url)
 
+    @property
+    def model_name(self) -> str:
+        """Specific model identifier (e.g. 'gemma4:e4b', 'claude-sonnet-4-6', 'mock')."""
+        if self._backend == "claude":
+            return self._claude_model
+        if self._backend == "mock":
+            return "mock"
+        return self._ollama_model
+
     def set_prompts(self, user_prompt: str | None = None, system_prompt: str | None = None) -> None:
         if user_prompt is not None:
             self._user_prompt = user_prompt
@@ -214,6 +259,23 @@ class VLMAnalyzer:
         return {"user_prompt": self._user_prompt, "system_prompt": self._system_prompt}
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def classify_person(self, image_bytes: bytes | list[bytes]) -> dict:
+        """Classify the person in the image into a person_type category.
+
+        Returns: { person_type, confidence, description }
+        person_type one of: pedestrian, occupant, worker_landscape, worker_delivery, chalker, unknown
+        """
+        if self._backend == "mock":
+            return {"person_type": "pedestrian", "confidence": 0.9, "description": "Mock classification."}
+        frames = image_bytes if isinstance(image_bytes, list) else [image_bytes]
+        try:
+            raw_text = self._raw_response(frames, _CLASSIFY_SYSTEM_PROMPT, _CLASSIFY_USER_PROMPT)
+            parsed   = _parse_json_raw(raw_text)
+            return _normalize_classify(parsed)
+        except Exception:
+            logger.exception("classify_person error")
+            return _CLASSIFY_FALLBACK.copy()
 
     def analyze(self, image_bytes: bytes | list[bytes], kind: str = "") -> dict:
         """Send one or more JPEG frames to the VLM and return the parsed JSON result.
@@ -228,11 +290,66 @@ class VLMAnalyzer:
             if self._backend == "claude":
                 return self._analyze_claude(frames)
             return self._analyze_ollama(frames)
-        except Exception:
-            logger.exception("VLM analysis error")
-            return _FALLBACK.copy()
+        except httpx.TimeoutException:
+            logger.warning("VLM timeout (%s): took >60 s", self.model_name)
+            fb = _FALLBACK.copy()
+            fb["description"] = f"VLM timeout — {self.model_name} took >60 s"
+            return fb
+        except httpx.ConnectError:
+            logger.warning("VLM unreachable (%s @ %s)", self.model_name, self._ollama_url)
+            fb = _FALLBACK.copy()
+            fb["description"] = f"VLM unreachable — {self._ollama_url}"
+            return fb
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                logger.warning("VLM model not found — run: ollama pull %s", self._ollama_model)
+                fb = _FALLBACK.copy()
+                fb["description"] = f"Model not found — run: ollama pull {self._ollama_model}"
+                return fb
+            logger.exception("VLM HTTP error (%s)", self.model_name)
+            fb = _FALLBACK.copy()
+            fb["description"] = f"VLM HTTP {exc.response.status_code} — {self.model_name}"
+            return fb
+        except Exception as exc:
+            logger.exception("VLM analysis error (%s)", self.model_name)
+            fb = _FALLBACK.copy()
+            fb["description"] = f"VLM error — {type(exc).__name__}: {exc}"
+            return fb
 
     # ── Backends ──────────────────────────────────────────────────────────────
+
+    def _raw_response(self, frames: list[bytes], system_prompt: str, user_prompt: str) -> str:
+        """Call the backend with custom prompts and return the raw text response."""
+        if self._backend == "claude":
+            content: list[dict] = []
+            for fb in frames:
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64.standard_b64encode(fb).decode(),
+                    },
+                })
+            content.append({"type": "text", "text": user_prompt})
+            response = self._claude.messages.create(
+                model=self._claude_model,
+                max_tokens=512,
+                system=system_prompt,
+                messages=[{"role": "user", "content": content}],
+            )
+            return response.content[0].text
+        else:
+            payload = {
+                "model":   self._ollama_model,
+                "prompt":  f"{system_prompt}\n\n{user_prompt}",
+                "images":  [base64.standard_b64encode(fb).decode() for fb in frames],
+                "stream":  False,
+                "options": {"temperature": 0.0, "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "4096"))},
+            }
+            resp = httpx.post(f"{self._ollama_url}/api/generate", json=payload, timeout=_OLLAMA_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json().get("response", "")
 
     def _analyze_claude(self, frames: list[bytes]) -> dict:
         content: list[dict] = []
@@ -290,7 +407,7 @@ class VLMAnalyzer:
             "prompt": f"{self._system_prompt}\n\n{self._user_prompt}",
             "images": [base64.standard_b64encode(fb).decode() for fb in frames],
             "stream": False,
-            "options": {"temperature": 0.0},
+            "options": {"temperature": 0.0, "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "4096"))},
         }
         logger.debug("Ollama request: %d frame(s)", len(frames))
 
@@ -305,6 +422,40 @@ class VLMAnalyzer:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_json_raw(text: str) -> dict:
+    """Parse JSON from LLM response without any schema normalization."""
+    text = re.sub(r"```(?:json)?", "", text).strip("`").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.rfind("{")
+    if start != -1:
+        depth, end = 0, -1
+        in_str, escape = False, False
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False; continue
+            if ch == "\\" and in_str:
+                escape = True; continue
+            if ch == '"':
+                in_str = not in_str; continue
+            if in_str:
+                continue
+            if ch == "{": depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1; break
+        if end != -1:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+    logger.warning("Could not parse raw VLM JSON: %r", text[:200])
+    return {}
+
 
 def _parse_json(text: str) -> dict:
     """Extract and parse the JSON object from an LLM response.

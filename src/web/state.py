@@ -56,6 +56,7 @@ class Event:
     session_id: Optional[str] = None
     rag_neighbors: list = field(default_factory=list)   # in-memory only, not persisted
     pipeline_trace: Optional[dict] = None               # in-memory only, not persisted
+    db_id: Optional[str] = None                         # set after vector_store.add() returns
 
 
 _LOGS_DIR = Path("logs")
@@ -263,6 +264,7 @@ class AppState:
         rejection_reason: str | None = None,
         track_id: int | None = None,
         bbox: list | None = None,
+        timestamp: float | None = None,
     ) -> None:
         with self._lock:
             self._debug_rejected.appendleft({
@@ -270,7 +272,7 @@ class AppState:
                 "thumbnail": thumbnail_b64,
                 "confidence": confidence,
                 "description": description,
-                "timestamp": time.time(),
+                "timestamp": timestamp if timestamp is not None else time.time(),
                 "frames": frames or [],
                 "suppressed_by_session": suppressed_by_session,
                 "rag_neighbors": rag_neighbors or [],
@@ -280,6 +282,14 @@ class AppState:
                 "bbox": bbox,
             })
 
+    def update_rejected_hires(self, kind: str, track_id: int, hires_url: str) -> None:
+        """Back-fill hires_url on the in-memory rejected event after vector_store saves it."""
+        with self._lock:
+            for item in self._debug_rejected:
+                if item.get("kind") == kind and item.get("track_id") == track_id and not item.get("hires_url"):
+                    item["hires_url"] = hires_url
+                    return
+
     def get_rejected_vlm(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._debug_rejected)
@@ -287,6 +297,8 @@ class AppState:
     def clear_rejected_vlm(self) -> None:
         with self._lock:
             self._debug_rejected.clear()
+
+    _PEOPLE_ALERT_DEDUP_SECS = 120  # suppress duplicate track within 2 min
 
     def record_people_alert(
         self,
@@ -299,12 +311,18 @@ class AppState:
         pipeline_trace: dict | None = None,
         thumbnail: str | None = None,
     ) -> None:
+        ts = timestamp if timestamp is not None else time.time()
         with self._lock:
+            if track_id is not None:
+                for existing in self._people_alerts:
+                    if (existing.get("track_id") == track_id
+                            and abs(ts - existing["timestamp"]) < self._PEOPLE_ALERT_DEDUP_SECS):
+                        return  # already recorded this track recently
             self._people_alerts.appendleft({
                 "confidence":    confidence,
                 "description":   description,
                 "frames":        frames or [],
-                "timestamp":     timestamp if timestamp is not None else time.time(),
+                "timestamp":     ts,
                 "track_id":      track_id,
                 "rag_neighbors": rag_neighbors or [],
                 "pipeline_trace": pipeline_trace,
@@ -567,6 +585,23 @@ class AppState:
         with self._lock:
             return {"calls": self._vlm_calls, "cost_usd": round(self._vlm_cost_usd, 5)}
 
+    def patch_event_db_id(self, track_id: int, db_id: str) -> None:
+        """Back-fill the vector-store ID onto the in-memory detected event so the
+        kanban can promote its live-ev-* card to a real ID without timestamp matching."""
+        with self._lock:
+            for ev in self.events:
+                if ev.track_id == track_id and ev.db_id is None:
+                    ev.db_id = db_id
+                    return
+
+    def patch_rejected_db_id(self, track_id: int, db_id: str) -> None:
+        """Same as patch_event_db_id but for the _debug_rejected deque."""
+        with self._lock:
+            for item in self._debug_rejected:
+                if item.get("track_id") == track_id and not item.get("db_id"):
+                    item["db_id"] = db_id
+                    return
+
     def get_events(self, limit: int = 30) -> list[dict]:
         with self._lock:
             return [
@@ -583,6 +618,7 @@ class AppState:
                     "camera_id": self.camera_id,
                     "rag_neighbors": e.rag_neighbors,
                     "pipeline_trace": e.pipeline_trace,
+                    "db_id": e.db_id,
                 }
                 for e in list(self.events)[:limit]
             ]
@@ -595,6 +631,22 @@ class AppState:
             self._total_sweeper  = 0
             self._last_chalking  = None
             self._last_sweeper   = None
+
+    def clear_all_history(self) -> None:
+        """Wipe in-memory deques and truncate the JSONL events log."""
+        with self._lock:
+            self.events.clear()
+            self._debug_rejected.clear()
+            self._people_alerts.clear()
+            self._total_chalking = 0
+            self._total_sweeper  = 0
+            self._last_chalking  = None
+            self._last_sweeper   = None
+        try:
+            if self._events_file.exists():
+                self._events_file.write_text("", encoding="utf-8")
+        except Exception:
+            pass
 
 
 # Anthropic pricing per million tokens (as of 2025)

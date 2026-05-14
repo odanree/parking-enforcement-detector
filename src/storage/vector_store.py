@@ -18,10 +18,13 @@ import uuid
 from pathlib import Path
 
 import chromadb
+import numpy as np
+import cv2
 
 logger = logging.getLogger(__name__)
 
 _LABELS = {"true_positive", "false_positive", "true_negative", "false_negative"}
+PERSON_TYPES = {"pedestrian", "occupant", "worker_landscape", "worker_delivery", "chalker", ""}
 
 
 def _try_default_ef():
@@ -70,30 +73,49 @@ class EventVectorStore:
         camera_id: int,
         thumbnail_b64: str = "",
         frames_b64: list[str] | None = None,
+        model_primary: str = "",
+        model_confirm: str = "",
+        yolo_confidence: float | None = None,
+        person_type: str = "",
+        capture_source: str = "chalking",
+        hires_b64: str = "",
+        timestamp: float | None = None,
     ) -> str:
         thumb_hash = _hash_b64(thumbnail_b64) if thumbnail_b64 else ""
         if thumb_hash and thumb_hash in self._thumb_hashes:
-            logger.debug("Skipping duplicate frame (hash %s)", thumb_hash)
+            logger.warning("Skipping duplicate frame (hash %s, source=%s)", thumb_hash, capture_source)
             return ""
 
-        event_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        ts = timestamp if timestamp is not None else time.time()
+        event_id = f"{int(ts * 1000)}_{uuid.uuid4().hex[:6]}"
 
         thumb_file = self._save_image(event_id, thumbnail_b64, "thumb") if thumbnail_b64 else ""
+        hires_file = self._save_image(event_id, hires_b64, "hires") if hires_b64 else ""
+        logger.info("vector_store.add: source=%s hires=%s thumb=%s", capture_source, bool(hires_file), bool(thumb_file))
         frame_files: list[str] = []
         for i, f in enumerate(frames_b64 or []):
             fname = self._save_image(event_id, f, f"f{i}")
             if fname:
                 frame_files.append(fname)
 
+        thumb_phash = _phash_b64(thumbnail_b64) if thumbnail_b64 else ""
         metadata: dict = {
-            "detected":    int(detected),
-            "confidence":  float(confidence),
-            "camera_id":   int(camera_id),
-            "timestamp":   float(time.time()),
-            "label":       "",
-            "thumb_file":  thumb_file,
-            "frame_files": ",".join(frame_files),
-            "thumb_hash":  thumb_hash,
+            "detected":        int(detected),
+            "confidence":      float(confidence),
+            "camera_id":       int(camera_id),
+            "timestamp":       float(ts),
+            "label":           "",
+            "person_type":     person_type,
+            "capture_source":  capture_source,
+            "thumb_file":      thumb_file,
+            "hires_file":      hires_file,
+            "frame_files":     ",".join(frame_files),
+            "thumb_hash":      thumb_hash,
+            "thumb_phash":     thumb_phash,
+            "model_primary":   model_primary,
+            "model_confirm":   model_confirm,
+            "yolo_confidence": float(yolo_confidence) if yolo_confidence is not None else -1.0,
+            "model_evals":     "",
         }
         try:
             self._col.add(
@@ -117,20 +139,55 @@ class EventVectorStore:
         meta["label"] = label
         self._col.update(ids=[event_id], metadatas=[meta])
 
+    def update_person_type(self, event_id: str, person_type: str) -> None:
+        if person_type not in PERSON_TYPES:
+            raise ValueError(f"person_type must be one of {PERSON_TYPES}")
+        existing = self._col.get(ids=[event_id], include=["metadatas"])
+        if not existing["ids"]:
+            raise KeyError(event_id)
+        meta = existing["metadatas"][0]
+        meta["person_type"] = person_type
+        self._col.update(ids=[event_id], metadatas=[meta])
+
     # ── Read ──────────────────────────────────────────────────────────────────
+
+    def delete(self, event_id: str) -> None:
+        """Remove an event from the collection and delete its image files."""
+        existing = self._col.get(ids=[event_id], include=["metadatas"])
+        if not existing["ids"]:
+            raise KeyError(event_id)
+        meta = existing["metadatas"][0]
+        for key in ("thumb_file", "hires_file"):
+            fname = meta.get(key, "")
+            if fname:
+                (self._dataset / fname).unlink(missing_ok=True)
+        for fname in meta.get("frame_files", "").split(","):
+            if fname:
+                (self._dataset / fname).unlink(missing_ok=True)
+        self._col.delete(ids=[event_id])
+        self._thumb_hashes.discard(meta.get("thumb_hash", ""))
 
     def get_filtered(
         self,
         since_ts: float | None = None,
         limit: int = 500,
+        offset: int = 0,
         label: str | None = None,
         camera_id: int | None = None,
-    ) -> list[dict]:
+        capture_source: str | None = None,
+        detected: int | None = None,
+    ) -> list[dict] | dict:
         """Fetch events with optional server-side filters.
 
-        since_ts  — only return events with timestamp >= this value
-        label     — '' = unlabeled, 'true_positive' etc., None = any label
-        camera_id — filter to a specific camera, None = all cameras
+        since_ts       — only return events with timestamp >= this value
+        label          — '' = unlabeled, 'true_positive' etc., None = any label
+        camera_id      — filter to a specific camera, None = all cameras
+        capture_source — 'chalking', 'zone_pedestrian', None = all
+        detected       — 1 = detections only, 0 = rejections only, None = all
+
+        When offset is non-zero or paginated results are needed, returns a
+        dict {total, offset, limit, items}.  Otherwise returns list[dict] for
+        backward compatibility with the kanban endpoint.
         """
         conditions: list[dict] = []
         if since_ts is not None:
@@ -139,6 +196,10 @@ class EventVectorStore:
             conditions.append({"label": {"$eq": label}})
         if camera_id is not None:
             conditions.append({"camera_id": {"$eq": camera_id}})
+        if capture_source is not None:
+            conditions.append({"capture_source": {"$eq": capture_source}})
+        if detected is not None:
+            conditions.append({"detected": {"$eq": detected}})
 
         where: dict | None = None
         if len(conditions) == 1:
@@ -146,11 +207,41 @@ class EventVectorStore:
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        kwargs: dict = {"include": ["documents", "metadatas"], "limit": limit}
-        if where:
-            kwargs["where"] = where
+        # Paginated path — return dict with total
+        if offset > 0 or limit <= 200:
+            try:
+                count_kw: dict = {"include": ["metadatas"], "limit": 100_000}
+                if where:
+                    count_kw["where"] = where
+                count_result = self._col.get(**count_kw)
+                total = len(count_result["ids"])
+            except Exception:
+                total = self._col.count()
+            kwargs: dict = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            try:
+                result = self._col.get(**kwargs)
+            except Exception:
+                logger.exception("get_filtered paginated failed")
+                result = {"ids": [], "documents": [], "metadatas": []}
+            return {"total": total, "offset": offset, "limit": limit, "items": self._flatten(result)}
+
+        # Legacy path (kanban) — return plain list.
+        # ChromaDB get() has no ORDER BY so a bare limit=500 returns arbitrary
+        # records, not the most recent 500.  Fetch all matching IDs first (cheap —
+        # metadata only), sort them chronologically (IDs are "{ms_ts}_{uuid}"),
+        # then retrieve only the most recent `limit` documents.
         try:
-            result = self._col.get(**kwargs)
+            id_kw: dict = {"include": [], "limit": 100_000}
+            if where:
+                id_kw["where"] = where
+            id_result = self._col.get(**id_kw)
+            all_ids = sorted(id_result.get("ids", []))          # lexicographic = chronological
+            recent_ids = all_ids[-limit:] if len(all_ids) > limit else all_ids
+            if not recent_ids:
+                return []
+            result = self._col.get(ids=recent_ids, include=["documents", "metadatas"])
         except Exception:
             logger.exception("get_filtered failed — falling back to get_all")
             result = self._col.get(include=["documents", "metadatas"], limit=limit)
@@ -255,6 +346,101 @@ class EventVectorStore:
         meta["reeval_description"] = description
         self._col.update(ids=[event_id], metadatas=[meta])
 
+    def add_model_eval(
+        self,
+        event_id: str,
+        model_name: str,
+        backend: str,
+        detected: bool,
+        confidence: float,
+        description: str,
+    ) -> None:
+        """Append a named model evaluation result to an event's model_evals list.
+
+        Idempotent per model — re-running the same model overwrites its entry.
+        """
+        import json as _json
+        existing = self._col.get(ids=[event_id], include=["metadatas"])
+        if not existing["ids"]:
+            raise KeyError(event_id)
+        meta = existing["metadatas"][0]
+        try:
+            evals: list[dict] = _json.loads(meta.get("model_evals") or "[]")
+        except Exception:
+            evals = []
+        # Overwrite existing entry for this model
+        evals = [e for e in evals if e.get("model") != model_name]
+        evals.append({
+            "model":       model_name,
+            "backend":     backend,
+            "detected":    int(detected),
+            "confidence":  round(float(confidence), 4),
+            "description": description,
+            "ts":          float(time.time()),
+        })
+        meta["model_evals"] = _json.dumps(evals)
+        self._col.update(ids=[event_id], metadatas=[meta])
+
+    def clear_pipeline_events(self) -> int:
+        """Delete only pipeline detection events (capture_source='chalking').
+
+        Preserves zone_pedestrian captures and any manually labeled dataset records
+        so the training dataset survives a kanban history clear.
+        Returns the number of records removed.
+        """
+        all_result = self._col.get(include=["metadatas"], limit=100_000)
+        to_delete: list[str] = []
+        files_to_remove: list[str] = []
+
+        for eid, meta in zip(all_result["ids"], all_result["metadatas"]):
+            # Treat missing/empty capture_source as "chalking" (pre-feature events)
+            src = meta.get("capture_source") or "chalking"
+            if src == "chalking":
+                to_delete.append(eid)
+                for fkey in ("thumb_file", "hires_file"):
+                    if meta.get(fkey):
+                        files_to_remove.append(meta[fkey])
+                for f in (meta.get("frame_files") or "").split(","):
+                    if f:
+                        files_to_remove.append(f)
+                if meta.get("thumb_hash"):
+                    self._thumb_hashes.discard(meta["thumb_hash"])
+
+        if to_delete:
+            self._col.delete(ids=to_delete)
+
+        removed_files = 0
+        for fname in files_to_remove:
+            try:
+                (self._dataset / fname).unlink(missing_ok=True)
+                removed_files += 1
+            except Exception:
+                pass
+
+        logger.info(
+            "Pipeline history cleared: %d events, %d files removed (%d dataset events preserved)",
+            len(to_delete), removed_files, self._col.count(),
+        )
+        return len(to_delete)
+
+    def clear_all(self) -> int:
+        """Delete every event from the collection and all dataset images. Returns count removed."""
+        count = self._col.count()
+        if count:
+            all_ids = self._col.get(include=[], limit=100_000)["ids"]
+            if all_ids:
+                self._col.delete(ids=all_ids)
+        self._thumb_hashes.clear()
+        removed_files = 0
+        for f in self._dataset.iterdir():
+            try:
+                f.unlink()
+                removed_files += 1
+            except Exception:
+                pass
+        logger.info("Vector store cleared: %d events, %d dataset files removed", count, removed_files)
+        return count
+
     def count(self) -> int:
         return self._col.count()
 
@@ -285,7 +471,7 @@ class EventVectorStore:
             (self._dataset / filename).write_bytes(base64.b64decode(b64))
             return filename
         except Exception:
-            logger.debug("Could not save image %s", filename)
+            logger.warning("Could not save image %s", filename, exc_info=True)
             return ""
 
     @staticmethod
@@ -302,5 +488,20 @@ def _hash_b64(b64: str) -> str:
     """MD5 of the raw image bytes (decoded from base64). Used for frame dedup."""
     try:
         return hashlib.md5(base64.b64decode(b64)).hexdigest()
+    except Exception:
+        return ""
+
+
+def _phash_b64(b64: str) -> str:
+    """8×8 average perceptual hash → 16-char hex. Used for visual grouping."""
+    try:
+        data  = base64.b64decode(b64)
+        arr   = np.frombuffer(data, np.uint8)
+        img   = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return ""
+        small = cv2.resize(img, (8, 8), interpolation=cv2.INTER_AREA).flatten()
+        bits  = small > small.mean()
+        return f'{int("".join("1" if b else "0" for b in bits), 2):016x}'
     except Exception:
         return ""

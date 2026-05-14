@@ -29,6 +29,7 @@ from src.detection.object_detector import Detection, ObjectDetector
 from src.detection.zone_filter import ZoneFilter
 from src.stream.frame_undistorter import FrameUndistorter
 from src.stream.osd_timestamp import extract_osd_timestamp
+from src.stream.hires_snapshot import fetch_hires_jpeg
 from src.stream.rtsp_handler import RTSPHandler
 from src.stream.video_file_handler import VideoFileHandler
 from src.vlm.analyzer import VLMAnalyzer
@@ -47,7 +48,10 @@ _IS_PLAYBACK       = bool(os.getenv("VIDEO_PATH"))
 def _in_pe_window(ts: float | None = None) -> bool:
     """True if ts (unix) falls within the PE enforcement window.
     Falls back to datetime.now() when ts is None (live RTSP or unknown source).
+    Returns True always when PE_WINDOW_ENABLED=false.
     """
+    if not _PE_WINDOW_ENABLED:
+        return True
     h = datetime.fromtimestamp(ts).hour if ts is not None else datetime.now().hour
     return _PE_WINDOW_START <= h < _PE_WINDOW_END
 
@@ -161,6 +165,12 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
         buffer_sample_every_n=chalk_cfg.get("buffer_sample_every_n", 5),
     )
 
+    # Track when we last stored a zone-pedestrian snapshot per track_id.
+    # Throttle to one capture per 30 seconds per track so we don't flood the DB
+    # with identical frames of the same person walking by.
+    _ZONE_PED_INTERVAL = 30.0  # seconds between captures for the same track
+    _zone_ped_last_seen: dict[int, float] = {}
+
     if vlm is None:
         vlm = VLMAnalyzer(
             backend=os.getenv("VLM_BACKEND", "claude"),
@@ -174,14 +184,20 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     # before an alert fires. Negatives skip the second stage entirely (zero API cost).
     if confirm_vlm is None:
         _confirm_backend = os.getenv("CONFIRM_BACKEND", "")
-        if _confirm_backend and _confirm_backend != os.getenv("VLM_BACKEND", "claude"):
+        _primary_model   = os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M")
+        _confirm_model   = os.getenv("CONFIRM_OLLAMA_MODEL", _primary_model)
+        _same_backend_diff_model = (
+            _confirm_backend == os.getenv("VLM_BACKEND", "claude") == "ollama"
+            and _confirm_model != _primary_model
+        )
+        if _confirm_backend and (_confirm_backend != os.getenv("VLM_BACKEND", "claude") or _same_backend_diff_model):
             confirm_vlm = VLMAnalyzer(
                 backend=_confirm_backend,
                 claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
                 ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
-                ollama_model=os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M"),
+                ollama_model=_confirm_model,
             )
-            logger.info("Two-stage VLM: %s → %s (on positive)", os.getenv("VLM_BACKEND"), _confirm_backend)
+            logger.info("Two-stage VLM: %s(%s) → %s(%s)", os.getenv("VLM_BACKEND"), os.getenv("OLLAMA_MODEL"), _confirm_backend, _confirm_model)
 
     ha_base = os.getenv("HA_WEBHOOK_URL", "").rsplit("/api/", 1)[0]
     notifier = Notifier(
@@ -245,6 +261,10 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             # Normalize to detection resolution so bbox coords match the
             # annotated frame. NVR footage is often higher-res than 1280×720.
             fh, fw = frame.shape[:2]
+            # Keep a clean pre-resize copy for use as the hi-res VLM/dataset image.
+            # This is the camera's native RTSP resolution — higher quality than the
+            # NVR snapshot.cgi API which often returns a downscaled version.
+            _raw_frame = frame if (fw, fh) == (_det_w, _det_h) else frame.copy()
             if (fw, fh) != (_det_w, _det_h):
                 frame = cv2.resize(frame, (_det_w, _det_h))
 
@@ -280,6 +300,15 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 ]
                 all_dets = all_dets + motion_dets
 
+            # Suppress detections whose centre falls inside a privacy region
+            if state and state.privacy_mode and state.privacy_regions:
+                def _in_privacy(bbox: tuple) -> bool:
+                    cx = (bbox[0] + bbox[2]) / 2
+                    cy = (bbox[1] + bbox[3]) / 2
+                    return any(x1 <= cx <= x2 and y1 <= cy <= y2
+                               for x1, y1, x2, y2 in state.privacy_regions)
+                all_dets = [d for d in all_dets if not _in_privacy(d.bbox)]
+
             zone_dets = zone_filter.filter(all_dets, "street_zone")
             # Wall time of this frame: NVR timestamp for video files, None for live RTSP
             # (None causes _in_pe_window to fall back to datetime.now())
@@ -295,6 +324,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 detail_b64 = job[6] if len(job) > 6 else []
                 snap_ts    = job[7] if len(job) > 7 else None
                 yolo_conf  = job[8] if len(job) > 8 else None
+                hires_b64  = job[9] if len(job) > 9 else ""
                 if not fut.done():
                     continue
                 del _vlm_jobs[job_key]
@@ -321,20 +351,22 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                     state.complete_pending_vlm(kind, tid, detected=detected)
                     if not detected:
                         # Full-frame thumbnail (with bbox) for the kanban rejected card
-                        _rej_fr = snap_fr.copy()
-                        if bbox:
-                            x1r, y1r, x2r, y2r = bbox
-                            cv2.rectangle(_rej_fr, (x1r, y1r), (x2r, y2r), (0, 0, 255), 2)
+                        _rej_fr = _annotate_person(snap_fr, bbox, yolo_conf) if bbox else snap_fr.copy()
                         _, _enc = cv2.imencode('.jpg', _rej_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
                         snap_thumb = _thumb_b64_from_jpeg(_enc.tobytes(), width=640)
+                        _desc = result.get("description", "")
+                        _is_vlm_err = _desc.startswith(("VLM ", "Model not found"))
+                        _rej_ts = time.time()  # shared timestamp for state + vector_store so round() matches
                         state.record_rejected_vlm(
                             kind, snap_thumb,
                             result.get("confidence", 0.0),
-                            result.get("description", ""),
+                            _desc,
                             frames=detail_b64 if kind == "chalking" else [],
                             rag_neighbors=rag_neighbors,
                             pipeline_trace=pipeline_trace,
                             track_id=tid,
+                            rejection_reason="vlm_error" if _is_vlm_err else None,
+                            timestamp=_rej_ts,
                         )
                 # People-alert phase: record when first-pass VLM was positive.
                 # Fires in two-stage mode regardless of confirm outcome so the
@@ -344,6 +376,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 _is_two_stage = pipeline_trace is not None and pipeline_trace.get("confirm") is not None
                 if kind == "chalking" and _fp and _fp.get("detected") and _is_two_stage and state:
                     _pa_ts = snap_ts or extract_osd_timestamp(snap_fr)
+                    _pa_fr = _annotate_person(snap_fr, bbox, yolo_conf) if bbox else snap_fr
+                    _, _pa_enc = cv2.imencode('.jpg', _pa_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    _pa_thumb = _thumb_b64_from_jpeg(_pa_enc.tobytes(), width=640)
                     state.record_people_alert(
                         confidence=_fp.get("confidence", 0.0),
                         description=_fp.get("description", ""),
@@ -352,26 +387,43 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                         track_id=tid,
                         rag_neighbors=rag_neighbors,
                         pipeline_trace=pipeline_trace,
-                        thumbnail=thumb,
+                        thumbnail=_pa_thumb,
                     )
 
                 _is_duplicate = False
+                # Full-frame thumbnail for kanban historical cards (thumb is a tight person crop)
+                _vs_fr  = _annotate_person(snap_fr, bbox, yolo_conf) if bbox else snap_fr
+                _, _vs_enc = cv2.imencode('.jpg', _vs_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                _vs_thumb = _thumb_b64_from_jpeg(_vs_enc.tobytes(), width=640)
                 if kind == "chalking" and vector_store:
                     try:
+                        _pt = pipeline_trace or {}
                         _event_id = vector_store.add(
                             description=result.get("description", ""),
                             detected=detected,
                             confidence=result.get("confidence", 0.0),
                             camera_id=state.camera_id if state else 0,
-                            thumbnail_b64=thumb,
+                            thumbnail_b64=_vs_thumb,
                             frames_b64=detail_b64,
+                            model_primary=(_pt.get("first_pass") or {}).get("backend", ""),
+                            model_confirm=(_pt.get("confirm") or {}).get("backend", ""),
+                            yolo_confidence=yolo_conf,
+                            hires_b64=hires_b64,
+                            timestamp=_rej_ts if not detected else None,
                         )
                         _is_duplicate = (not _IS_PLAYBACK) and (_event_id == "")
+                        if _event_id and state:
+                            if detected:
+                                state.patch_event_db_id(tid, _event_id)
+                            else:
+                                state.patch_rejected_db_id(tid, _event_id)
+                                if hires_b64:
+                                    state.update_rejected_hires(kind, tid, f"/dataset/{_event_id}_hires.jpg")
                     except Exception:
                         logger.exception("vector_store.add failed")
                 if kind == "chalking" and result["chalking_detected"] and not _is_duplicate:
                     sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
-                    snap = notifier.send("chalking", result, sf, bbox)
+                    snap = notifier.send("chalking", result, sf, bbox, yolo_conf=yolo_conf)
                     event_ts = snap_ts or extract_osd_timestamp(snap_fr)
                     if state:
                         state.record_alert("chalking", result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64, track_id=tid, timestamp=event_ts, rag_neighbors=rag_neighbors, pipeline_trace=pipeline_trace)
@@ -389,7 +441,31 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 # ── Chalking ──────────────────────────────────────────────────
                 if det.class_name == "person":
                     if not _near_vehicle(det.bbox, vehicle_bboxes, _vehicle_proximity_px):
-                        chalking.evict(det.track_id)  # reset state — pedestrian, not near any vehicle
+                        chalking.evict(det.track_id)
+                        # ── Zone-pedestrian dataset capture ───────────────────
+                        # Store a throttled snapshot for persons in-zone but NOT
+                        # near any vehicle.  These become our "pedestrian" training
+                        # examples for model benchmarking.
+                        if vector_store:
+                            _now = time.time()
+                            _last = _zone_ped_last_seen.get(det.track_id, 0.0)
+                            if _now - _last >= _ZONE_PED_INTERVAL:
+                                _zone_ped_last_seen[det.track_id] = _now
+                                _ped_fr = _annotate_person(frame, det.bbox, det.confidence)
+                                _, _ped_enc = cv2.imencode('.jpg', _ped_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                                _ped_thumb = _thumb_b64_from_jpeg(_ped_enc.tobytes())
+                                try:
+                                    vector_store.add(
+                                        description="Zone pedestrian — not near any vehicle",
+                                        detected=False,
+                                        confidence=det.confidence,
+                                        camera_id=state.camera_id if state else 0,
+                                        thumbnail_b64=_ped_thumb,
+                                        yolo_confidence=det.confidence,
+                                        capture_source="zone_pedestrian",
+                                    )
+                                except Exception:
+                                    logger.debug("zone-ped store failed", exc_info=True)
                         continue
                     crop = _crop_wide_bytes(frame, det.bbox)
                     chalking.store_frame(det.track_id, crop)
@@ -410,6 +486,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                         "chalking", thumb, 0.0,
                                         f"Suppressed — session {suppressed_sid} downvoted by user",
                                         suppressed_by_session=suppressed_sid,
+                                        rejection_reason="suppressed",
                                     )
                                 chalking.on_alert(det.track_id)
                             elif trusted_sid:
@@ -428,8 +505,11 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 _after_hours = not _IS_PLAYBACK and not _in_pe_window(_frame_wall_ts)
                                 if _after_hours and det.confidence < 0.40:
                                     if state:
+                                        _ah_fr = _annotate_person(frame, det.bbox, det.confidence) if det.bbox else frame
+                                        _, _ah_enc = cv2.imencode('.jpg', _ah_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                                        _ah_thumb = _thumb_b64_from_jpeg(_ah_enc.tobytes(), width=640)
                                         state.record_rejected_vlm(
-                                            "chalking", thumb, det.confidence,
+                                            "chalking", _ah_thumb, det.confidence,
                                             f"After-hours gate: YOLO {det.confidence:.0%} below 40% threshold",
                                             rejection_reason="out_of_hours",
                                             track_id=det.track_id,
@@ -438,12 +518,27 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                     chalking.on_alert(det.track_id)
                                     continue
                                 scene      = _crop_scene_bytes(frame, det.bbox)
-                                vlm_frames = [scene] + detail_frames
                                 snap_ts    = _frame_wall_ts
-                                # confirm_vlm intentionally not passed — Claude is a human-triggered gate only.
-                                # Use /api/dataset/reeval to run Claude on specific items.
-                                fut = _vlm_pool.submit(_two_stage, vlm, None, vlm_frames, "chalking", vector_store)
-                                _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence)
+                                # Priority: direct-camera / NVR HTTP snapshot (highest quality).
+                                # Fallback: raw pre-resize RTSP frame (always available).
+                                _cam_id = state.camera_id if state else 0
+                                _hires_jpg = fetch_hires_jpeg(_cam_id)
+                                if not _hires_jpg:
+                                    _ok_hr, _buf_hr = cv2.imencode('.jpg', _raw_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                    _hires_jpg = _buf_hr.tobytes() if _ok_hr else None
+                                    if _hires_jpg:
+                                        _hires_h, _hires_w = _raw_frame.shape[:2]
+                                        logger.info("hires: RTSP fallback %dx%d cam=%d", _hires_w, _hires_h, _cam_id)
+                                if _hires_jpg and det.bbox:
+                                    _hires_jpg = _annotate_hires(_hires_jpg, det.bbox, det.confidence, _det_w, _det_h)
+                                _hires_b64 = base64.b64encode(_hires_jpg).decode() if _hires_jpg else ""
+                                # VLM gets a bbox-region crop from the hi-res image — person +
+                                # adjacent vehicles but not the full 4K frame.
+                                # Full hi-res is kept in the dataset via _hires_b64.
+                                _vlm_jpg = _crop_vlm_from_hires(_hires_jpg, det.bbox, _det_w, _det_h) if _hires_jpg and det.bbox else None
+                                vlm_frames = [_vlm_jpg] if _vlm_jpg else ([scene] + detail_frames)
+                                fut = _vlm_pool.submit(_two_stage, vlm, confirm_vlm, vlm_frames, "chalking", vector_store)
+                                _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence, _hires_b64)
                                 if state:
                                     state.add_pending_vlm("chalking", det.track_id, thumb)
 
@@ -451,6 +546,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             for tid in list(chalking._frame_count.keys()):
                 if tid not in active_ids:
                     chalking.evict(tid)
+            for tid in list(_zone_ped_last_seen.keys()):
+                if tid not in active_ids:
+                    del _zone_ped_last_seen[tid]
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
@@ -493,6 +591,25 @@ def _overlaps_vehicle(
             if inter / blob_area >= min_overlap_frac:
                 return True
     return False
+
+
+def _annotate_person(
+    frame: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    confidence: float | None,
+    color: tuple[int, int, int] = (0, 220, 0),
+) -> np.ndarray:
+    """Return a copy of frame with YOLO person bbox + confidence label drawn."""
+    out = frame.copy()
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+    label = f"person {confidence:.2f}" if confidence is not None else "person"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(label, font, 0.6, 1)
+    ty = max(y1 - 4, th + 6)
+    cv2.rectangle(out, (x1, ty - th - 6), (x1 + tw + 6, ty + 2), color, -1)
+    cv2.putText(out, label, (x1 + 3, ty - 2), font, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
 
 
 def _crop_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int], pad: int = 20) -> bytes:
@@ -581,7 +698,7 @@ def _two_stage(
             "detected":    first.get(f"{kind}_detected", False),
             "confidence":  first.get("confidence", 0.0),
             "description": first.get("description", ""),
-            "backend":     primary._backend,
+            "backend":     primary.model_name,
         },
         "rag": None,
         "confirm": None,
@@ -647,11 +764,108 @@ def _two_stage(
         "detected":    second.get(f"{kind}_detected", False),
         "confidence":  second.get("confidence", 0.0),
         "description": second.get("description", ""),
-        "backend":     confirm._backend,
+        "backend":     confirm.model_name,
     }
     second["_rag_neighbors"]  = rag_neighbors
     second["_pipeline_trace"] = trace
     return second
+
+
+_VLM_CROP_W = 1280
+_VLM_CROP_H = 720
+
+
+def _crop_vlm_from_hires(
+    jpeg_bytes: bytes,
+    bbox: tuple[int, int, int, int],
+    det_w: int,
+    det_h: int,
+) -> bytes:
+    """Return a 1280×720 crop from the hi-res image centered on the detected person.
+
+    Bbox is in detection-resolution coordinates; it is scaled to hi-res before
+    centering.  The window is shifted inward if it would exceed the image boundary
+    so the output is always exactly 1280×720.
+    """
+    arr = np.frombuffer(jpeg_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return jpeg_bytes
+    ih, iw = img.shape[:2]
+
+    # If the hi-res image is smaller than the crop target, just return as-is.
+    if iw < _VLM_CROP_W or ih < _VLM_CROP_H:
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return buf.tobytes() if ok else jpeg_bytes
+
+    sx, sy = iw / det_w, ih / det_h
+    cx = int(((bbox[0] + bbox[2]) / 2) * sx)
+    cy = int(((bbox[1] + bbox[3]) / 2) * sy)
+
+    x1 = cx - _VLM_CROP_W // 2
+    y1 = cy - _VLM_CROP_H // 2
+    # Clamp so the window stays inside the image.
+    x1 = max(0, min(x1, iw - _VLM_CROP_W))
+    y1 = max(0, min(y1, ih - _VLM_CROP_H))
+
+    crop = img[y1 : y1 + _VLM_CROP_H, x1 : x1 + _VLM_CROP_W]
+    ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes() if ok else jpeg_bytes
+
+
+def _annotate_hires(
+    jpeg_bytes: bytes,
+    bbox: tuple[int, int, int, int],
+    confidence: float,
+    det_w: int,
+    det_h: int,
+) -> bytes:
+    """Draw the YOLO bbox and the VLM analysis window on the hi-res image.
+
+    Green box  = YOLO detection.
+    Orange box = 1280×720 region that will be sent to the VLM.
+    """
+    arr = np.frombuffer(jpeg_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return jpeg_bytes
+    h, w = img.shape[:2]
+    sx, sy = w / det_w, h / det_h
+    x1 = int(bbox[0] * sx)
+    y1 = int(bbox[1] * sy)
+    x2 = int(bbox[2] * sx)
+    y2 = int(bbox[3] * sy)
+
+    thickness = max(2, int(min(sx, sy) * 2))
+    font      = cv2.FONT_HERSHEY_SIMPLEX
+    fscale    = max(0.8, min(sx, sy) * 0.5)
+    fthick    = max(1, int(min(sx, sy)))
+
+    # Green YOLO bbox + label
+    green = (0, 220, 0)
+    cv2.rectangle(img, (x1, y1), (x2, y2), green, thickness)
+    label = f"person {confidence:.0%}"
+    (tw, th), _ = cv2.getTextSize(label, font, fscale, fthick)
+    ty = max(y1 - 4, th + 6)
+    cv2.rectangle(img, (x1, ty - th - 6), (x1 + tw + 6, ty + 2), green, -1)
+    cv2.putText(img, label, (x1 + 3, ty - 2), font, fscale, (0, 0, 0), fthick, cv2.LINE_AA)
+
+    # Orange VLM crop window
+    if w >= _VLM_CROP_W and h >= _VLM_CROP_H:
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        vx1 = max(0, min(cx - _VLM_CROP_W // 2, w - _VLM_CROP_W))
+        vy1 = max(0, min(cy - _VLM_CROP_H // 2, h - _VLM_CROP_H))
+        vx2, vy2 = vx1 + _VLM_CROP_W, vy1 + _VLM_CROP_H
+        orange = (0, 165, 255)
+        cv2.rectangle(img, (vx1, vy1), (vx2, vy2), orange, thickness)
+        vlm_label = f"VLM {_VLM_CROP_W}x{_VLM_CROP_H}"
+        (vw, vh), _ = cv2.getTextSize(vlm_label, font, fscale * 0.8, fthick)
+        cv2.rectangle(img, (vx1, vy1), (vx1 + vw + 6, vy1 + vh + 8), orange, -1)
+        cv2.putText(img, vlm_label, (vx1 + 3, vy1 + vh + 4), font, fscale * 0.8, (0, 0, 0), fthick, cv2.LINE_AA)
+
+    ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return buf.tobytes() if ok else jpeg_bytes
 
 
 def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
