@@ -37,6 +37,10 @@ function PtzBtn({ cameraId, dir }: { cameraId: number; dir: Dir }) {
   );
 }
 
+function gotoPreset(cameraId: number, preset: number) {
+  fetch(`/api/camera/${cameraId}/ptz/preset/${preset}`, { method: 'POST' }).catch(() => {});
+}
+
 export function PtzOverlay({ cameraId }: Props) {
   return (
     <div className="ptz-overlay">
@@ -52,6 +56,9 @@ export function PtzOverlay({ cameraId }: Props) {
       <div className="ptz-zoom">
         <PtzBtn cameraId={cameraId} dir="zoom_in"  />
         <PtzBtn cameraId={cameraId} dir="zoom_out" />
+        <button className="ptz-home" onClick={() => gotoPreset(cameraId, 1)} title="Go to preset 001 (home)">
+          ⌂
+        </button>
       </div>
     </div>
   );
