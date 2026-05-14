@@ -6,6 +6,8 @@ import { EventModal }        from './components/EventModal';
 import { DebugDrawer }       from './components/DebugDrawer';
 import { ComparisonDrawer }  from './components/ComparisonDrawer';
 import { PipelineKanban }   from './components/PipelineKanban';
+import { DatasetAdmin }     from './components/DatasetAdmin';
+import { TimelinePlot }    from './components/TimelinePlot';
 import { useAppStore }      from './store';
 import { useStats }         from './hooks/useStats';
 import { useEvents }        from './hooks/useEvents';
@@ -23,9 +25,10 @@ export default function App() {
   const kanbanOpen    = useAppStore((s) => s.kanbanOpen);
   const setKanbanOpen = useAppStore((s) => s.setKanbanOpen);
   const [pipClosed, setPipClosed] = useState<Set<number>>(new Set());
+  const [pipLarge,  setPipLarge]  = useState(false);
 
   useEffect(() => {
-    if (!kanbanOpen) setPipClosed(new Set());
+    if (!kanbanOpen) { setPipClosed(new Set()); setPipLarge(false); }
   }, [kanbanOpen]);
 
   const cams = [0, 1].filter((id) => !kanbanOpen || !pipClosed.has(id));
@@ -36,12 +39,17 @@ export default function App() {
       <Header />
       <main>
         {showPanels && (
-          <div className={`video-panels${kanbanOpen ? ' pip' : ''}`}>
+          <div className={`video-panels${kanbanOpen ? ' pip' : ''}${kanbanOpen && pipLarge ? ' pip-large' : ''}`}>
             {cams.map((camId) => (
               <div key={camId} className="video-panel-pip-wrap">
                 <VideoPanel cameraId={camId} />
                 {kanbanOpen && (
                   <div className="pip-controls">
+                    <button
+                      className="pip-btn"
+                      title={pipLarge ? 'Small preview' : 'Large preview'}
+                      onClick={() => setPipLarge(l => !l)}
+                    >{pipLarge ? '⊟' : '⊞'}</button>
                     <button
                       className="pip-btn"
                       title="Back to fullscreen"
@@ -63,6 +71,8 @@ export default function App() {
       <DebugDrawer />
       <ComparisonDrawer />
       <PipelineKanban />
+      <DatasetAdmin />
+      <TimelinePlot />
       <EventModal />
     </>
   );

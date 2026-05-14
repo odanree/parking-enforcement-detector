@@ -7,6 +7,8 @@ export function Header() {
   const setDebugOpen      = useAppStore((s) => s.setDebugOpen);
   const setComparisonOpen = useAppStore((s) => s.setComparisonOpen);
   const setKanbanOpen     = useAppStore((s) => s.setKanbanOpen);
+  const setAdminOpen      = useAppStore((s) => s.setAdminOpen);
+  const setTimelineOpen   = useAppStore((s) => s.setTimelineOpen);
   const demo = stats?.demo_mode ?? false;
 
   return (
@@ -29,6 +31,12 @@ export function Header() {
             </button>
             <button className="btn-debug-open" onClick={() => setComparisonOpen(true)}>
               Comparison
+            </button>
+            <button className="btn-debug-open" onClick={() => setAdminOpen(true)}>
+              Dataset
+            </button>
+            <button className="btn-debug-open" onClick={() => setTimelineOpen(true)}>
+              Timeline
             </button>
             <button id="btn-debug-open" className="btn-debug-open" onClick={() => setDebugOpen(true)}>
               Debug

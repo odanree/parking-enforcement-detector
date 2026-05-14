@@ -2,9 +2,18 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../store';
 import type { PipelineStage, RagNeighbor, RagStage } from '../types';
 
-type TimeFilter  = '5m' | '1h' | '6h' | '12h' | '7d' | '30d' | 'all';
+type TimeFilter  = '5m' | '1h' | '12h' | '24h' | 'all';
 type LabelFilter = 'unlabeled' | 'labeled' | 'all';
 type CamFilter   = 0 | 1 | 'all';
+
+interface ModelEvalEntry {
+  model: string;
+  backend: string;
+  detected: number;
+  confidence: number;
+  description: string;
+  ts: number;
+}
 
 interface TraceCard {
   id: string;
@@ -16,6 +25,7 @@ interface TraceCard {
   description: string;
   thumbnail: string | null;   // base64 for live rejected items
   thumb_url: string | null;   // /dataset/<file> for historical items
+  hires_url: string | null;   // /dataset/<file>_hires.jpg when HIRES_SNAPSHOT=true
   rag_neighbors: RagNeighbor[];
   track_id?: number | null;
   phash?: string | null;
@@ -24,7 +34,12 @@ interface TraceCard {
   rag: RagStage | null;
   confirm: PipelineStage | null;
   label?: string;
+  person_type?: string;
+  capture_source?: string;
   rejection_reason?: string;
+  model_evals?: ModelEvalEntry[];
+  model_primary?: string;
+  model_confirm?: string;
 }
 
 function pct(v: number) { return `${Math.round(v * 100)}%`; }
@@ -66,6 +81,14 @@ function groupCards(cards: TraceCard[]): CardGroup[] {
   });
 }
 
+const PERSON_TYPES: { key: string; label: string; emoji: string }[] = [
+  { key: 'pedestrian',       label: 'Pedestrian',  emoji: '🚶' },
+  { key: 'occupant',         label: 'Occupant',    emoji: '🚗' },
+  { key: 'worker_landscape', label: 'Landscaper',  emoji: '🌿' },
+  { key: 'worker_delivery',  label: 'Delivery',    emoji: '📦' },
+  { key: 'chalker',          label: 'Chalker',     emoji: '✏️' },
+];
+
 function ConfBadge({ v, detected }: { v: number; detected: boolean }) {
   const cls = detected ? 'kanban-conf-pos' : 'kanban-conf-neg';
   return <span className={`kanban-conf ${cls}`}>{pct(v)}</span>;
@@ -98,12 +121,14 @@ function ZoomableImage({ src }: { src: string }) {
   const zoomRef      = useRef({ scale: 1, tx: 0, ty: 0 });
   const dragRef      = useRef<{ x: number; y: number } | null>(null);
   const [xform, setXform] = useState({ scale: 1, tx: 0, ty: 0 });
+  const [dims, setDims]   = useState<{ w: number; h: number } | null>(null);
 
-  // Reset whenever the image changes (prev/next navigation)
+  // Reset zoom and dimensions whenever the image changes (prev/next navigation)
   useEffect(() => {
     const z = { scale: 1, tx: 0, ty: 0 };
     zoomRef.current = z;
     setXform(z);
+    setDims(null);
   }, [src]);
 
   // Wheel handler — must be non-passive to call preventDefault
@@ -169,7 +194,14 @@ function ZoomableImage({ src }: { src: string }) {
         draggable={false}
         className="kanban-zoom-img"
         style={{ transformOrigin: '0 0', transform: `translate(${xform.tx}px,${xform.ty}px) scale(${xform.scale})` }}
+        onLoad={(e) => {
+          const img = e.currentTarget;
+          setDims({ w: img.naturalWidth, h: img.naturalHeight });
+        }}
       />
+      {dims && (
+        <span className="img-resolution-badge">{dims.w}×{dims.h}</span>
+      )}
       {xform.scale > 1 && (
         <span className="kanban-zoom-hint">double-click to reset</span>
       )}
@@ -183,11 +215,16 @@ function thumbSrc(card: TraceCard): string | null {
   return null;
 }
 
+function hiresSrc(card: TraceCard): string | null {
+  return card.hires_url ?? thumbSrc(card);
+}
+
 function KanbanCard({ card, count, onClick }: { card: TraceCard; count?: number; onClick: () => void }) {
   const timeStr = new Date(card.timestamp * 1000).toLocaleTimeString([], {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
   const src = thumbSrc(card);
+  const isLive = card.id.startsWith('live-');
 
   return (
     <div className={`kanban-card ${card.outcome}`} onClick={onClick}>
@@ -202,6 +239,7 @@ function KanbanCard({ card, count, onClick }: { card: TraceCard; count?: number;
       <div className="kanban-card-meta">
         <div className="kanban-card-top">
           <span className="kanban-cam">Cam {card.camera_id}</span>
+          {isLive && <span className="kanban-live-dot" title="Pending database index" />}
           <span className="kanban-time">{timeStr}</span>
         </div>
         <div className="kanban-desc">{card.description.slice(0, 80)}{card.description.length > 80 ? '…' : ''}</div>
@@ -281,20 +319,129 @@ function CardDetail({ card }: { card: TraceCard }) {
           {card.outcome === 'chalking'
             ? <><span className="stage-pos-text">✓ Chalking alert</span> <ConfBadge v={card.confidence} detected /></>
             : card.outcome === 'people_alert' || card.outcome === 'detected'
-            ? <><span className="stage-pos-text">✓ People alert</span> <ConfBadge v={card.confidence} detected /></>
+            ? <><span className="stage-pos-text">✓ {COLUMNS.find(c => c.key === cardColumn(card))?.label ?? 'People Alert'}</span> <ConfBadge v={card.confidence} detected /></>
             : <><span className="stage-neg-text">✗ Rejected</span> <ConfBadge v={card.confidence} detected={false} /></>
           }
         </div>
+      </div>
+      {card.model_evals && card.model_evals.length > 0 && (
+        <div className="kanban-stage-block stage-model-evals">
+          <div className="kanban-stage-label">Model Comparison</div>
+          <table className="model-eval-table">
+            <thead>
+              <tr><th>Model</th><th>Result</th><th>Conf</th></tr>
+            </thead>
+            <tbody>
+              {card.model_evals.map((e) => (
+                <tr key={e.model} className={e.detected ? 'eval-pos' : 'eval-neg'}>
+                  <td className="eval-model-name">{e.model}</td>
+                  <td>{e.detected ? '✓' : '✗'}</td>
+                  <td>{pct(e.confidence)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PersonTypeLabeler({ card }: { card: TraceCard }) {
+  const [current, setCurrent] = useState(card.person_type ?? '');
+  const [saving, setSaving] = useState(false);
+
+  async function applyLabel(pt: string) {
+    const next = current === pt ? '' : pt; // toggle off if already set
+    setSaving(true);
+    try {
+      await fetch(`/api/dataset/${card.id}/person-type`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ person_type: next }),
+      });
+      setCurrent(next);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="person-type-labeler">
+      <span className="person-type-label-title">Person Type</span>
+      <div className="person-type-buttons">
+        {PERSON_TYPES.map((pt) => (
+          <button
+            key={pt.key}
+            className={`btn-person-type btn-pt-${pt.key}${current === pt.key ? ' active' : ''}`}
+            onClick={() => applyLabel(pt.key)}
+            disabled={saving}
+            title={pt.label}
+          >
+            {pt.emoji} {pt.label}
+          </button>
+        ))}
+        {current && (
+          <button className="btn-person-type btn-pt-clear" onClick={() => applyLabel('')} disabled={saving}>
+            ✕ Clear
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
-function StageDetailModal({ cards: allCards, startIndex, onClose }: { cards: TraceCard[]; startIndex: number; onClose: () => void }) {
+function TpFpLabeler({ card, onLabeled }: { card: TraceCard; onLabeled?: (label: string) => void }) {
+  const [current, setCurrent] = useState(card.label ?? '');
+  const [saving, setSaving] = useState(false);
+  const isLive = card.id.startsWith('live-');
+
+  async function applyLabel(next: string) {
+    if (isLive) return;
+    const val = current === next ? '' : next;
+    setSaving(true);
+    try {
+      await fetch(`/api/dataset/${card.id}/label`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: val }),
+      });
+      setCurrent(val);
+      onLabeled?.(val);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const LABELS = [
+    { val: 'true_positive',  short: 'TP', cls: 'tp' },
+    { val: 'false_positive', short: 'FP', cls: 'fp' },
+    { val: 'true_negative',  short: 'TN', cls: 'tn' },
+    { val: 'false_negative', short: 'FN', cls: 'fn' },
+  ];
+
+  return (
+    <div className="kanban-tpfp-row">
+      {LABELS.map(({ val, short, cls }) => (
+        <button
+          key={val}
+          className={`kanban-tpfp-btn ${cls}${current === val ? ' active' : ''}`}
+          onClick={() => applyLabel(val)}
+          disabled={saving || isLive}
+          title={isLive ? 'Available once event is saved to dataset' : val.replace('_', ' ')}
+        >{short}</button>
+      ))}
+      {isLive && <span className="kanban-tpfp-pending">Pending index…</span>}
+    </div>
+  );
+}
+
+function StageDetailModal({ cards: allCards, startIndex, onClose, onLabeled }: { cards: TraceCard[]; startIndex: number; onClose: () => void; onLabeled?: (label: string, cardId: string) => void }) {
   const [idx, setIdx] = useState(startIndex);
   const card = allCards[idx];
   const timeStr = new Date(card.timestamp * 1000).toLocaleString();
   const total = allCards.length;
+  const captureTag = card.capture_source === 'zone_pedestrian' ? '🚶 Zone pedestrian' : null;
 
   return (
     <div className="kanban-modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -302,8 +449,13 @@ function StageDetailModal({ cards: allCards, startIndex, onClose }: { cards: Tra
         <button className="kanban-modal-close" onClick={onClose}>&times;</button>
         <div className="kanban-modal-header">
           <span className={`kanban-outcome-badge ${card.outcome}`}>
-            {card.outcome === 'chalking' ? '✓ Chalking' : card.outcome === 'people_alert' || card.outcome === 'detected' ? '✓ People Alert' : '✗ Rejected'}
+            {card.outcome === 'chalking'
+              ? '✓ Chalking'
+              : card.outcome === 'people_alert' || card.outcome === 'detected'
+              ? `✓ ${COLUMNS.find(c => c.key === cardColumn(card))?.label ?? 'People Alert'}`
+              : `✗ ${COLUMNS.find(c => c.key === cardColumn(card))?.label ?? 'Rejected'}`}
           </span>
+          {captureTag && <span className="kanban-capture-tag">{captureTag}</span>}
           <span className="kanban-modal-time">Cam {card.camera_id} · {timeStr}</span>
         </div>
 
@@ -315,15 +467,18 @@ function StageDetailModal({ cards: allCards, startIndex, onClose }: { cards: Tra
           </div>
         )}
 
-        {thumbSrc(card) && <ZoomableImage src={thumbSrc(card)!} />}
-
-        {card.label && (
-          <div style={{ marginBottom: 8 }}>
-            <span className={`cmp-label-badge ${card.label === 'true_positive' ? 'cmp-label-tp' : card.label === 'false_positive' ? 'cmp-label-fp' : 'cmp-label-other'}`}>
-              {card.label === 'true_positive' ? 'TP' : card.label === 'false_positive' ? 'FP' : card.label}
-            </span>
+        {hiresSrc(card) && (
+          <div style={{ position: 'relative' }}>
+            <ZoomableImage src={hiresSrc(card)!} />
+            {card.hires_url && (
+              <span className="hires-badge">HI-RES</span>
+            )}
           </div>
         )}
+
+        <TpFpLabeler card={card} onLabeled={onLabeled ? (label) => onLabeled(label, card.id) : undefined} />
+
+        <PersonTypeLabeler card={card} />
 
         <CardDetail card={card} />
       </div>
@@ -332,32 +487,36 @@ function StageDetailModal({ cards: allCards, startIndex, onClose }: { cards: Tra
 }
 
 const COLUMNS: { key: string; label: string; desc: string }[] = [
-  { key: 'time_window',   label: 'Off Hours ✗',    desc: 'Outside PE enforcement window'         },
-  { key: 'first_pass',    label: 'Primary ✗',      desc: 'Rejected by 1st-pass VLM'             },
-  { key: 'rag',           label: 'RAG Blocked ✗',  desc: 'Auto-rejected by FP matches'          },
-  { key: 'confirm',       label: 'Reeval ✗',       desc: 'Rejected by confirm/reeval'           },
-  { key: 'people_alert',  label: 'People Alert ✓', desc: 'Person near vehicle (VLM positive)'   },
-  { key: 'chalking',      label: 'Chalking ✓',     desc: 'Confirmed by both VLM stages'         },
+  { key: 'time_window',  label: 'Off Hours ✗',    desc: 'Outside PE enforcement window'           },
+  { key: 'no_person',    label: 'No Person ✗',    desc: 'Rejected — no person near vehicle'       },
+  { key: 'vlm_error',    label: 'VLM Error ⚠',    desc: 'Timeout / connection failure'            },
+  { key: 'not_chalking', label: 'False Detect ✗', desc: 'Model disagreement — not a real detection' },
+  { key: 'pedestrian',   label: 'Pedestrian ✓',   desc: 'Person on sidewalk / walking by'         },
+  { key: 'occupant',     label: 'Occupant ✓',     desc: 'Person exiting or entering vehicle'      },
+  { key: 'chalking',     label: 'Chalking ✓',     desc: 'Confirmed chalking activity'             },
 ];
+
+const _NO_PERSON_RE   = /no person|not visible|nobody|no one|not anyone|not present|no individual|no human|cannot see|can't see/i;
+const _PEDESTRIAN_RE  = /sidewalk|pedestrian|walking|walk by|passing|foot traffic|passer|stroll/i;
 
 function cardColumn(card: TraceCard): string {
   if (card.rejection_reason === 'out_of_hours') return 'time_window';
+  if (card.rejection_reason === 'suppressed')   return 'no_person';
+  if (card.rejection_reason === 'vlm_error')    return 'vlm_error';
 
-  // Explicit people_alert outcome (two-stage: first-pass positive before confirm)
-  if (card.outcome === 'people_alert') return 'people_alert';
+  const desc = card.description || card.first_pass?.description || '';
 
-  if (card.outcome === 'rejected') {
-    if (!card.first_pass?.detected) return 'first_pass';
-    if (card.rag?.skipped_confirm) return 'rag';
-    if (card.confirm && !card.confirm.detected) return 'confirm';
-    return 'first_pass';
+  if (card.outcome === 'people_alert' || card.outcome === 'detected') {
+    if (card.confirm?.detected) return 'chalking';
+    return _PEDESTRIAN_RE.test(desc) ? 'pedestrian' : 'occupant';
   }
 
-  // outcome === 'detected'
-  // Two-stage confirm positive → chalking (rare)
-  if (card.confirm?.detected) return 'chalking';
-  // Single-stage positive (no confirm stage ran) → people alert (common)
-  return 'people_alert';
+  if (card.outcome === 'rejected') {
+    // RAG-blocked and confirm-rejected both land in not_chalking (columns removed)
+    return _NO_PERSON_RE.test(desc) ? 'no_person' : 'not_chalking';
+  }
+
+  return 'no_person';
 }
 
 export function PipelineKanban() {
@@ -370,14 +529,14 @@ export function PipelineKanban() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const [timeFilter,  setTimeFilter]  = useState<TimeFilter>('12h');
+  const [timeFilter,  setTimeFilter]  = useState<TimeFilter>('1h');
   const [labelFilter, setLabelFilter] = useState<LabelFilter>('unlabeled');
   const [camFilter,   setCamFilter]   = useState<CamFilter>('all');
 
   const timeWindowSecs = useMemo(() => {
     if (timeFilter === 'all') return null;
-    return timeFilter === '5m' ? 300 : timeFilter === '1h' ? 3600 : timeFilter === '6h' ? 6 * 3600
-         : timeFilter === '12h' ? 12 * 3600 : timeFilter === '7d' ? 7 * 86400 : 30 * 86400;
+    return timeFilter === '5m' ? 300 : timeFilter === '1h' ? 3600
+         : timeFilter === '12h' ? 12 * 3600 : 24 * 3600;
   }, [timeFilter]);
 
   function buildUrl() {
@@ -414,6 +573,22 @@ export function PipelineKanban() {
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [kanbanOpen, autoRefresh, timeWindowSecs, labelFilter, camFilter]);
 
+  // Keep the open modal in sync with the latest card fetch (e.g. hires_url backfill after restart).
+  // Only refresh cards that belong to the same kanban column as the originally-selected group
+  // so that a False Detect and an Occupant sharing the same timestamp don't merge in the modal.
+  useEffect(() => {
+    if (!selected) return;
+    const selectedCol = cardColumn(selected.cards[0]);
+    const keys = new Set(selected.cards.map(sc => `${sc.camera_id}:${Math.round(sc.timestamp)}`));
+    const refreshed = cards.filter(c =>
+      cardColumn(c) === selectedCol &&
+      keys.has(`${c.camera_id}:${Math.round(c.timestamp)}`),
+    );
+    if (refreshed.length > 0) {
+      setSelected(prev => prev ? { index: Math.min(prev.index, refreshed.length - 1), cards: refreshed } : prev);
+    }
+  }, [cards]);
+
   useEffect(() => {
     if (!kanbanOpen) return;
     function onKey(e: KeyboardEvent) { if (e.key === 'Escape') { setSelected(null); setKanbanOpen(false); } }
@@ -426,15 +601,29 @@ export function PipelineKanban() {
     ? cards.filter((c) => c.label && c.label !== '')
     : cards;
 
+  const oldestTs = cards.length > 0 ? Math.min(...cards.map(c => c.timestamp)) : null;
+  const oldestLabel = oldestTs !== null ? (() => {
+    const date = new Date(oldestTs * 1000).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+    const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - oldestTs));
+    const d = Math.floor(diffSec / 86400);
+    const h = Math.floor((diffSec % 86400) / 3600);
+    const m = Math.floor((diffSec % 3600) / 60);
+    const s = diffSec % 60;
+    const rel = d > 0 ? `${d}d ${h}h ago` : h > 0 ? `${h}h ${m}m ago` : m > 0 ? `${m}m ${s}s ago` : `${s}s ago`;
+    return `back to ${date} (${rel})`;
+  })() : null;
+
   const detected = visibleCards.filter((c) => c.outcome === 'detected' || c.outcome === 'people_alert');
   const rejected  = visibleCards.filter((c) => c.outcome === 'rejected');
 
   const byColumn: Record<string, TraceCard[]> = {
-    time_window: [], first_pass: [], rag: [], confirm: [], people_alert: [], chalking: [],
+    time_window: [], no_person: [], vlm_error: [], not_chalking: [], pedestrian: [], occupant: [], chalking: [],
   };
   for (const card of visibleCards) {
     const col = cardColumn(card);
-    byColumn[col].push(card);
+    (byColumn[col] ??= []).push(card);
   }
 
   if (!kanbanOpen) return null;
@@ -442,7 +631,15 @@ export function PipelineKanban() {
   return (
     <>
       {selected && (
-        <StageDetailModal cards={selected.cards} startIndex={selected.index} onClose={() => setSelected(null)} />
+        <StageDetailModal
+          cards={selected.cards}
+          startIndex={selected.index}
+          onClose={() => setSelected(null)}
+          onLabeled={(label, cardId) => {
+            if (label && labelFilter === 'unlabeled') setLabelFilter('all');
+            setCards(prev => prev.map(c => c.id === cardId ? { ...c, label } : c));
+          }}
+        />
       )}
       <div className="kanban-overlay" onClick={(e) => { if (e.target === e.currentTarget) setKanbanOpen(false); }}>
         <div className="kanban-panel">
@@ -450,10 +647,10 @@ export function PipelineKanban() {
             <h2 className="kanban-title">Pipeline Kanban</h2>
             <div className="kanban-filters">
               {/* Time */}
-              {(['5m','1h','6h','12h','7d','30d','all'] as TimeFilter[]).map((t) => (
+              {(['5m','1h','12h','24h','all'] as TimeFilter[]).map((t) => (
                 <button key={t} className={`kanban-filter-btn${timeFilter === t ? ' active' : ''}`}
                   onClick={() => setTimeFilter(t)}>
-                  {t === '5m' ? '5 min' : t === '1h' ? '1 hour' : t === '6h' ? '6 hours' : t === '12h' ? '12 hours' : t === '7d' ? '7 days' : t === '30d' ? '30 days' : 'All time'}
+                  {t === '5m' ? '5 min' : t === '1h' ? '1 hr' : t === '12h' ? '12 hr' : t === '24h' ? '24 hr' : 'All time'}
                 </button>
               ))}
               <span className="kanban-filter-sep" />
@@ -476,10 +673,20 @@ export function PipelineKanban() {
             <div className="kanban-header-right">
               <span className="kanban-stat kanban-stat-detected">{detected.length} detected</span>
               <span className="kanban-stat kanban-stat-rejected">{rejected.length} rejected</span>
+              {oldestLabel && (
+                <span className="kanban-stat kanban-stat-oldest" title={`Oldest of ${cards.length} cards`}>
+                  back to {oldestLabel}
+                </span>
+              )}
               <label className="kanban-auto-label">
                 <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
                 Live
               </label>
+              <button className="btn-kanban-clear" onClick={async () => {
+                if (!confirm('Delete all pipeline history? This cannot be undone.')) return;
+                await fetch('/api/pipeline/history', { method: 'DELETE' });
+                setCards([]);
+              }}>Clear History</button>
               <button className="btn-debug-close" onClick={() => setKanbanOpen(false)}>&times;</button>
             </div>
           </div>
@@ -487,23 +694,26 @@ export function PipelineKanban() {
           {loading && <div className="kanban-loading">Loading…</div>}
 
           <div className="kanban-board">
-            {COLUMNS.map((col) => (
-              <div key={col.key} className="kanban-col">
-                <div className="kanban-col-header">
-                  <span className="kanban-col-title">{col.label}</span>
-                  <span className="kanban-col-desc">{col.desc}</span>
-                  <span className="kanban-col-count">{byColumn[col.key].length}</span>
+            {COLUMNS.map((col) => {
+              const colCards = byColumn[col.key] ?? [];
+              return (
+                <div key={col.key} className="kanban-col">
+                  <div className="kanban-col-header">
+                    <span className="kanban-col-title">{col.label}</span>
+                    <span className="kanban-col-desc">{col.desc}</span>
+                    <span className="kanban-col-count">{colCards.length}</span>
+                  </div>
+                  <div className="kanban-col-cards">
+                    {colCards.length === 0
+                      ? <div className="kanban-col-empty">—</div>
+                      : groupCards(colCards).sort((a, b) => b.count - a.count).map(({ rep, count, all }) => (
+                          <KanbanCard key={rep.id} card={rep} count={count} onClick={() => setSelected({ cards: all, index: all.indexOf(rep) })} />
+                        ))
+                    }
+                  </div>
                 </div>
-                <div className="kanban-col-cards">
-                  {byColumn[col.key].length === 0
-                    ? <div className="kanban-col-empty">—</div>
-                    : groupCards(byColumn[col.key]).map(({ rep, count, all }) => (
-                        <KanbanCard key={rep.id} card={rep} count={count} onClick={() => setSelected({ cards: all, index: all.indexOf(rep) })} />
-                      ))
-                  }
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>

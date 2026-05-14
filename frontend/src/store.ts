@@ -10,6 +10,8 @@ interface AppStore {
   debugOpen:        boolean;
   comparisonOpen:   boolean;
   kanbanOpen:       boolean;
+  adminOpen:        boolean;
+  timelineOpen:     boolean;
   modalEvent:    AppEvent | null;
   wsStatuses:    ('connected' | 'disconnected')[];
   sessionFilter: string | null;
@@ -22,6 +24,8 @@ interface AppStore {
   setDebugOpen:        (open: boolean) => void;
   setComparisonOpen:   (open: boolean) => void;
   setKanbanOpen:       (open: boolean) => void;
+  setAdminOpen:        (open: boolean) => void;
+  setTimelineOpen:     (open: boolean) => void;
   openModal:           (ev: AppEvent) => void;
   closeModal:          () => void;
   setWsStatus:         (cam: number, s: 'connected' | 'disconnected') => void;
@@ -37,6 +41,8 @@ export const useAppStore = create<AppStore>((set) => ({
   debugOpen:        false,
   comparisonOpen:   false,
   kanbanOpen:       false,
+  adminOpen:        false,
+  timelineOpen:     false,
   modalEvent:    null,
   wsStatuses:    ['disconnected', 'disconnected'],
   sessionFilter: null,
@@ -49,6 +55,8 @@ export const useAppStore = create<AppStore>((set) => ({
   setDebugOpen:        (debugOpen)  => set({ debugOpen }),
   setComparisonOpen:   (comparisonOpen) => set({ comparisonOpen }),
   setKanbanOpen:       (kanbanOpen)     => set({ kanbanOpen }),
+  setAdminOpen:        (adminOpen)      => set({ adminOpen }),
+  setTimelineOpen:     (timelineOpen)   => set({ timelineOpen }),
   openModal:           (modalEvent) => set({ modalEvent }),
   closeModal:          ()           => set({ modalEvent: null }),
   setSessionFilter:    (sessionFilter) => set({ sessionFilter }),
