@@ -37,6 +37,10 @@ _SUBTYPE  = int(os.getenv("HIRES_SUBTYPE", "0"))
 _PTZ_PORT = os.getenv("PTZ_PORT", "80")
 _SNAP_PORT = os.getenv("SNAPSHOT_PORT", _PTZ_PORT)
 
+# Persistent clients keyed by camera_id so digest-auth nonces are reused
+# across calls and the 401-challenge round-trip only happens once per session.
+_clients: dict[int, httpx.Client] = {}
+
 
 def _snap_host(camera_id: int) -> str:
     """Direct-camera host if configured, otherwise NVR host."""
@@ -95,23 +99,30 @@ def fetch_hires_jpeg(camera_id: int, subtype: int | None = None) -> bytes | None
     url  = f"http://{host}:{port}/cgi-bin/snapshot.cgi"
     direct = bool(os.getenv(f"SNAPSHOT_HOST_{camera_id}"))
 
+    if camera_id not in _clients:
+        _clients[camera_id] = httpx.Client(
+            auth=httpx.DigestAuth(user, pwd),
+            timeout=5.0,
+        )
+
     try:
-        with httpx.Client(auth=httpx.DigestAuth(user, pwd), timeout=5.0) as c:
-            r = c.get(url, params={"channel": ch, "subtype": sub})
-            r.raise_for_status()
-            ct = r.headers.get("content-type", "")
-            if "image" not in ct:
-                logger.warning(
-                    "hires_snapshot: unexpected content-type %r cam=%d url=%s",
-                    ct, camera_id, url,
-                )
-                return None
-            logger.info(
-                "hires_snapshot: OK %d bytes cam=%d ch=%d subtype=%d source=%s",
-                len(r.content), camera_id, ch, sub,
-                "direct" if direct else "nvr",
+        r = _clients[camera_id].get(url, params={"channel": ch, "subtype": sub})
+        r.raise_for_status()
+        ct = r.headers.get("content-type", "")
+        if "image" not in ct:
+            logger.warning(
+                "hires_snapshot: unexpected content-type %r cam=%d url=%s",
+                ct, camera_id, url,
             )
-            return r.content
+            return None
+        logger.info(
+            "hires_snapshot: OK %d bytes cam=%d ch=%d subtype=%d source=%s",
+            len(r.content), camera_id, ch, sub,
+            "direct" if direct else "nvr",
+        )
+        return r.content
     except Exception:
+        # Discard the client so a fresh auth handshake happens next call
+        _clients.pop(camera_id, None)
         logger.warning("hires_snapshot failed cam=%d url=%s", camera_id, url, exc_info=True)
         return None
