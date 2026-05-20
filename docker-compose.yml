@@ -1,17 +1,56 @@
 services:
-  detector:
-    build: .
+  ollama:
+    image: ollama/ollama:latest
     restart: unless-stopped
-    env_file: .env
+    environment:
+      - OLLAMA_MAX_LOADED_MODELS=1
     volumes:
-      - ./config:/app/config:ro
-      - ./snapshots:/app/snapshots
-      - ./logs:/app/logs
-    network_mode: host   # needed to reach RTSP camera on LAN
+      - ollama_data:/root/.ollama
+    networks:
+      - parking-net
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]   # remove block if running CPU-only
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  detector:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - TZ=America/Los_Angeles
+    volumes:
+      - ./config:/app/config:ro
+      - ./snapshots:/app/snapshots
+      - ./logs:/app/logs
+    networks:
+      - parking-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
+
+networks:
+  parking-net:
+    driver: bridge
