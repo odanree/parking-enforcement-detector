@@ -38,6 +38,11 @@ services:
       - ./config:/app/config:ro
       - ./snapshots:/app/snapshots
       - ./logs:/app/logs
+      # Persist the vector store and dataset images across container rebuilds.
+      # Without these, the DB lives in the ephemeral writable layer and is lost
+      # on every `docker compose up --build` / recreate.
+      - ./data:/app/data
+      - ./dataset:/app/dataset
     networks:
       - parking-net
     deploy:

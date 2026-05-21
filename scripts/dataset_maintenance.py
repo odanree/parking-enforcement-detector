@@ -373,6 +373,78 @@ def cmd_clip_backfill(args) -> None:
     logger.info("CLIP backfill complete: %d added", added)
 
 
+def cmd_merge(args) -> None:
+    """Merge a source vector store into the target (--db).
+
+    Copies records (documents + embeddings + metadata) and their referenced
+    image files from --from-db / --from-dataset into the target. Records whose
+    id already exists in the target are skipped, so the merge is idempotent and
+    safe to re-run. Event ids are timestamp-prefixed; non-overlapping capture
+    windows will never collide.
+    """
+    import shutil
+
+    target = _open(args.db)
+    src    = _open(args.from_db)
+    src_ds = Path(args.from_dataset)
+    tgt_ds = Path(args.dataset)
+    tgt_ds.mkdir(parents=True, exist_ok=True)
+
+    existing = set(target.get(include=[], limit=500_000)["ids"])
+    src_res = src.get(include=["documents", "embeddings", "metadatas"], limit=500_000)
+    src_ids = src_res["ids"]
+    new_idx = [i for i, eid in enumerate(src_ids) if eid not in existing]
+    logger.info(
+        "Source rows: %d  already-in-target: %d  to-merge: %d",
+        len(src_ids), len(src_ids) - len(new_idx), len(new_idx),
+    )
+    if not new_idx:
+        return
+
+    # Collect image files to copy from the metadata of the new rows.
+    files: list[str] = []
+    for i in new_idx:
+        m = src_res["metadatas"][i]
+        for k in ("thumb_file", "hires_file"):
+            if m.get(k):
+                files.append(m[k])
+        for f in (m.get("frame_files") or "").split(","):
+            if f:
+                files.append(f)
+
+    if not args.apply:
+        logger.info("[DRY-RUN] would add %d records and copy up to %d image files",
+                    len(new_idx), len(files))
+        return
+
+    # Copy image files first so a row never references a missing file.
+    copied = 0
+    for fname in files:
+        s = src_ds / fname
+        d = tgt_ds / fname
+        if s.exists() and not d.exists():
+            try:
+                shutil.copy2(s, d)
+                copied += 1
+            except Exception:
+                logger.debug("copy failed: %s", fname, exc_info=True)
+    logger.info("Copied %d image files", copied)
+
+    # Add records in batches, preserving precomputed embeddings.
+    docs   = [src_res["documents"][i] for i in new_idx]
+    embeds = [src_res["embeddings"][i] for i in new_idx]
+    metas  = [src_res["metadatas"][i] for i in new_idx]
+    ids    = [src_ids[i] for i in new_idx]
+    for s in range(0, len(ids), 500):
+        target.add(
+            ids=ids[s:s + 500],
+            documents=docs[s:s + 500],
+            embeddings=embeds[s:s + 500],
+            metadatas=metas[s:s + 500],
+        )
+    logger.info("Merged %d records into target (%d total now)", len(ids), target.count())
+
+
 def cmd_rewrite_zoneped(args) -> None:
     """Rewrite legacy 'Zone pedestrian - not near any vehicle' descriptions to
     the new diversified form using each row's stored bbox metadata.
@@ -461,6 +533,12 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--limit", type=int, default=1000)
     sp.add_argument("--apply", action="store_true")
     sp.set_defaults(func=cmd_clip_backfill)
+
+    sp = sub.add_parser("merge", help="Merge another vector store into --db (idempotent)")
+    sp.add_argument("--from-db", required=True, help="Source ChromaDB path")
+    sp.add_argument("--from-dataset", required=True, help="Source dataset image dir")
+    sp.add_argument("--apply", action="store_true")
+    sp.set_defaults(func=cmd_merge)
 
     args = p.parse_args(argv)
     args.func(args)
