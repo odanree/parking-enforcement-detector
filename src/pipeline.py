@@ -224,6 +224,17 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     # Each entry: (future, kind, track_id, snap_frame, bbox, thumb_b64)
     _vlm_jobs: dict[tuple[str, int], tuple[Future, str, int, np.ndarray, tuple, str]] = {}
 
+    # Person-type classifier cache: tid -> person_type (one classify per track).
+    # Re-use the primary VLM for classification unless an explicit override is
+    # provided; the call is cheap and reuses cache_control on Claude.
+    _classify_cache: dict[int, str] = {}
+    _classify_vlm: VLMAnalyzer | None = vlm if _CLASSIFY_ENABLED else None
+    if _CLASSIFY_ENABLED:
+        logger.info(
+            "Person classifier ENABLED — skip types: %s",
+            ",".join(sorted(_CLASSIFY_SKIP_TYPES)),
+        )
+
 
     _initial_paused = os.getenv("INITIAL_PAUSED", "false").lower() == "true"
     if video_path and _initial_paused:
@@ -398,6 +409,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 if kind == "chalking" and vector_store:
                     try:
                         _pt = pipeline_trace or {}
+                        _classify_pt = (_pt.get("classify") or {}).get("person_type", "")
                         _event_id = vector_store.add(
                             description=result.get("description", ""),
                             detected=detected,
@@ -409,6 +421,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                             model_confirm=(_pt.get("confirm") or {}).get("backend", ""),
                             yolo_confidence=yolo_conf,
                             hires_b64=hires_b64,
+                            person_type=_classify_pt,
                             timestamp=_rej_ts if not detected else None,
                         )
                         _is_duplicate = (not _IS_PLAYBACK) and (_event_id == "")
@@ -537,7 +550,11 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 # Full hi-res is kept in the dataset via _hires_b64.
                                 _vlm_jpg = _crop_vlm_from_hires(_hires_jpg, det.bbox, _det_w, _det_h) if _hires_jpg and det.bbox else None
                                 vlm_frames = [_vlm_jpg] if _vlm_jpg else ([scene] + detail_frames)
-                                fut = _vlm_pool.submit(_two_stage, vlm, confirm_vlm, vlm_frames, "chalking", vector_store)
+                                fut = _vlm_pool.submit(
+                                    _two_stage,
+                                    vlm, confirm_vlm, vlm_frames, "chalking", vector_store,
+                                    _classify_vlm, _classify_cache, det.track_id,
+                                )
                                 _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence, _hires_b64)
                                 if state:
                                     state.add_pending_vlm("chalking", det.track_id, thumb)
@@ -549,6 +566,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             for tid in list(_zone_ped_last_seen.keys()):
                 if tid not in active_ids:
                     del _zone_ped_last_seen[tid]
+            for tid in list(_classify_cache.keys()):
+                if tid not in active_ids:
+                    del _classify_cache[tid]
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
@@ -675,6 +695,15 @@ _RAG_AUTO_REJECT   = os.getenv("RAG_AUTO_REJECT", "false").lower() == "true"
 _RAG_FP_THRESHOLD  = float(os.getenv("RAG_FP_THRESHOLD", "0.30"))
 _RAG_FP_MIN_VOTES  = int(os.getenv("RAG_FP_MIN_VOTES", "3"))
 
+# Person-type classifier pre-filter — runs once per track, caches result.
+# Types listed here short-circuit the chalking VLM call entirely.
+_CLASSIFY_ENABLED   = os.getenv("PERSON_CLASSIFIER_ENABLED", "false").lower() == "true"
+_CLASSIFY_SKIP_TYPES = set(
+    t.strip() for t in os.getenv(
+        "PERSON_CLASSIFIER_SKIP", "pedestrian,occupant,worker_delivery"
+    ).split(",") if t.strip()
+)
+
 
 def _two_stage(
     primary: "VLMAnalyzer",
@@ -682,6 +711,9 @@ def _two_stage(
     frames: "list[bytes]",
     kind: str,
     rag_store=None,
+    classify_vlm: "VLMAnalyzer | None" = None,
+    classify_cache: "dict[int, str] | None" = None,
+    track_id: "int | None" = None,
 ) -> dict:
     """Run primary VLM; RAG lookup; optionally skip confirm; run confirm VLM.
 
@@ -689,11 +721,61 @@ def _two_stage(
       _usage          — token usage from whichever VLM ran last
       _rag_neighbors  — list of similar labeled events from ChromaDB
       _pipeline_trace — per-stage breakdown for the kanban view
+
+    If ``classify_vlm`` is supplied alongside a cache + track_id, a one-shot
+    person-type classification runs first per track; classes in
+    ``_CLASSIFY_SKIP_TYPES`` short-circuit and never reach the chalking VLM.
     """
+    # ── Optional classifier pre-filter ──────────────────────────────────────
+    classify_trace: dict | None = None
+    if (
+        classify_vlm is not None
+        and classify_cache is not None
+        and track_id is not None
+    ):
+        pt = classify_cache.get(track_id)
+        if pt is None:
+            try:
+                # Use the most recent detail crop — last frame is freshest.
+                cresult = classify_vlm.classify_person(frames[-1:])
+                pt = str(cresult.get("person_type", "unknown"))
+                classify_cache[track_id] = pt
+                classify_trace = {
+                    "person_type": pt,
+                    "confidence":  cresult.get("confidence", 0.0),
+                    "description": cresult.get("description", ""),
+                    "backend":     classify_vlm.model_name,
+                    "cached":      False,
+                }
+            except Exception:
+                logger.debug("classify_person failed", exc_info=True)
+                pt = "unknown"
+                classify_cache[track_id] = pt
+                classify_trace = {"person_type": pt, "cached": False, "error": True}
+        else:
+            classify_trace = {"person_type": pt, "cached": True}
+
+        if pt in _CLASSIFY_SKIP_TYPES:
+            return {
+                f"{kind}_detected":   False,
+                "sweeper_detected":   False,
+                "pe_vehicle_detected": False,
+                "confidence":         1.0,
+                "description":        f"Classifier short-circuit: person_type={pt}",
+                "_rag_neighbors":     [],
+                "_pipeline_trace": {
+                    "classify":   classify_trace,
+                    "first_pass": None,
+                    "rag":        None,
+                    "confirm":    None,
+                },
+            }
+
     first = primary.analyze(frames, kind)
 
     # ── Stage 1 snapshot ─────────────────────────────────────────────────────
     trace: dict = {
+        "classify": classify_trace,
         "first_pass": {
             "detected":    first.get(f"{kind}_detected", False),
             "confidence":  first.get("confidence", 0.0),
