@@ -140,6 +140,14 @@ class ObjectDetector:
             if not (self._min_px <= area <= self._max_px):
                 continue
 
+            # Post-track confidence gate: ByteTrack runs at _track_low_thresh so
+            # it can re-associate partly-occluded objects, but downstream stages
+            # should only see detections that clear the user-configured threshold.
+            # Without this, ~70 % of stage-1 VLM calls were spent rejecting sub-0.30
+            # YOLO hits on shadows.
+            if float(conf) < self._threshold:
+                continue
+
             det = Detection(
                 track_id=int(track_id),
                 class_name=class_name,
