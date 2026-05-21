@@ -165,7 +165,7 @@ def _normalize_classify(data: dict) -> dict:
         pt = "unknown"
     return {
         "person_type": pt,
-        "confidence":  float(data.get("confidence", 0.0)),
+        "confidence":  _normalize_confidence(data.get("confidence", 0.0)),
         "description": str(data.get("description", "")),
     }
 
@@ -511,11 +511,32 @@ def _parse_json(text: str) -> dict:
     return _FALLBACK.copy()
 
 
+def _normalize_confidence(value) -> float:
+    """Clamp confidence into [0, 1].
+
+    Qwen2.5VL and several other open VLMs frequently return confidence on a
+    0-100 (or 0-10) scale despite the prompt asking for 0.0-1.0. Treat any
+    value > 1.5 as a percentage and divide accordingly; clamp out-of-range
+    values defensively.
+    """
+    try:
+        c = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if c != c or c < 0:                          # NaN / negative
+        return 0.0
+    if c > 1.5 and c <= 100.0:
+        c = c / 100.0
+    elif c > 100.0:
+        return 1.0
+    return min(1.0, c)
+
+
 def _normalize(data: dict) -> dict:
     return {
         "chalking_detected":  bool(data.get("chalking_detected", False)),
         "sweeper_detected":   bool(data.get("sweeper_detected", False)),
         "pe_vehicle_detected": bool(data.get("pe_vehicle_detected", False)),
-        "confidence":         float(data.get("confidence", 0.0)),
+        "confidence":         _normalize_confidence(data.get("confidence", 0.0)),
         "description":        str(data.get("description", "")),
     }
