@@ -15,3 +15,7 @@ wsproto>=1.2.0
 twilio>=8.0.0
 chromadb>=0.5.0
 pytesseract>=0.3.10
+# Optional — enables CLIP image embeddings in the vector store
+# (CLIP_EMBEDDINGS_ENABLED=true). Comment out to save ~1 GB on install.
+open-clip-torch>=2.24.0
+

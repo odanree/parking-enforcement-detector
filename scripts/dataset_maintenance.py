@@ -322,6 +322,57 @@ def cmd_phash_cluster(args) -> None:
     logger.info("Wrote %d cluster representatives to %s", min(args.limit, len(sorted_groups)), out_path)
 
 
+def cmd_clip_backfill(args) -> None:
+    """Populate the CLIP image-embedding collection from existing thumbnails.
+
+    Requires CLIP_EMBEDDINGS_ENABLED=true (and open-clip-torch installed).
+    Skips rows already present in the CLIP collection.
+    """
+    os.environ["CLIP_EMBEDDINGS_ENABLED"] = "true"
+    from src.storage.vector_store import EventVectorStore, _decode_jpeg_bytes_to_rgb  # noqa: E402
+
+    vs = EventVectorStore(db_path=args.db, dataset_path=args.dataset)
+    if vs._clip_col is None:
+        logger.error("CLIP collection unavailable — install open-clip-torch and pillow")
+        return
+    main_res = vs._col.get(include=["metadatas"], limit=200_000)
+    existing = set(vs._clip_col.get(include=[], limit=200_000)["ids"])
+    todo = [
+        (eid, m) for eid, m in zip(main_res["ids"], main_res["metadatas"])
+        if eid not in existing and m.get("thumb_file")
+    ]
+    logger.info("CLIP backfill: %d rows pending (limit=%d)", len(todo), args.limit)
+    if not args.apply:
+        logger.info("[DRY-RUN] pass --apply to embed and write")
+        return
+    dataset_dir = Path(args.dataset)
+    added = 0
+    for eid, m in todo[: args.limit]:
+        path = dataset_dir / m["thumb_file"]
+        if not path.exists():
+            continue
+        arr = _decode_jpeg_bytes_to_rgb(path.read_bytes())
+        if arr is None:
+            continue
+        try:
+            vs._clip_col.add(
+                ids=[eid],
+                images=[arr],
+                metadatas=[{
+                    "detected":       int(m.get("detected", 0)),
+                    "label":          m.get("label", ""),
+                    "capture_source": m.get("capture_source", ""),
+                    "camera_id":      int(m.get("camera_id", 0)),
+                }],
+            )
+            added += 1
+        except Exception:
+            logger.exception("CLIP add failed for %s", eid)
+        if added and added % 50 == 0:
+            logger.info("Progress: %d/%d added", added, args.limit)
+    logger.info("CLIP backfill complete: %d added", added)
+
+
 def cmd_rewrite_zoneped(args) -> None:
     """Rewrite legacy 'Zone pedestrian - not near any vehicle' descriptions to
     the new diversified form using each row's stored bbox metadata.
@@ -405,6 +456,11 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("rewrite-zoneped", help="Rewrite legacy zone_pedestrian descriptions")
     sp.add_argument("--apply", action="store_true")
     sp.set_defaults(func=cmd_rewrite_zoneped)
+
+    sp = sub.add_parser("clip-backfill", help="Populate CLIP collection from existing thumbnails")
+    sp.add_argument("--limit", type=int, default=1000)
+    sp.add_argument("--apply", action="store_true")
+    sp.set_defaults(func=cmd_clip_backfill)
 
     args = p.parse_args(argv)
     args.func(args)
