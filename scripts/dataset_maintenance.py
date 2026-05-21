@@ -42,6 +42,12 @@ if str(_ROOT) not in sys.path:
 
 import chromadb  # noqa: E402
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_ROOT / ".env")
+except Exception:
+    pass
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("dataset_maintenance")
 
@@ -271,6 +277,11 @@ def cmd_backfill_person_type(args) -> None:
             result = vlm.classify_person(img_bytes)
         except Exception:
             logger.exception("classify failed for %s", eid)
+            continue
+        # Do NOT write on a failed/fallback classification — that would pollute
+        # the row with a bogus 'unknown' and make it ineligible for retry.
+        if (result.get("description") or "").startswith(("Classification failed", "Classification error")):
+            logger.warning("classify returned failure fallback for %s — skipping write", eid)
             continue
         pt = (result.get("person_type") or "").strip() or "unknown"
         meta = dict(m)
