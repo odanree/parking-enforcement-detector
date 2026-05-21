@@ -277,19 +277,29 @@ class VLMAnalyzer:
             logger.exception("classify_person error")
             return _CLASSIFY_FALLBACK.copy()
 
-    def analyze(self, image_bytes: bytes | list[bytes], kind: str = "") -> dict:
+    def analyze(
+        self,
+        image_bytes: bytes | list[bytes],
+        kind: str = "",
+        prior_signals: str | None = None,
+    ) -> dict:
         """Send one or more JPEG frames to the VLM and return the parsed JSON result.
 
         When a list is passed the frames are treated as a chronological sequence
         (oldest first) so the model can use earlier context to disambiguate.
+
+        ``prior_signals`` is an optional short string (≤ 200 chars) describing
+        deterministic priors from upstream (e.g. pose: crouching, wrist near
+        wheel). It is appended to the user prompt as a hint, not as ground
+        truth — the VLM still owns the final decision.
         """
         if self._backend == "mock":
             return _MOCK_RESULTS.get(kind, _MOCK_RESULTS["pe_vehicle"])
         frames = image_bytes if isinstance(image_bytes, list) else [image_bytes]
         try:
             if self._backend == "claude":
-                return self._analyze_claude(frames)
-            return self._analyze_ollama(frames)
+                return self._analyze_claude(frames, prior_signals=prior_signals)
+            return self._analyze_ollama(frames, prior_signals=prior_signals)
         except httpx.TimeoutException:
             logger.warning("VLM timeout (%s): took >60 s", self.model_name)
             fb = _FALLBACK.copy()
@@ -351,7 +361,7 @@ class VLMAnalyzer:
             resp.raise_for_status()
             return resp.json().get("response", "")
 
-    def _analyze_claude(self, frames: list[bytes]) -> dict:
+    def _analyze_claude(self, frames: list[bytes], prior_signals: str | None = None) -> dict:
         content: list[dict] = []
         for fb in frames:
             content.append({
@@ -375,6 +385,12 @@ class VLMAnalyzer:
             'Do NOT dismiss chalking just because one frame looks ambiguous — judge the full sequence.\n\n'
             + self._user_prompt
         )
+        if prior_signals:
+            prompt = (
+                f"PRIOR SIGNALS (deterministic, from pose estimator): {prior_signals}.\n"
+                "Treat these as weak evidence — confirm visually before flagging.\n\n"
+                + prompt
+            )
         content.append({"type": "text", "text": prompt})
 
         response = self._claude.messages.create(
@@ -401,10 +417,17 @@ class VLMAnalyzer:
         }
         return parsed
 
-    def _analyze_ollama(self, frames: list[bytes]) -> dict:
+    def _analyze_ollama(self, frames: list[bytes], prior_signals: str | None = None) -> dict:
+        user = self._user_prompt
+        if prior_signals:
+            user = (
+                f"PRIOR SIGNALS (deterministic, from pose estimator): {prior_signals}.\n"
+                "Treat these as weak evidence — confirm visually before flagging.\n\n"
+                + user
+            )
         payload = {
             "model": self._ollama_model,
-            "prompt": f"{self._system_prompt}\n\n{self._user_prompt}",
+            "prompt": f"{self._system_prompt}\n\n{user}",
             "images": [base64.standard_b64encode(fb).decode() for fb in frames],
             "stream": False,
             "options": {"temperature": 0.0, "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "4096"))},

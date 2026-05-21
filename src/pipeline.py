@@ -27,6 +27,11 @@ from src.behavior.chalking_analyzer import ChalkingAnalyzer
 from src.detection.motion_detector import MotionDetector
 from src.detection.object_detector import Detection, ObjectDetector
 from src.detection.zone_filter import ZoneFilter
+
+_POSE_ENABLED = os.getenv("POSE_ESTIMATION_ENABLED", "false").lower() == "true"
+_POSE_CONTACT_PX = int(os.getenv("POSE_CONTACT_PX", "35"))
+_POSE_KNEE_DEG   = float(os.getenv("POSE_KNEE_DEG", "130"))
+_POSE_MODEL      = os.getenv("POSE_MODEL", "yolov8m-pose.pt")
 from src.stream.frame_undistorter import FrameUndistorter
 from src.stream.osd_timestamp import extract_osd_timestamp
 from src.stream.hires_snapshot import fetch_hires_jpeg
@@ -235,6 +240,23 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             ",".join(sorted(_CLASSIFY_SKIP_TYPES)),
         )
 
+    # Pose estimator — opt-in. Provides deterministic crouch / wrist-low /
+    # wrist-near-vehicle signals that the VLM can use as a structured prior.
+    _pose_estimator = None
+    if _POSE_ENABLED:
+        try:
+            from src.detection.pose_estimator import PoseEstimator
+            _pose_estimator = PoseEstimator(
+                model_path=_POSE_MODEL,
+                contact_px=_POSE_CONTACT_PX,
+                knee_angle_threshold_deg=_POSE_KNEE_DEG,
+            )
+        except Exception:
+            logger.exception("Pose estimator failed to load — continuing without pose")
+            _pose_estimator = None
+    # Per-frame map populated below: track_id -> PoseSignals
+    _pose_by_track: dict[int, "object"] = {}
+
 
     _initial_paused = os.getenv("INITIAL_PAUSED", "false").lower() == "true"
     if video_path and _initial_paused:
@@ -324,6 +346,23 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             # Wall time of this frame: NVR timestamp for video files, None for live RTSP
             # (None causes _in_pe_window to fall back to datetime.now())
             _frame_wall_ts = getattr(stream, 'get_current_wall_time', lambda: None)()
+
+            # ── Pose estimation (opt-in) ────────────────────────────────────
+            # Computed once per frame over all zone persons; results keyed by
+            # track_id and consumed when building the chalking VLM job.
+            _pose_by_track.clear()
+            if _pose_estimator is not None:
+                _vehicle_bb_for_pose = [
+                    d.bbox for d in all_dets
+                    if d.class_name in {"car", "truck", "motorcycle"}
+                ]
+                _zone_persons = [d for d in zone_dets if d.class_name == "person"]
+                if _zone_persons:
+                    try:
+                        for ps in _pose_estimator.estimate(frame, _zone_persons, _vehicle_bb_for_pose):
+                            _pose_by_track[ps.track_id] = ps
+                    except Exception:
+                        logger.debug("pose.estimate failed", exc_info=True)
 
             active_ids = {d.track_id for d in zone_dets}
             alert_ids.clear()
@@ -557,10 +596,12 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 # Full hi-res is kept in the dataset via _hires_b64.
                                 _vlm_jpg = _crop_vlm_from_hires(_hires_jpg, det.bbox, _det_w, _det_h) if _hires_jpg and det.bbox else None
                                 vlm_frames = [_vlm_jpg] if _vlm_jpg else ([scene] + detail_frames)
+                                _ps = _pose_by_track.get(det.track_id)
+                                _ps_dict = _ps.as_dict() if _ps is not None else None
                                 fut = _vlm_pool.submit(
                                     _two_stage,
                                     vlm, confirm_vlm, vlm_frames, "chalking", vector_store,
-                                    _classify_vlm, _classify_cache, det.track_id,
+                                    _classify_vlm, _classify_cache, det.track_id, _ps_dict,
                                 )
                                 _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence, _hires_b64)
                                 if state:
@@ -721,6 +762,7 @@ def _two_stage(
     classify_vlm: "VLMAnalyzer | None" = None,
     classify_cache: "dict[int, str] | None" = None,
     track_id: "int | None" = None,
+    pose_signals: "dict | None" = None,
 ) -> dict:
     """Run primary VLM; RAG lookup; optionally skip confirm; run confirm VLM.
 
@@ -778,11 +820,23 @@ def _two_stage(
                 },
             }
 
-    first = primary.analyze(frames, kind)
+    prior_str = None
+    if pose_signals:
+        # Compact, fact-only sentence — the VLM tends to over-anchor on long hints.
+        flags = []
+        if pose_signals.get("is_crouching"):       flags.append("crouching")
+        if pose_signals.get("hand_low"):           flags.append("hand-low (wrist near ground)")
+        if pose_signals.get("wrist_near_vehicle"): flags.append("wrist within 35px of a vehicle")
+        if not flags:
+            flags.append("neutral stance")
+        prior_str = "; ".join(flags) + f" (pose conf={pose_signals.get('confidence', 0.0):.2f})"
+
+    first = primary.analyze(frames, kind, prior_signals=prior_str)
 
     # ── Stage 1 snapshot ─────────────────────────────────────────────────────
     trace: dict = {
         "classify": classify_trace,
+        "pose":     pose_signals,
         "first_pass": {
             "detected":    first.get(f"{kind}_detected", False),
             "confidence":  first.get("confidence", 0.0),
@@ -848,7 +902,7 @@ def _two_stage(
 
     # ── Confirm stage ─────────────────────────────────────────────────────────
     logger.debug("Two-stage: %s positive → confirm VLM", kind)
-    second = confirm.analyze(frames, kind)
+    second = confirm.analyze(frames, kind, prior_signals=prior_str)
     trace["confirm"] = {
         "detected":    second.get(f"{kind}_detected", False),
         "confidence":  second.get("confidence", 0.0),
