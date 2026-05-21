@@ -467,14 +467,21 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 _ped_fr = _annotate_person(frame, det.bbox, det.confidence)
                                 _, _ped_enc = cv2.imencode('.jpg', _ped_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
                                 _ped_thumb = _thumb_b64_from_jpeg(_ped_enc.tobytes())
+                                # Diversify description so the text embedding doesn't collapse
+                                # every zone-pedestrian capture into a single point — this is
+                                # what makes RAG nearest-neighbour useful across pedestrians.
+                                _ped_desc = _zone_pedestrian_description(
+                                    det, _det_w, _det_h, _classify_cache.get(det.track_id)
+                                )
                                 try:
                                     vector_store.add(
-                                        description="Zone pedestrian — not near any vehicle",
+                                        description=_ped_desc,
                                         detected=False,
                                         confidence=det.confidence,
                                         camera_id=state.camera_id if state else 0,
                                         thumbnail_b64=_ped_thumb,
                                         yolo_confidence=det.confidence,
+                                        person_type=_classify_cache.get(det.track_id, "") or "",
                                         capture_source="zone_pedestrian",
                                     )
                                 except Exception:
@@ -963,6 +970,40 @@ def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> byt
                  max(0, x1 - pad_x)     : min(w, x2 + pad_x)]
     ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else b""
+
+
+def _zone_pedestrian_description(
+    det: "Detection",
+    frame_w: int,
+    frame_h: int,
+    person_type: str | None,
+) -> str:
+    """Build a discriminating description for a zone pedestrian.
+
+    A single hardcoded string collapses every zone_pedestrian event to the same
+    vector in ChromaDB, which defeats nearest-neighbour search across thousands
+    of stored frames. Adding spatial grid position, bbox size bucket, and the
+    classifier label (when available) produces enough variation for embeddings
+    to distinguish e.g. "person walking centre-left near sidewalk" from
+    "delivery worker top-right of zone".
+    """
+    cx, cy = det.center
+    # 3x3 spatial grid
+    col = ["left", "centre", "right"][min(2, max(0, (cx * 3) // max(1, frame_w)))]
+    row = ["top", "middle", "bottom"][min(2, max(0, (cy * 3) // max(1, frame_h)))]
+    # Bucket bbox height into rough scale categories
+    h = det.height
+    if h < 40:
+        scale = "small"
+    elif h < 90:
+        scale = "medium"
+    else:
+        scale = "large"
+    pt = person_type or "unclassified"
+    return (
+        f"Zone pedestrian ({pt}), {row}-{col} of frame, {scale} bbox "
+        f"({h}px high, yolo={det.confidence:.2f}). No nearby vehicle."
+    )
 
 
 def _near_vehicle(
