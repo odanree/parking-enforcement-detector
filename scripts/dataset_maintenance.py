@@ -242,8 +242,14 @@ def cmd_backfill_person_type(args) -> None:
         # Need a thumbnail file to classify from.
         if not m.get("thumb_file"):
             continue
+        # Optional capture_source filter (e.g. only 'chalking' near-vehicle rows).
+        if args.source and (m.get("capture_source") or "chalking") != args.source:
+            continue
         candidates.append((eid, m))
-    logger.info("Candidates without person_type: %d (limit=%d)", len(candidates), args.limit)
+    logger.info(
+        "Candidates without person_type: %d (source=%s, limit=%d)",
+        len(candidates), args.source or "all", args.limit,
+    )
     if not candidates:
         return
 
@@ -517,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("backfill-person-type", help="Run classify_person() over unclassified rows")
     sp.add_argument("--limit", type=int, default=100, help="Max rows to process this run")
+    sp.add_argument("--source", default="", help="Only rows with this capture_source (e.g. 'chalking')")
     sp.add_argument("--apply", action="store_true")
     sp.set_defaults(func=cmd_backfill_person_type)
 
