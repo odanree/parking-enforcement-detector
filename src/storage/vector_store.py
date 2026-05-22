@@ -83,8 +83,12 @@ class EventVectorStore:
         self._clip_embedder = _try_clip_embedder()
         if self._clip_embedder is not None:
             try:
+                # v2: a fresh collection with NO embedding function. The original
+                # "chalking_evals_clip" had OpenCLIPEmbeddingFunction baked into its
+                # persisted config, which ChromaDB re-instantiated (reloading the
+                # model) on every operation. We supply vectors explicitly instead.
                 self._clip_col = self._client.get_or_create_collection(
-                    name="chalking_evals_clip",
+                    name="chalking_evals_clipv2",
                     metadata={"hnsw:space": "cosine"},
                 )
                 logger.info("CLIP image-embedding collection ready (%d entries)", self._clip_col.count())
