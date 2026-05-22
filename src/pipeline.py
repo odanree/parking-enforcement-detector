@@ -645,6 +645,18 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                             chalking.on_alert(det.track_id)
                                             continue
 
+                                # Tight native-res person crop for the classifier — built from
+                                # the RAW hires (before annotation) so qwen sees the person filling
+                                # the frame and can resolve pedestrian/occupant/delivery instead of
+                                # returning 'unknown' on a wide 1280×720 window.
+                                _classify_jpg = None
+                                if _CLASSIFY_ENABLED and _hires_jpg and det.bbox:
+                                    _cnc = _native_person_crop(_hires_jpg, det.bbox, _det_w, _det_h, pad_ratio=0.8)
+                                    if _cnc is not None:
+                                        _ok_cc, _cc_buf = cv2.imencode('.jpg', _cnc[0], [cv2.IMWRITE_JPEG_QUALITY, 90])
+                                        if _ok_cc:
+                                            _classify_jpg = _cc_buf.tobytes()
+
                                 if _hires_jpg and det.bbox:
                                     _hires_jpg = _annotate_hires(_hires_jpg, det.bbox, det.confidence, _det_w, _det_h)
                                 _hires_b64 = base64.b64encode(_hires_jpg).decode() if _hires_jpg else ""
@@ -659,7 +671,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                     _two_stage,
                                     vlm, confirm_vlm, vlm_frames, "chalking", vector_store,
                                     _classify_vlm, _classify_cache, det.track_id, _ps_dict,
-                                    _wand_sig_dict,
+                                    _wand_sig_dict, _classify_jpg,
                                 )
                                 _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence, _hires_b64)
                                 if state:
@@ -824,6 +836,7 @@ def _two_stage(
     track_id: "int | None" = None,
     pose_signals: "dict | None" = None,
     wand_signals: "dict | None" = None,
+    classify_jpeg: "bytes | None" = None,
 ) -> dict:
     """Run primary VLM; RAG lookup; optionally skip confirm; run confirm VLM.
 
@@ -846,8 +859,10 @@ def _two_stage(
         pt = classify_cache.get(track_id)
         if pt is None:
             try:
-                # Use the most recent detail crop — last frame is freshest.
-                cresult = classify_vlm.classify_person(frames[-1:])
+                # Prefer a tight native-res person crop (qwen resolves the person
+                # far better than on the wide VLM window); fall back to last frame.
+                _cls_input = [classify_jpeg] if classify_jpeg else frames[-1:]
+                cresult = classify_vlm.classify_person(_cls_input)
                 pt = str(cresult.get("person_type", "unknown"))
                 classify_cache[track_id] = pt
                 classify_trace = {
