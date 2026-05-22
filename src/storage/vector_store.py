@@ -39,22 +39,22 @@ def _try_default_ef():
         return None
 
 
-def _try_clip_ef():
-    """Return an OpenCLIP embedding function or None.
+def _try_clip_embedder():
+    """Return a persistent ClipEmbedder or None.
 
-    open_clip is a heavy optional dependency; if it isn't installed we run
-    without image embeddings rather than failing the whole pipeline.
+    Loads the open_clip model ONCE (unlike ChromaDB's OpenCLIPEmbeddingFunction,
+    which reloaded weights per call). open_clip is an optional dependency; if it
+    isn't installed we run without image embeddings.
     """
     if os.getenv("CLIP_EMBEDDINGS_ENABLED", "false").lower() != "true":
         return None
     try:
-        from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
-        ef = OpenCLIPEmbeddingFunction()
-        return ef
+        from src.storage.clip_embedder import ClipEmbedder
+        return ClipEmbedder()
     except Exception as exc:
         logger.warning(
-            "CLIP embedding function unavailable (%s) — install open-clip-torch "
-            "and pillow to enable image-similarity search.", exc.__class__.__name__,
+            "CLIP embedder unavailable (%s) — install open-clip-torch and pillow "
+            "to enable image-similarity search.", exc.__class__.__name__,
         )
         return None
 
@@ -76,16 +76,15 @@ class EventVectorStore:
             embedding_function=ef,
         )
 
-        # Parallel CLIP image-embedding collection (opt-in). Mirrors event_ids
-        # so callers can cross-reference; metadata is intentionally minimal
-        # (we already store the full record in the main collection).
+        # Parallel CLIP image-embedding collection (opt-in). We compute vectors
+        # ourselves with a persistent model and write them via embeddings=, so
+        # the collection has NO embedding_function (ChromaDB never re-embeds).
         self._clip_col = None
-        clip_ef = _try_clip_ef()
-        if clip_ef is not None:
+        self._clip_embedder = _try_clip_embedder()
+        if self._clip_embedder is not None:
             try:
                 self._clip_col = self._client.get_or_create_collection(
                     name="chalking_evals_clip",
-                    embedding_function=clip_ef,
                     metadata={"hnsw:space": "cosine"},
                 )
                 logger.info("CLIP image-embedding collection ready (%d entries)", self._clip_col.count())
@@ -167,15 +166,17 @@ class EventVectorStore:
         except Exception:
             logger.exception("Failed to add event %s to vector store", event_id)
 
-        # CLIP image embedding (mirrors event_id). Best-effort; failures here
-        # never block the main collection write.
-        if self._clip_col is not None and thumbnail_b64:
+        # CLIP image embedding (mirrors event_id). We embed with the persistent
+        # model and store the vector directly. Best-effort; never blocks the
+        # main write.
+        if self._clip_col is not None and self._clip_embedder is not None and thumbnail_b64:
             try:
-                arr = _decode_b64_to_rgb_array(thumbnail_b64)
-                if arr is not None:
+                bgr = _decode_b64_to_bgr(thumbnail_b64)
+                vec = self._clip_embedder.embed_image(bgr) if bgr is not None else None
+                if vec is not None:
                     self._clip_col.add(
                         ids=[event_id],
-                        images=[arr],
+                        embeddings=[vec],
                         metadatas=[{
                             "detected":       int(detected),
                             "label":          "",
@@ -350,14 +351,15 @@ class EventVectorStore:
         Returns rich metadata by cross-referencing back to the main collection.
         No-op (returns []) when the CLIP collection is disabled or empty.
         """
-        if self._clip_col is None or self._clip_col.count() < 1:
+        if self._clip_col is None or self._clip_embedder is None or self._clip_col.count() < 1:
             return []
-        arr = _decode_jpeg_bytes_to_rgb(image_bytes)
-        if arr is None:
+        bgr = _decode_jpeg_bytes_to_bgr(image_bytes)
+        vec = self._clip_embedder.embed_image(bgr) if bgr is not None else None
+        if vec is None:
             return []
         try:
             results = self._clip_col.query(
-                query_images=[arr],
+                query_embeddings=[vec],
                 n_results=min(n, self._clip_col.count()),
                 include=["distances", "metadatas"],
             )
@@ -614,22 +616,17 @@ class EventVectorStore:
         ]
 
 
-def _decode_b64_to_rgb_array(b64: str):
-    """Decode a base64 JPEG into an (H, W, 3) RGB numpy array — what OpenCLIP wants."""
+def _decode_b64_to_bgr(b64: str):
+    """Decode a base64 JPEG into an (H, W, 3) BGR numpy array (ClipEmbedder converts to RGB)."""
     try:
-        data = base64.b64decode(b64)
-        return _decode_jpeg_bytes_to_rgb(data)
+        return _decode_jpeg_bytes_to_bgr(base64.b64decode(b64))
     except Exception:
         return None
 
 
-def _decode_jpeg_bytes_to_rgb(data: bytes):
+def _decode_jpeg_bytes_to_bgr(data: bytes):
     arr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)   # BGR
-    if img is None:
-        return None
-    # OpenCLIP / PIL expect RGB ordering.
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)   # BGR or None
 
 
 def _hash_b64(b64: str) -> str:

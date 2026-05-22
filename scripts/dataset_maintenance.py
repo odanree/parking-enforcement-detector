@@ -346,11 +346,11 @@ def cmd_clip_backfill(args) -> None:
     Skips rows already present in the CLIP collection.
     """
     os.environ["CLIP_EMBEDDINGS_ENABLED"] = "true"
-    from src.storage.vector_store import EventVectorStore, _decode_jpeg_bytes_to_rgb  # noqa: E402
+    from src.storage.vector_store import EventVectorStore, _decode_jpeg_bytes_to_bgr  # noqa: E402
 
     vs = EventVectorStore(db_path=args.db, dataset_path=args.dataset)
-    if vs._clip_col is None:
-        logger.error("CLIP collection unavailable — install open-clip-torch and pillow")
+    if vs._clip_col is None or vs._clip_embedder is None:
+        logger.error("CLIP embedder unavailable — install open-clip-torch and pillow")
         return
     main_res = vs._col.get(include=["metadatas"], limit=200_000)
     existing = set(vs._clip_col.get(include=[], limit=200_000)["ids"])
@@ -362,31 +362,39 @@ def cmd_clip_backfill(args) -> None:
     if not args.apply:
         logger.info("[DRY-RUN] pass --apply to embed and write")
         return
+
     dataset_dir = Path(args.dataset)
     added = 0
-    for eid, m in todo[: args.limit]:
-        path = dataset_dir / m["thumb_file"]
-        if not path.exists():
-            continue
-        arr = _decode_jpeg_bytes_to_rgb(path.read_bytes())
-        if arr is None:
+    batch = max(1, args.batch)
+    work = todo[: args.limit]
+    for i in range(0, len(work), batch):
+        chunk = work[i:i + batch]
+        ids, bgrs, metas = [], [], []
+        for eid, m in chunk:
+            path = dataset_dir / m["thumb_file"]
+            if not path.exists():
+                continue
+            bgr = _decode_jpeg_bytes_to_bgr(path.read_bytes())
+            if bgr is None:
+                continue
+            ids.append(eid)
+            bgrs.append(bgr)
+            metas.append({
+                "detected":       int(m.get("detected", 0)),
+                "label":          m.get("label", ""),
+                "capture_source": m.get("capture_source", ""),
+                "camera_id":      int(m.get("camera_id", 0)),
+            })
+        if not ids:
             continue
         try:
-            vs._clip_col.add(
-                ids=[eid],
-                images=[arr],
-                metadatas=[{
-                    "detected":       int(m.get("detected", 0)),
-                    "label":          m.get("label", ""),
-                    "capture_source": m.get("capture_source", ""),
-                    "camera_id":      int(m.get("camera_id", 0)),
-                }],
-            )
-            added += 1
+            vecs = vs._clip_embedder.embed_images(bgrs)   # one model, batched
+            vs._clip_col.add(ids=ids, embeddings=vecs, metadatas=metas)
+            added += len(ids)
         except Exception:
-            logger.exception("CLIP add failed for %s", eid)
-        if added and added % 50 == 0:
-            logger.info("Progress: %d/%d added", added, args.limit)
+            logger.exception("CLIP batch add failed (rows %d-%d)", i, i + len(chunk))
+        if added and (i // batch) % 5 == 0:
+            logger.info("Progress: %d/%d embedded", added, len(work))
     logger.info("CLIP backfill complete: %d added", added)
 
 
@@ -549,6 +557,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("clip-backfill", help="Populate CLIP collection from existing thumbnails")
     sp.add_argument("--limit", type=int, default=1000)
+    sp.add_argument("--batch", type=int, default=64, help="images embedded per batch")
     sp.add_argument("--apply", action="store_true")
     sp.set_defaults(func=cmd_clip_backfill)
 
