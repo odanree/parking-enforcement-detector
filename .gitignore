@@ -18,3 +18,6 @@ dataset/*
 data/*
 !data/.gitkeep
 config/privacy_*.json
+
+# Local tool index files
+.lla-*.json
