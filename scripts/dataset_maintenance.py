@@ -398,6 +398,51 @@ def cmd_clip_backfill(args) -> None:
     logger.info("CLIP backfill complete: %d added", added)
 
 
+def cmd_purge_source(args) -> None:
+    """Delete every event with a given capture_source (rows + image files +
+    CLIP embeddings). Used to drop the low-res zone_pedestrian captures so the
+    dataset contains only hi-res snapshots.
+    """
+    client = chromadb.PersistentClient(path=args.db)
+    col = client.get_or_create_collection(_COLLECTION)
+    res = col.get(include=["metadatas"], limit=500_000)
+    rows = [
+        (eid, m) for eid, m in zip(res["ids"], res["metadatas"])
+        if (m.get("capture_source") or "chalking") == args.source
+    ]
+    files: list[str] = []
+    for _, m in rows:
+        for k in ("thumb_file", "hires_file"):
+            if m.get(k):
+                files.append(m[k])
+        for f in (m.get("frame_files") or "").split(","):
+            if f:
+                files.append(f)
+    ids = [eid for eid, _ in rows]
+    logger.info("purge-source '%s': %d rows, %d image files", args.source, len(ids), len(files))
+    if not args.apply:
+        logger.info("[DRY-RUN] pass --apply to delete")
+        return
+    for i in range(0, len(ids), 500):
+        col.delete(ids=ids[i:i + 500])
+    # Cascade to the CLIP collection.
+    try:
+        clip = client.get_collection("chalking_evals_clipv2")
+        for i in range(0, len(ids), 500):
+            clip.delete(ids=ids[i:i + 500])
+    except Exception:
+        logger.debug("clipv2 cascade delete skipped", exc_info=True)
+    ds = Path(args.dataset)
+    removed = 0
+    for f in files:
+        try:
+            (ds / f).unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            pass
+    logger.info("Deleted %d rows, removed %d files (source=%s)", len(ids), removed, args.source)
+
+
 def cmd_merge(args) -> None:
     """Merge a source vector store into the target (--db).
 
