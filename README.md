@@ -8,37 +8,36 @@ Real-time detection of parking enforcement activity using YOLO object detection 
 RTSP / video file
       │
       ▼
-  YOLO (YOLOv8) + ByteTrack     ← detects and tracks persons per frame
+  YOLO (YOLOv8) + ByteTrack     ← tracks persons; post-track gate drops sub-threshold hits
       │
       ▼
-  Zone filter                    ← ignores detections outside the street zone
+  Zone filter + vehicle proximity← only persons dwelling near a vehicle continue
       │
       ▼
-  After-hours gate               ← drops YOLO detections < 40% confidence
-      │  (outside PE window)       outside the 08:00–16:00 enforcement window
-      ▼
-  Behavior analyzers             ← chalking / sweeper / PE vehicle heuristics
-  (entry_frames, cooldown,         only passes tracks that dwell near a vehicle
-   vehicle proximity)
+  Person classifier  (opt-in)    ← skips pedestrians/occupants/delivery before the VLM
+  Pose priors        (opt-in)    ← crouch / wrist-near-wheel signals
+  Wand gate          (opt-in)    ← motion-gated chalk-wand detector (classical CV)
       │
       ▼
-  1st-pass VLM (people detection)← lenient check: is a person next to a vehicle?
-      │  Claude Haiku / Ollama      positives recorded as People Alert in kanban
-      ▼
-  RAG retrieval                  ← nearest neighbors from labeled event store
-      │  ChromaDB                   auto-rejects if FP-close neighbors exceed threshold
-      ▼
-  Confirm VLM (chalking check)   ← strict: does the person exhibit chalking behavior?
-      │  Claude Haiku / Ollama      runs only when 1st-pass positive + RAG allows it
-      ▼
-  Dedup (vector store)           ← skip alert if visually identical event was recently sent
+  After-hours gate               ← drops low-confidence hits outside the PE window
       │
       ▼
-  Alert (email / ntfy / HA webhook)
+  1st-pass VLM (people detection)← lenient: is a person next to a vehicle?
+      │  Claude / Ollama
+      ▼
+  RAG retrieval (ChromaDB)       ← nearest neighbors (text + opt-in CLIP image embeddings);
+      │                            auto-rejects if FP-close neighbors exceed threshold
+      ▼
+  Confirm VLM (chalking check)   ← strict prompt, or structured-evidence + Python policy (opt-in)
       │
       ▼
-  Dashboard (React + WebSocket)
+  Dedup (vector store)           ← skip alert if a visually identical event was recently sent
+      │
+      ▼
+  Alert (email / ntfy / HA webhook)  →  Dashboard (React + WebSocket)
 ```
+
+Stages marked **opt-in** default to off (no behaviour change) and are enabled via env vars below.
 
 ### Detection phases
 
@@ -73,7 +72,11 @@ python -m src.main_web
 docker compose up -d
 ```
 
-The Dockerfile uses a two-stage build: Node 20 compiles the React frontend; Python 3.11 runs the FastAPI server.
+The Dockerfile uses a two-stage build: Node compiles the React frontend; Python 3.11 runs the FastAPI server. The vector store and dataset images persist via the `./data` and `./dataset` bind mounts. Maintenance/ingestion CLIs run in-container, e.g.:
+
+```bash
+docker compose run --rm detector python -m scripts.dataset_maintenance stats
+```
 
 ## Configuration
 
@@ -94,16 +97,32 @@ Key `.env` variables:
 | `DEMO_MODE` | `false` | Hide admin controls (zone editor, alerts, debug) |
 | `HA_WEBHOOK_URL` | — | Home Assistant webhook URL for alert triggers |
 
+Opt-in accuracy/volume features (default off):
+
+| Variable | Default | Description |
+|---|---|---|
+| `PERSON_CLASSIFIER_ENABLED` | `false` | Classify each track once; skip pedestrians/occupants/delivery before the VLM |
+| `POSE_ESTIMATION_ENABLED` | `false` | YOLOv8-pose crouch / wrist-near-wheel priors fed to the VLM |
+| `WAND_GATE` | `off` | `soft` (detect + annotate) or `hard` (escalate to VLM only on a confirmed chalk wand) |
+| `VLM_STRUCTURED_PROMPT` | `false` | VLM returns observation flags; a Python policy makes the chalking decision |
+| `CLIP_EMBEDDINGS_ENABLED` | `false` | Add CLIP image embeddings for visual RAG (needs `open-clip-torch`) |
+
 See [`.env.example`](.env.example) for all options and [`docs/runbooks/operations.md`](docs/runbooks/operations.md) for detailed setup.
 
 ## Stack
 
-- **Detection:** YOLOv8 (Ultralytics) + ByteTrack
-- **VLM:** Claude Haiku via Anthropic API, or any Ollama multimodal model
-- **RAG:** ChromaDB embedding store for labeled-event retrieval and auto-rejection
+- **Detection:** YOLOv8 (Ultralytics) + ByteTrack; opt-in YOLOv8-pose and a classical-CV chalk-wand detector
+- **VLM:** Claude via Anthropic API, or any Ollama multimodal model
+- **RAG:** ChromaDB store (description text + opt-in CLIP image embeddings) for retrieval and auto-rejection
 - **Backend:** FastAPI + WebSocket
 - **Frontend:** React 19 + Vite + Zustand
 - **Alerts:** Email (Gmail SMTP), ntfy.sh, Home Assistant webhook
+
+## Maintenance
+
+- `scripts/dataset_maintenance.py` — vector-store stats, purge errors/shadows, fix confidence, backfill `person_type`, phash clustering, CLIP backfill, merge
+- `scripts/ingest_nvr_positives.py` — ingest ground-truth chalking frames as labeled `chalker` positives (host extract → in-container ingest)
+- `scripts/recover_vector_store.py` — rebuild a collection from raw SQLite if its vector segment is damaged
 
 ## Docs
 
