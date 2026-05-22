@@ -39,8 +39,13 @@ _POSE_MODEL      = os.getenv("POSE_MODEL", "yolov8m-pose.pt")
 #          never suppress a VLM call (use to gather production data first)
 #   hard — only escalate to the VLM when a wand is temporally confirmed for the
 #          track (the volume reducer; risks false negatives if the wand is missed)
+#   promote — a temporally-confirmed wand FORCES a chalking positive (overriding
+#             the VLM/classifier negative); the VLM still runs for description.
+#             Catches real fisheye events the VLM can't visually confirm.
 _WAND_GATE_MODE       = os.getenv("WAND_GATE", "off").lower()
 _WAND_DARK_TORSO      = os.getenv("WAND_REQUIRE_DARK_TORSO", "true").lower() == "true"
+_WAND_PROMOTE         = _WAND_GATE_MODE == "promote"
+_WAND_ENABLED_MODES   = ("soft", "hard", "promote")
 from src.stream.frame_undistorter import FrameUndistorter
 from src.stream.osd_timestamp import extract_osd_timestamp
 from src.stream.hires_snapshot import fetch_hires_jpeg
@@ -271,7 +276,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     _wand_detector = None
     _wand_tracker = None
     _wand_mog = None
-    if _WAND_GATE_MODE in ("soft", "hard"):
+    if _WAND_GATE_MODE in _WAND_ENABLED_MODES:
         try:
             from src.detection.wand_detector import WandDetector, WandTracker
             _wand_detector = WandDetector(require_dark_torso=_WAND_DARK_TORSO)
@@ -825,6 +830,25 @@ _CLASSIFY_SKIP_TYPES = set(
 )
 
 
+def _apply_wand_promote(result: dict, wand_signals: "dict | None", kind: str) -> dict:
+    """Promote to a positive when a wand was temporally confirmed for the track.
+
+    In WAND_GATE=promote mode a confirmed chalk wand is the authoritative signal
+    — it overrides the VLM/classifier negative (the VLM can't see the wand at
+    fisheye distance). The VLM still ran, so its description is kept for context.
+    """
+    if not (_WAND_PROMOTE and wand_signals and wand_signals.get("confirmed")):
+        return result
+    wc = float(wand_signals.get("confidence", 0.0) or 0.0)
+    result[f"{kind}_detected"] = True
+    result["confidence"] = max(float(result.get("confidence", 0.0) or 0.0), wc, 0.70)
+    result["description"] = (
+        f"[WAND-CONFIRMED conf={wc:.2f}] chalk wand detected over multiple frames. "
+        + str(result.get("description", ""))
+    )
+    return result
+
+
 def _two_stage(
     primary: "VLMAnalyzer",
     confirm: "VLMAnalyzer | None",
@@ -881,7 +905,7 @@ def _two_stage(
             classify_trace = {"person_type": pt, "cached": True}
 
         if pt in _CLASSIFY_SKIP_TYPES:
-            return {
+            return _apply_wand_promote({
                 f"{kind}_detected":   False,
                 "sweeper_detected":   False,
                 "pe_vehicle_detected": False,
@@ -890,11 +914,13 @@ def _two_stage(
                 "_rag_neighbors":     [],
                 "_pipeline_trace": {
                     "classify":   classify_trace,
+                    "pose":       pose_signals,
+                    "wand":       wand_signals,
                     "first_pass": None,
                     "rag":        None,
                     "confirm":    None,
                 },
-            }
+            }, wand_signals, kind)
 
     prior_parts: list[str] = []
     if pose_signals:
@@ -976,13 +1002,13 @@ def _two_stage(
         first["_rag_neighbors"]  = rag_neighbors
         first["_pipeline_trace"] = trace
         logger.info("RAG auto-reject: %d FP neighbors (dist<%.2f)", len(fp_close), _RAG_FP_THRESHOLD)
-        return first
+        return _apply_wand_promote(first, wand_signals, kind)
 
     first["_rag_neighbors"]  = rag_neighbors
     first["_pipeline_trace"] = trace
 
     if confirm is None or not first.get(f"{kind}_detected", False):
-        return first
+        return _apply_wand_promote(first, wand_signals, kind)
 
     # ── Confirm stage ─────────────────────────────────────────────────────────
     logger.debug("Two-stage: %s positive → confirm VLM", kind)
@@ -995,7 +1021,7 @@ def _two_stage(
     }
     second["_rag_neighbors"]  = rag_neighbors
     second["_pipeline_trace"] = trace
-    return second
+    return _apply_wand_promote(second, wand_signals, kind)
 
 
 _VLM_CROP_W = 1280
