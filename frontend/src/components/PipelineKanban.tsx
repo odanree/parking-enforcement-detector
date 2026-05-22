@@ -491,8 +491,10 @@ const COLUMNS: { key: string; label: string; desc: string }[] = [
   { key: 'no_person',    label: 'No Person ✗',    desc: 'Rejected — no person near vehicle'       },
   { key: 'vlm_error',    label: 'VLM Error ⚠',    desc: 'Timeout / connection failure'            },
   { key: 'not_chalking', label: 'False Detect ✗', desc: 'Model disagreement — not a real detection' },
-  { key: 'pedestrian',   label: 'Pedestrian ✓',   desc: 'Person on sidewalk / walking by'         },
-  { key: 'occupant',     label: 'Occupant ✓',     desc: 'Person exiting or entering vehicle'      },
+  { key: 'pedestrian',   label: 'Pedestrian',     desc: 'Person on sidewalk / walking by'         },
+  { key: 'occupant',     label: 'Occupant',       desc: 'Person exiting or entering vehicle'      },
+  { key: 'delivery',     label: 'Delivery',       desc: 'Delivery driver carrying packages'       },
+  { key: 'landscaper',   label: 'Landscaper',     desc: 'Gardener / maintenance worker'           },
   { key: 'chalking',     label: 'Chalking ✓',     desc: 'Confirmed chalking activity'             },
 ];
 
@@ -505,17 +507,25 @@ function cardColumn(card: TraceCard): string {
   if (card.rejection_reason === 'vlm_error')    return 'vlm_error';
 
   const desc = card.description || card.first_pass?.description || '';
+  const detected = card.outcome === 'people_alert' || card.outcome === 'detected';
 
-  if (card.outcome === 'people_alert' || card.outcome === 'detected') {
-    if (card.confirm?.detected) return 'chalking';
-    return _PEDESTRIAN_RE.test(desc) ? 'pedestrian' : 'occupant';
+  // Confirmed chalking always wins.
+  if (detected && card.confirm?.detected) return 'chalking';
+
+  // Route by the classifier's person_type when known. This covers classifier
+  // short-circuits (pedestrian/occupant/delivery skip the VLM and are "rejected"
+  // by design but ARE correctly-classified people, not false detections).
+  switch (card.person_type) {
+    case 'pedestrian':       return 'pedestrian';
+    case 'occupant':         return 'occupant';
+    case 'worker_delivery':  return 'delivery';
+    case 'worker_landscape': return 'landscaper';
+    case 'chalker':          return detected ? 'chalking' : 'not_chalking';
   }
 
-  if (card.outcome === 'rejected') {
-    // RAG-blocked and confirm-rejected both land in not_chalking (columns removed)
-    return _NO_PERSON_RE.test(desc) ? 'no_person' : 'not_chalking';
-  }
-
+  // No classifier label → fall back to outcome/description heuristics.
+  if (detected) return _PEDESTRIAN_RE.test(desc) ? 'pedestrian' : 'occupant';
+  if (card.outcome === 'rejected') return _NO_PERSON_RE.test(desc) ? 'no_person' : 'not_chalking';
   return 'no_person';
 }
 
@@ -619,7 +629,8 @@ export function PipelineKanban() {
   const rejected  = visibleCards.filter((c) => c.outcome === 'rejected');
 
   const byColumn: Record<string, TraceCard[]> = {
-    time_window: [], no_person: [], vlm_error: [], not_chalking: [], pedestrian: [], occupant: [], chalking: [],
+    time_window: [], no_person: [], vlm_error: [], not_chalking: [],
+    pedestrian: [], occupant: [], delivery: [], landscaper: [], chalking: [],
   };
   for (const card of visibleCards) {
     const col = cardColumn(card);
