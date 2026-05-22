@@ -487,14 +487,12 @@ function StageDetailModal({ cards: allCards, startIndex, onClose, onLabeled }: {
 }
 
 const COLUMNS: { key: string; label: string; desc: string }[] = [
-  { key: 'time_window',  label: 'Off Hours ✗',    desc: 'Outside PE enforcement window'           },
   { key: 'no_person',    label: 'No Person ✗',    desc: 'Rejected — no person near vehicle'       },
   { key: 'vlm_error',    label: 'VLM Error ⚠',    desc: 'Timeout / connection failure'            },
   { key: 'not_chalking', label: 'False Detect ✗', desc: 'Model disagreement — not a real detection' },
   { key: 'pedestrian',   label: 'Pedestrian',     desc: 'Person on sidewalk / walking by'         },
   { key: 'occupant',     label: 'Occupant',       desc: 'Person exiting or entering vehicle'      },
-  { key: 'delivery',     label: 'Delivery',       desc: 'Delivery driver carrying packages'       },
-  { key: 'landscaper',   label: 'Landscaper',     desc: 'Gardener / maintenance worker'           },
+  { key: 'worker',       label: 'Worker',         desc: 'Delivery driver, landscaper, or maintenance' },
   { key: 'chalking',     label: 'Chalking ✓',     desc: 'Confirmed chalking activity'             },
 ];
 
@@ -502,7 +500,6 @@ const _NO_PERSON_RE   = /no person|not visible|nobody|no one|not anyone|not pres
 const _PEDESTRIAN_RE  = /sidewalk|pedestrian|walking|walk by|passing|foot traffic|passer|stroll/i;
 
 function cardColumn(card: TraceCard): string {
-  if (card.rejection_reason === 'out_of_hours') return 'time_window';
   if (card.rejection_reason === 'suppressed')   return 'no_person';
   if (card.rejection_reason === 'vlm_error')    return 'vlm_error';
 
@@ -518,8 +515,8 @@ function cardColumn(card: TraceCard): string {
   switch (card.person_type) {
     case 'pedestrian':       return 'pedestrian';
     case 'occupant':         return 'occupant';
-    case 'worker_delivery':  return 'delivery';
-    case 'worker_landscape': return 'landscaper';
+    case 'worker_delivery':  return 'worker';
+    case 'worker_landscape': return 'worker';
     case 'chalker':          return detected ? 'chalking' : 'not_chalking';
   }
 
@@ -629,8 +626,8 @@ export function PipelineKanban() {
   const rejected  = visibleCards.filter((c) => c.outcome === 'rejected');
 
   const byColumn: Record<string, TraceCard[]> = {
-    time_window: [], no_person: [], vlm_error: [], not_chalking: [],
-    pedestrian: [], occupant: [], delivery: [], landscaper: [], chalking: [],
+    no_person: [], vlm_error: [], not_chalking: [],
+    pedestrian: [], occupant: [], worker: [], chalking: [],
   };
   for (const card of visibleCards) {
     const col = cardColumn(card);

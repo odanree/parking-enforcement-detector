@@ -1450,12 +1450,14 @@ main {
   color: var(--text);
 }
 
-/* VLM Error ⚠ (col 3) */
-.kanban-col:nth-child(3) .kanban-col-title  { color: #f59e0b; }
-.kanban-col:nth-child(3) .kanban-col-header { border-bottom-color: #f59e0b33; }
-/* Pedestrian ✓ (col 5) and Occupant ✓ (col 6) */
+/* VLM Error ⚠ (col 2) */
+.kanban-col:nth-child(2) .kanban-col-title  { color: #f59e0b; }
+.kanban-col:nth-child(2) .kanban-col-header { border-bottom-color: #f59e0b33; }
+/* Person-type columns: Pedestrian (4), Occupant (5), Worker (6) */
+.kanban-col:nth-child(4) .kanban-col-title,
 .kanban-col:nth-child(5) .kanban-col-title,
 .kanban-col:nth-child(6) .kanban-col-title  { color: #60a5fa; }
+.kanban-col:nth-child(4) .kanban-col-header,
 .kanban-col:nth-child(5) .kanban-col-header,
 .kanban-col:nth-child(6) .kanban-col-header { border-bottom-color: #60a5fa33; }
 /* Chalking ✓ (col 7 / last) */
