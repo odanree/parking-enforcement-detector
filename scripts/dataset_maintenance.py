@@ -612,6 +612,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--apply", action="store_true")
     sp.set_defaults(func=cmd_merge)
 
+    sp = sub.add_parser("purge-source", help="Delete all events of a given capture_source")
+    sp.add_argument("--source", required=True, help="capture_source to delete (e.g. zone_pedestrian)")
+    sp.add_argument("--apply", action="store_true")
+    sp.set_defaults(func=cmd_purge_source)
+
     args = p.parse_args(argv)
     args.func(args)
     return 0
