@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -38,6 +39,26 @@ def _try_default_ef():
         return None
 
 
+def _try_clip_ef():
+    """Return an OpenCLIP embedding function or None.
+
+    open_clip is a heavy optional dependency; if it isn't installed we run
+    without image embeddings rather than failing the whole pipeline.
+    """
+    if os.getenv("CLIP_EMBEDDINGS_ENABLED", "false").lower() != "true":
+        return None
+    try:
+        from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
+        ef = OpenCLIPEmbeddingFunction()
+        return ef
+    except Exception as exc:
+        logger.warning(
+            "CLIP embedding function unavailable (%s) — install open-clip-torch "
+            "and pillow to enable image-similarity search.", exc.__class__.__name__,
+        )
+        return None
+
+
 class EventVectorStore:
     def __init__(
         self,
@@ -54,6 +75,24 @@ class EventVectorStore:
             name="chalking_evals",
             embedding_function=ef,
         )
+
+        # Parallel CLIP image-embedding collection (opt-in). Mirrors event_ids
+        # so callers can cross-reference; metadata is intentionally minimal
+        # (we already store the full record in the main collection).
+        self._clip_col = None
+        clip_ef = _try_clip_ef()
+        if clip_ef is not None:
+            try:
+                self._clip_col = self._client.get_or_create_collection(
+                    name="chalking_evals_clip",
+                    embedding_function=clip_ef,
+                    metadata={"hnsw:space": "cosine"},
+                )
+                logger.info("CLIP image-embedding collection ready (%d entries)", self._clip_col.count())
+            except Exception:
+                logger.exception("CLIP collection init failed — continuing text-only")
+                self._clip_col = None
+
         # Persistent dedup: load all known hashes so restarts don't re-add the
         # same frame if the pipeline replays the same footage.
         all_meta = self._col.get(include=["metadatas"], limit=100_000).get("metadatas", [])
@@ -127,6 +166,25 @@ class EventVectorStore:
                 self._thumb_hashes.add(thumb_hash)
         except Exception:
             logger.exception("Failed to add event %s to vector store", event_id)
+
+        # CLIP image embedding (mirrors event_id). Best-effort; failures here
+        # never block the main collection write.
+        if self._clip_col is not None and thumbnail_b64:
+            try:
+                arr = _decode_b64_to_rgb_array(thumbnail_b64)
+                if arr is not None:
+                    self._clip_col.add(
+                        ids=[event_id],
+                        images=[arr],
+                        metadatas=[{
+                            "detected":       int(detected),
+                            "label":          "",
+                            "capture_source": capture_source,
+                            "camera_id":      int(camera_id),
+                        }],
+                    )
+            except Exception:
+                logger.debug("CLIP add failed for %s", event_id, exc_info=True)
         return event_id
 
     def update_label(self, event_id: str, label: str) -> None:
@@ -166,6 +224,11 @@ class EventVectorStore:
                 (self._dataset / fname).unlink(missing_ok=True)
         self._col.delete(ids=[event_id])
         self._thumb_hashes.discard(meta.get("thumb_hash", ""))
+        if self._clip_col is not None:
+            try:
+                self._clip_col.delete(ids=[event_id])
+            except Exception:
+                logger.debug("CLIP delete failed for %s", event_id, exc_info=True)
 
     def get_filtered(
         self,
@@ -280,6 +343,63 @@ class EventVectorStore:
                 results["distances"][0],
             )
         ]
+
+    def query_similar_by_image(self, image_bytes: bytes, n: int = 5) -> list[dict]:
+        """Find n events whose thumbnail is visually closest to the given image.
+
+        Returns rich metadata by cross-referencing back to the main collection.
+        No-op (returns []) when the CLIP collection is disabled or empty.
+        """
+        if self._clip_col is None or self._clip_col.count() < 1:
+            return []
+        arr = _decode_jpeg_bytes_to_rgb(image_bytes)
+        if arr is None:
+            return []
+        try:
+            results = self._clip_col.query(
+                query_images=[arr],
+                n_results=min(n, self._clip_col.count()),
+                include=["distances", "metadatas"],
+            )
+        except Exception:
+            logger.exception("CLIP query failed")
+            return []
+        ids = results.get("ids", [[]])[0]
+        dists = results.get("distances", [[]])[0]
+        if not ids:
+            return []
+        # Cross-reference into the main collection for full metadata + description.
+        main = self._col.get(ids=ids, include=["documents", "metadatas"])
+        by_id = {
+            eid: {"id": eid, "description": doc, **meta}
+            for eid, doc, meta in zip(main["ids"], main["documents"], main["metadatas"])
+        }
+        out: list[dict] = []
+        for eid, dist in zip(ids, dists):
+            row = by_id.get(eid)
+            if row is None:
+                continue
+            row["distance"] = round(float(dist), 4)
+            out.append(row)
+        return out
+
+    def query_similar_image(self, event_id: str, n: int = 10) -> list[dict]:
+        """Image-similarity counterpart to ``query_similar``: nearest by CLIP."""
+        if self._clip_col is None:
+            return []
+        meta = self._col.get(ids=[event_id], include=["metadatas"])
+        if not meta["ids"]:
+            return []
+        thumb_file = meta["metadatas"][0].get("thumb_file", "")
+        if not thumb_file:
+            return []
+        path = self._dataset / thumb_file
+        if not path.exists():
+            return []
+        return [
+            r for r in self.query_similar_by_image(path.read_bytes(), n=n + 1)
+            if r["id"] != event_id
+        ][:n]
 
     def query_similar(self, event_id: str, n: int = 10) -> list[dict]:
         src = self._col.get(ids=[event_id], include=["documents"])
@@ -408,6 +528,11 @@ class EventVectorStore:
 
         if to_delete:
             self._col.delete(ids=to_delete)
+            if self._clip_col is not None:
+                try:
+                    self._clip_col.delete(ids=to_delete)
+                except Exception:
+                    logger.debug("CLIP delete-batch failed", exc_info=True)
 
         removed_files = 0
         for fname in files_to_remove:
@@ -430,6 +555,11 @@ class EventVectorStore:
             all_ids = self._col.get(include=[], limit=100_000)["ids"]
             if all_ids:
                 self._col.delete(ids=all_ids)
+                if self._clip_col is not None:
+                    try:
+                        self._clip_col.delete(ids=all_ids)
+                    except Exception:
+                        logger.debug("CLIP clear_all delete failed", exc_info=True)
         self._thumb_hashes.clear()
         removed_files = 0
         for f in self._dataset.iterdir():
@@ -482,6 +612,24 @@ class EventVectorStore:
                 result["ids"], result["documents"], result["metadatas"]
             )
         ]
+
+
+def _decode_b64_to_rgb_array(b64: str):
+    """Decode a base64 JPEG into an (H, W, 3) RGB numpy array — what OpenCLIP wants."""
+    try:
+        data = base64.b64decode(b64)
+        return _decode_jpeg_bytes_to_rgb(data)
+    except Exception:
+        return None
+
+
+def _decode_jpeg_bytes_to_rgb(data: bytes):
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)   # BGR
+    if img is None:
+        return None
+    # OpenCLIP / PIL expect RGB ordering.
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def _hash_b64(b64: str) -> str:

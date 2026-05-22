@@ -27,6 +27,11 @@ from src.behavior.chalking_analyzer import ChalkingAnalyzer
 from src.detection.motion_detector import MotionDetector
 from src.detection.object_detector import Detection, ObjectDetector
 from src.detection.zone_filter import ZoneFilter
+
+_POSE_ENABLED = os.getenv("POSE_ESTIMATION_ENABLED", "false").lower() == "true"
+_POSE_CONTACT_PX = int(os.getenv("POSE_CONTACT_PX", "35"))
+_POSE_KNEE_DEG   = float(os.getenv("POSE_KNEE_DEG", "130"))
+_POSE_MODEL      = os.getenv("POSE_MODEL", "yolov8m-pose.pt")
 from src.stream.frame_undistorter import FrameUndistorter
 from src.stream.osd_timestamp import extract_osd_timestamp
 from src.stream.hires_snapshot import fetch_hires_jpeg
@@ -224,6 +229,34 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     # Each entry: (future, kind, track_id, snap_frame, bbox, thumb_b64)
     _vlm_jobs: dict[tuple[str, int], tuple[Future, str, int, np.ndarray, tuple, str]] = {}
 
+    # Person-type classifier cache: tid -> person_type (one classify per track).
+    # Re-use the primary VLM for classification unless an explicit override is
+    # provided; the call is cheap and reuses cache_control on Claude.
+    _classify_cache: dict[int, str] = {}
+    _classify_vlm: VLMAnalyzer | None = vlm if _CLASSIFY_ENABLED else None
+    if _CLASSIFY_ENABLED:
+        logger.info(
+            "Person classifier ENABLED — skip types: %s",
+            ",".join(sorted(_CLASSIFY_SKIP_TYPES)),
+        )
+
+    # Pose estimator — opt-in. Provides deterministic crouch / wrist-low /
+    # wrist-near-vehicle signals that the VLM can use as a structured prior.
+    _pose_estimator = None
+    if _POSE_ENABLED:
+        try:
+            from src.detection.pose_estimator import PoseEstimator
+            _pose_estimator = PoseEstimator(
+                model_path=_POSE_MODEL,
+                contact_px=_POSE_CONTACT_PX,
+                knee_angle_threshold_deg=_POSE_KNEE_DEG,
+            )
+        except Exception:
+            logger.exception("Pose estimator failed to load — continuing without pose")
+            _pose_estimator = None
+    # Per-frame map populated below: track_id -> PoseSignals
+    _pose_by_track: dict[int, "object"] = {}
+
 
     _initial_paused = os.getenv("INITIAL_PAUSED", "false").lower() == "true"
     if video_path and _initial_paused:
@@ -314,6 +347,23 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             # (None causes _in_pe_window to fall back to datetime.now())
             _frame_wall_ts = getattr(stream, 'get_current_wall_time', lambda: None)()
 
+            # ── Pose estimation (opt-in) ────────────────────────────────────
+            # Computed once per frame over all zone persons; results keyed by
+            # track_id and consumed when building the chalking VLM job.
+            _pose_by_track.clear()
+            if _pose_estimator is not None:
+                _vehicle_bb_for_pose = [
+                    d.bbox for d in all_dets
+                    if d.class_name in {"car", "truck", "motorcycle"}
+                ]
+                _zone_persons = [d for d in zone_dets if d.class_name == "person"]
+                if _zone_persons:
+                    try:
+                        for ps in _pose_estimator.estimate(frame, _zone_persons, _vehicle_bb_for_pose):
+                            _pose_by_track[ps.track_id] = ps
+                    except Exception:
+                        logger.debug("pose.estimate failed", exc_info=True)
+
             active_ids = {d.track_id for d in zone_dets}
             alert_ids.clear()
 
@@ -398,6 +448,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 if kind == "chalking" and vector_store:
                     try:
                         _pt = pipeline_trace or {}
+                        _classify_pt = (_pt.get("classify") or {}).get("person_type", "")
                         _event_id = vector_store.add(
                             description=result.get("description", ""),
                             detected=detected,
@@ -409,6 +460,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                             model_confirm=(_pt.get("confirm") or {}).get("backend", ""),
                             yolo_confidence=yolo_conf,
                             hires_b64=hires_b64,
+                            person_type=_classify_pt,
                             timestamp=_rej_ts if not detected else None,
                         )
                         _is_duplicate = (not _IS_PLAYBACK) and (_event_id == "")
@@ -454,14 +506,21 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 _ped_fr = _annotate_person(frame, det.bbox, det.confidence)
                                 _, _ped_enc = cv2.imencode('.jpg', _ped_fr, [cv2.IMWRITE_JPEG_QUALITY, 75])
                                 _ped_thumb = _thumb_b64_from_jpeg(_ped_enc.tobytes())
+                                # Diversify description so the text embedding doesn't collapse
+                                # every zone-pedestrian capture into a single point — this is
+                                # what makes RAG nearest-neighbour useful across pedestrians.
+                                _ped_desc = _zone_pedestrian_description(
+                                    det, _det_w, _det_h, _classify_cache.get(det.track_id)
+                                )
                                 try:
                                     vector_store.add(
-                                        description="Zone pedestrian — not near any vehicle",
+                                        description=_ped_desc,
                                         detected=False,
                                         confidence=det.confidence,
                                         camera_id=state.camera_id if state else 0,
                                         thumbnail_b64=_ped_thumb,
                                         yolo_confidence=det.confidence,
+                                        person_type=_classify_cache.get(det.track_id, "") or "",
                                         capture_source="zone_pedestrian",
                                     )
                                 except Exception:
@@ -537,7 +596,13 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 # Full hi-res is kept in the dataset via _hires_b64.
                                 _vlm_jpg = _crop_vlm_from_hires(_hires_jpg, det.bbox, _det_w, _det_h) if _hires_jpg and det.bbox else None
                                 vlm_frames = [_vlm_jpg] if _vlm_jpg else ([scene] + detail_frames)
-                                fut = _vlm_pool.submit(_two_stage, vlm, confirm_vlm, vlm_frames, "chalking", vector_store)
+                                _ps = _pose_by_track.get(det.track_id)
+                                _ps_dict = _ps.as_dict() if _ps is not None else None
+                                fut = _vlm_pool.submit(
+                                    _two_stage,
+                                    vlm, confirm_vlm, vlm_frames, "chalking", vector_store,
+                                    _classify_vlm, _classify_cache, det.track_id, _ps_dict,
+                                )
                                 _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence, _hires_b64)
                                 if state:
                                     state.add_pending_vlm("chalking", det.track_id, thumb)
@@ -549,6 +614,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             for tid in list(_zone_ped_last_seen.keys()):
                 if tid not in active_ids:
                     del _zone_ped_last_seen[tid]
+            for tid in list(_classify_cache.keys()):
+                if tid not in active_ids:
+                    del _classify_cache[tid]
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
@@ -675,6 +743,15 @@ _RAG_AUTO_REJECT   = os.getenv("RAG_AUTO_REJECT", "false").lower() == "true"
 _RAG_FP_THRESHOLD  = float(os.getenv("RAG_FP_THRESHOLD", "0.30"))
 _RAG_FP_MIN_VOTES  = int(os.getenv("RAG_FP_MIN_VOTES", "3"))
 
+# Person-type classifier pre-filter — runs once per track, caches result.
+# Types listed here short-circuit the chalking VLM call entirely.
+_CLASSIFY_ENABLED   = os.getenv("PERSON_CLASSIFIER_ENABLED", "false").lower() == "true"
+_CLASSIFY_SKIP_TYPES = set(
+    t.strip() for t in os.getenv(
+        "PERSON_CLASSIFIER_SKIP", "pedestrian,occupant,worker_delivery"
+    ).split(",") if t.strip()
+)
+
 
 def _two_stage(
     primary: "VLMAnalyzer",
@@ -682,6 +759,10 @@ def _two_stage(
     frames: "list[bytes]",
     kind: str,
     rag_store=None,
+    classify_vlm: "VLMAnalyzer | None" = None,
+    classify_cache: "dict[int, str] | None" = None,
+    track_id: "int | None" = None,
+    pose_signals: "dict | None" = None,
 ) -> dict:
     """Run primary VLM; RAG lookup; optionally skip confirm; run confirm VLM.
 
@@ -689,11 +770,73 @@ def _two_stage(
       _usage          — token usage from whichever VLM ran last
       _rag_neighbors  — list of similar labeled events from ChromaDB
       _pipeline_trace — per-stage breakdown for the kanban view
+
+    If ``classify_vlm`` is supplied alongside a cache + track_id, a one-shot
+    person-type classification runs first per track; classes in
+    ``_CLASSIFY_SKIP_TYPES`` short-circuit and never reach the chalking VLM.
     """
-    first = primary.analyze(frames, kind)
+    # ── Optional classifier pre-filter ──────────────────────────────────────
+    classify_trace: dict | None = None
+    if (
+        classify_vlm is not None
+        and classify_cache is not None
+        and track_id is not None
+    ):
+        pt = classify_cache.get(track_id)
+        if pt is None:
+            try:
+                # Use the most recent detail crop — last frame is freshest.
+                cresult = classify_vlm.classify_person(frames[-1:])
+                pt = str(cresult.get("person_type", "unknown"))
+                classify_cache[track_id] = pt
+                classify_trace = {
+                    "person_type": pt,
+                    "confidence":  cresult.get("confidence", 0.0),
+                    "description": cresult.get("description", ""),
+                    "backend":     classify_vlm.model_name,
+                    "cached":      False,
+                }
+            except Exception:
+                logger.debug("classify_person failed", exc_info=True)
+                pt = "unknown"
+                classify_cache[track_id] = pt
+                classify_trace = {"person_type": pt, "cached": False, "error": True}
+        else:
+            classify_trace = {"person_type": pt, "cached": True}
+
+        if pt in _CLASSIFY_SKIP_TYPES:
+            return {
+                f"{kind}_detected":   False,
+                "sweeper_detected":   False,
+                "pe_vehicle_detected": False,
+                "confidence":         1.0,
+                "description":        f"Classifier short-circuit: person_type={pt}",
+                "_rag_neighbors":     [],
+                "_pipeline_trace": {
+                    "classify":   classify_trace,
+                    "first_pass": None,
+                    "rag":        None,
+                    "confirm":    None,
+                },
+            }
+
+    prior_str = None
+    if pose_signals:
+        # Compact, fact-only sentence — the VLM tends to over-anchor on long hints.
+        flags = []
+        if pose_signals.get("is_crouching"):       flags.append("crouching")
+        if pose_signals.get("hand_low"):           flags.append("hand-low (wrist near ground)")
+        if pose_signals.get("wrist_near_vehicle"): flags.append("wrist within 35px of a vehicle")
+        if not flags:
+            flags.append("neutral stance")
+        prior_str = "; ".join(flags) + f" (pose conf={pose_signals.get('confidence', 0.0):.2f})"
+
+    first = primary.analyze(frames, kind, prior_signals=prior_str)
 
     # ── Stage 1 snapshot ─────────────────────────────────────────────────────
     trace: dict = {
+        "classify": classify_trace,
+        "pose":     pose_signals,
         "first_pass": {
             "detected":    first.get(f"{kind}_detected", False),
             "confidence":  first.get("confidence", 0.0),
@@ -759,7 +902,7 @@ def _two_stage(
 
     # ── Confirm stage ─────────────────────────────────────────────────────────
     logger.debug("Two-stage: %s positive → confirm VLM", kind)
-    second = confirm.analyze(frames, kind)
+    second = confirm.analyze(frames, kind, prior_signals=prior_str)
     trace["confirm"] = {
         "detected":    second.get(f"{kind}_detected", False),
         "confidence":  second.get("confidence", 0.0),
@@ -881,6 +1024,40 @@ def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> byt
                  max(0, x1 - pad_x)     : min(w, x2 + pad_x)]
     ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else b""
+
+
+def _zone_pedestrian_description(
+    det: "Detection",
+    frame_w: int,
+    frame_h: int,
+    person_type: str | None,
+) -> str:
+    """Build a discriminating description for a zone pedestrian.
+
+    A single hardcoded string collapses every zone_pedestrian event to the same
+    vector in ChromaDB, which defeats nearest-neighbour search across thousands
+    of stored frames. Adding spatial grid position, bbox size bucket, and the
+    classifier label (when available) produces enough variation for embeddings
+    to distinguish e.g. "person walking centre-left near sidewalk" from
+    "delivery worker top-right of zone".
+    """
+    cx, cy = det.center
+    # 3x3 spatial grid
+    col = ["left", "centre", "right"][min(2, max(0, (cx * 3) // max(1, frame_w)))]
+    row = ["top", "middle", "bottom"][min(2, max(0, (cy * 3) // max(1, frame_h)))]
+    # Bucket bbox height into rough scale categories
+    h = det.height
+    if h < 40:
+        scale = "small"
+    elif h < 90:
+        scale = "medium"
+    else:
+        scale = "large"
+    pt = person_type or "unclassified"
+    return (
+        f"Zone pedestrian ({pt}), {row}-{col} of frame, {scale} bbox "
+        f"({h}px high, yolo={det.confidence:.2f}). No nearby vehicle."
+    )
 
 
 def _near_vehicle(

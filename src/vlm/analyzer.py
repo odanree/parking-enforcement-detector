@@ -33,6 +33,36 @@ logger = logging.getLogger(__name__)
 
 _OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
 
+# Structured-evidence prompt — opt-in via VLM_STRUCTURED_PROMPT=true.
+# The model returns discrete observation flags; final classification logic
+# lives in Python (apply_chalking_policy) so behaviour is testable and the
+# prompt stays short enough for Haiku-class models to follow reliably.
+_STRUCTURED_SYSTEM_PROMPT = (
+    "You are a vision analyst examining overhead street-camera frames. "
+    "Report ONLY what is visually present — do NOT reason about whether it is "
+    "chalking. A separate policy layer combines your flags into a decision. "
+    "Always respond with valid JSON only, no markdown, no commentary."
+)
+
+_STRUCTURED_USER_PROMPT = (
+    "Return JSON with these exact keys:\n"
+    "{\n"
+    '  "tool_visible": <bool>,           // a long thin object held IN a hand pointing toward ground/wheel\n'
+    '  "tool_confidence": <0..1>,        // your visual certainty for tool_visible\n'
+    '  "crouching_or_bending": <bool>,   // person\'s torso is angled downward OR they are squatting/kneeling\n'
+    '  "close_to_rear_wheel": <bool>,    // within ~1 person-width of a parked vehicle\'s rear wheel area\n'
+    '  "trunk_or_hatch_open": <bool>,    // any vehicle near the person has a raised trunk, hatch, or open door\n'
+    '  "movement_pattern": <"rear_to_front"|"front_to_back"|"stationary"|"leaving_vehicle"|"unclear">,\n'
+    '  "notes": <one short sentence describing the scene>,\n'
+    '  "observed_confidence": <0..1>     // your overall certainty in the above observations\n'
+    "}\n"
+    "Notes:\n"
+    "- Do NOT compute chalking_detected; leave that to the policy layer.\n"
+    "- Backpacks, shoulder bags, shadows, arms, and clothing do NOT count as tools.\n"
+    "- 'leaving_vehicle' is when the person walks away from a vehicle's door/trunk area.\n"
+    "- 'stationary' is when the person remains in roughly one position across frames.\n"
+)
+
 # Strict prompt — used by the confirm stage (Claude/Sonnet).
 _USER_PROMPT = (
     'Analyze this street camera crop (overhead/wide-angle, person appears small) '
@@ -165,7 +195,7 @@ def _normalize_classify(data: dict) -> dict:
         pt = "unknown"
     return {
         "person_type": pt,
-        "confidence":  float(data.get("confidence", 0.0)),
+        "confidence":  _normalize_confidence(data.get("confidence", 0.0)),
         "description": str(data.get("description", "")),
     }
 
@@ -212,6 +242,59 @@ _FALLBACK = {
 }
 
 
+_STRUCTURED_MODE = os.getenv("VLM_STRUCTURED_PROMPT", "false").lower() == "true"
+
+
+def apply_chalking_policy(obs: dict) -> dict:
+    """Combine the VLM's structured observations into a chalking verdict.
+
+    Policy precedence (highest to lowest):
+      1. trunk_or_hatch_open OR leaving_vehicle → false (exclusion)
+      2. tool_visible AND tool_confidence ≥ 0.5 → true (tool gate)
+      3. crouching_or_bending AND close_to_rear_wheel → true (posture gate)
+      4. movement_pattern == 'rear_to_front' AND close_to_rear_wheel → true
+         (officer walking pattern; conf capped at 0.65 if no posture/tool)
+      5. otherwise → false
+
+    Returns a dict in the canonical pipeline shape with a synthesized
+    ``description`` for the kanban view.
+    """
+    trunk      = bool(obs.get("trunk_or_hatch_open", False))
+    leaving    = obs.get("movement_pattern") == "leaving_vehicle"
+    tool       = bool(obs.get("tool_visible", False))
+    tool_c     = float(obs.get("tool_confidence", 0.0))
+    crouch     = bool(obs.get("crouching_or_bending", False))
+    close      = bool(obs.get("close_to_rear_wheel", False))
+    pattern    = str(obs.get("movement_pattern", "unclear"))
+    obs_conf   = float(obs.get("observed_confidence", 0.5))
+    notes      = str(obs.get("notes", ""))
+
+    detected = False
+    reason = ""
+    confidence = 0.0
+
+    if trunk or leaving:
+        reason = "trunk/door/hatch open or person leaving vehicle"
+    elif tool and tool_c >= 0.5:
+        detected, reason, confidence = True, "tool visible in hand", min(1.0, max(tool_c, obs_conf))
+    elif crouch and close:
+        detected, reason, confidence = True, "crouch + adjacent to rear wheel", obs_conf
+    elif pattern == "rear_to_front" and close:
+        detected, reason, confidence = True, "rear-to-front officer pattern near wheel", min(0.65, obs_conf)
+    else:
+        reason = "no qualifying evidence"
+
+    desc = f"[policy] {reason}. {notes}".strip()
+    return {
+        "chalking_detected":  detected,
+        "sweeper_detected":   False,
+        "pe_vehicle_detected": False,
+        "confidence":         _normalize_confidence(confidence) if detected else _normalize_confidence(obs_conf),
+        "description":        desc,
+        "_observations":      obs,  # carried through trace for debugging
+    }
+
+
 class VLMAnalyzer:
     def __init__(
         self,
@@ -221,12 +304,18 @@ class VLMAnalyzer:
         ollama_model: str = "llava:7b-v1.6-mistral-q4_K_M",
         user_prompt: str | None = None,
         system_prompt: str | None = None,
+        structured: bool | None = None,
     ) -> None:
         self._backend = backend
         self._ollama_url = ollama_url.rstrip("/")
         self._ollama_model = ollama_model
-        self._user_prompt = user_prompt or _USER_PROMPT
-        self._system_prompt = system_prompt or _SYSTEM_PROMPT
+        self._structured = _STRUCTURED_MODE if structured is None else structured
+        if self._structured:
+            self._user_prompt = user_prompt or _STRUCTURED_USER_PROMPT
+            self._system_prompt = system_prompt or _STRUCTURED_SYSTEM_PROMPT
+        else:
+            self._user_prompt = user_prompt or _USER_PROMPT
+            self._system_prompt = system_prompt or _SYSTEM_PROMPT
 
         if backend == "claude":
             self._claude = anthropic.Anthropic()
@@ -277,19 +366,37 @@ class VLMAnalyzer:
             logger.exception("classify_person error")
             return _CLASSIFY_FALLBACK.copy()
 
-    def analyze(self, image_bytes: bytes | list[bytes], kind: str = "") -> dict:
+    def analyze(
+        self,
+        image_bytes: bytes | list[bytes],
+        kind: str = "",
+        prior_signals: str | None = None,
+    ) -> dict:
         """Send one or more JPEG frames to the VLM and return the parsed JSON result.
 
         When a list is passed the frames are treated as a chronological sequence
         (oldest first) so the model can use earlier context to disambiguate.
+
+        ``prior_signals`` is an optional short string (≤ 200 chars) describing
+        deterministic priors from upstream (e.g. pose: crouching, wrist near
+        wheel). It is appended to the user prompt as a hint, not as ground
+        truth — the VLM still owns the final decision.
         """
         if self._backend == "mock":
             return _MOCK_RESULTS.get(kind, _MOCK_RESULTS["pe_vehicle"])
         frames = image_bytes if isinstance(image_bytes, list) else [image_bytes]
         try:
             if self._backend == "claude":
-                return self._analyze_claude(frames)
-            return self._analyze_ollama(frames)
+                raw = self._analyze_claude(frames, prior_signals=prior_signals)
+            else:
+                raw = self._analyze_ollama(frames, prior_signals=prior_signals)
+            if self._structured:
+                obs = raw.get("_obs_raw", {})
+                policy_result = apply_chalking_policy(obs)
+                if "_usage" in raw:
+                    policy_result["_usage"] = raw["_usage"]
+                return policy_result
+            return raw
         except httpx.TimeoutException:
             logger.warning("VLM timeout (%s): took >60 s", self.model_name)
             fb = _FALLBACK.copy()
@@ -351,7 +458,7 @@ class VLMAnalyzer:
             resp.raise_for_status()
             return resp.json().get("response", "")
 
-    def _analyze_claude(self, frames: list[bytes]) -> dict:
+    def _analyze_claude(self, frames: list[bytes], prior_signals: str | None = None) -> dict:
         content: list[dict] = []
         for fb in frames:
             content.append({
@@ -375,6 +482,12 @@ class VLMAnalyzer:
             'Do NOT dismiss chalking just because one frame looks ambiguous — judge the full sequence.\n\n'
             + self._user_prompt
         )
+        if prior_signals:
+            prompt = (
+                f"PRIOR SIGNALS (deterministic, from pose estimator): {prior_signals}.\n"
+                "Treat these as weak evidence — confirm visually before flagging.\n\n"
+                + prompt
+            )
         content.append({"type": "text", "text": prompt})
 
         response = self._claude.messages.create(
@@ -391,20 +504,31 @@ class VLMAnalyzer:
         )
         if response.stop_reason == "max_tokens":
             logger.warning("Claude response truncated at max_tokens — increase max_tokens")
-        parsed = _parse_json(response.content[0].text)
-        parsed["_usage"] = {
+        usage = {
             "model": self._claude_model,
             "input_tokens": response.usage.input_tokens,
             "output_tokens": response.usage.output_tokens,
             "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
             "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
         }
+        if self._structured:
+            obs = _parse_json_raw(response.content[0].text)
+            return {"_obs_raw": obs, "_usage": usage}
+        parsed = _parse_json(response.content[0].text)
+        parsed["_usage"] = usage
         return parsed
 
-    def _analyze_ollama(self, frames: list[bytes]) -> dict:
+    def _analyze_ollama(self, frames: list[bytes], prior_signals: str | None = None) -> dict:
+        user = self._user_prompt
+        if prior_signals:
+            user = (
+                f"PRIOR SIGNALS (deterministic, from pose estimator): {prior_signals}.\n"
+                "Treat these as weak evidence — confirm visually before flagging.\n\n"
+                + user
+            )
         payload = {
             "model": self._ollama_model,
-            "prompt": f"{self._system_prompt}\n\n{self._user_prompt}",
+            "prompt": f"{self._system_prompt}\n\n{user}",
             "images": [base64.standard_b64encode(fb).decode() for fb in frames],
             "stream": False,
             "options": {"temperature": 0.0, "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "4096"))},
@@ -418,6 +542,8 @@ class VLMAnalyzer:
         )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
+        if self._structured:
+            return {"_obs_raw": _parse_json_raw(raw)}
         return _parse_json(raw)
 
 
@@ -511,11 +637,32 @@ def _parse_json(text: str) -> dict:
     return _FALLBACK.copy()
 
 
+def _normalize_confidence(value) -> float:
+    """Clamp confidence into [0, 1].
+
+    Qwen2.5VL and several other open VLMs frequently return confidence on a
+    0-100 (or 0-10) scale despite the prompt asking for 0.0-1.0. Treat any
+    value > 1.5 as a percentage and divide accordingly; clamp out-of-range
+    values defensively.
+    """
+    try:
+        c = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if c != c or c < 0:                          # NaN / negative
+        return 0.0
+    if c > 1.5 and c <= 100.0:
+        c = c / 100.0
+    elif c > 100.0:
+        return 1.0
+    return min(1.0, c)
+
+
 def _normalize(data: dict) -> dict:
     return {
         "chalking_detected":  bool(data.get("chalking_detected", False)),
         "sweeper_detected":   bool(data.get("sweeper_detected", False)),
         "pe_vehicle_detected": bool(data.get("pe_vehicle_detected", False)),
-        "confidence":         float(data.get("confidence", 0.0)),
+        "confidence":         _normalize_confidence(data.get("confidence", 0.0)),
         "description":        str(data.get("description", "")),
     }
