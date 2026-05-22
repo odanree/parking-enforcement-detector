@@ -2363,6 +2363,20 @@ main {
 }
 .da-del-btn:hover { background: rgba(255,23,68,.15); color: var(--red); }
 
+.da-hires-btn {
+  background: rgba(0,160,255,.12);
+  border: 1px solid rgba(0,160,255,.35);
+  color: #4ab3ff;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.da-hires-btn:hover:not(:disabled) { background: rgba(0,160,255,.25); }
+.da-hires-btn:disabled { opacity: .5; cursor: default; }
+
 .da-pagination {
   display: flex;
   align-items: center;

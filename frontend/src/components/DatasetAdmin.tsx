@@ -206,7 +206,7 @@ export function DatasetAdmin() {
   const [filterLabel,    setFilterLabel]    = useState('all');
   const [filterDetected, setFilterDetected] = useState('all');
   const [filterCamera,   setFilterCamera]   = useState('all');
-  const [filterSource,   setFilterSource]   = useState('all');
+  const [filterSource,   setFilterSource]   = useState('hires');  // default: hide lo-res zone_pedestrian
 
   const [viewMode,    setViewMode]    = useState<ViewMode>('list');
   const [previewIdx,  setPreviewIdx]  = useState<number | null>(null);
@@ -228,7 +228,8 @@ export function DatasetAdmin() {
     if (filterLabel    !== 'all') p.set('label',          filterLabel === 'unlabeled' ? '' : filterLabel);
     if (filterDetected !== 'all') p.set('detected',       filterDetected);
     if (filterCamera   !== 'all') p.set('camera_id',      filterCamera);
-    if (filterSource   !== 'all') p.set('capture_source', filterSource);
+    if (filterSource === 'hires')      p.set('exclude_source', 'zone_pedestrian');
+    else if (filterSource !== 'all')   p.set('capture_source', filterSource);
     try {
       const res  = await fetch(`/api/dataset?${p}`);
       const data = await res.json();
@@ -269,6 +270,29 @@ export function DatasetAdmin() {
   function handleLabel(id: string, label: LabelVal) {
     setItems(prev => prev.map(it => it.id === id ? { ...it, label } : it));
     setGroupPreview(g => g ? { ...g, all: g.all.map(it => it.id === id ? { ...it, label } : it) } : g);
+  }
+
+  const [hiresBusy, setHiresBusy] = useState<string | null>(null);
+
+  async function handleCaptureHires(id: string) {
+    setHiresBusy(id);
+    try {
+      const res = await fetch(`/api/dataset/${id}/capture-hires`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`Hi-res capture failed: ${err.detail || res.status}`);
+        return;
+      }
+      const data = await res.json();
+      const hires_file = (data.hires_url || '').replace('/dataset/', '');
+      const patch = (it: DbItem) => it.id === id ? { ...it, hires_file, capture_source: 'manual_hires' } : it;
+      setItems(prev => prev.map(patch));
+      setGroupPreview(g => g ? { ...g, all: g.all.map(patch) } : g);
+    } catch (e) {
+      alert(`Hi-res capture error: ${e}`);
+    } finally {
+      setHiresBusy(null);
+    }
   }
 
   async function handleDelete(id: string) {
@@ -363,6 +387,14 @@ export function DatasetAdmin() {
               <span className={gpItem.detected ? 'da-yes' : 'da-no'}>{gpItem.detected ? '✓ Detected' : '✗ Rejected'}</span>
               <GroupPreviewLabel item={gpItem} onLabel={handleLabel} />
               <span className="da-preview-counter">{groupPreview!.idx + 1} / {groupPreview!.all.length}</span>
+              {!gpItem.hires_file && (
+                <button
+                  className="da-hires-btn"
+                  title="Re-grab a hi-res frame from the NVR recording at this timestamp"
+                  disabled={hiresBusy === gpItem.id}
+                  onClick={() => handleCaptureHires(gpItem.id)}
+                >{hiresBusy === gpItem.id ? '…' : '⤓ hi-res'}</button>
+              )}
               <button
                 className="da-del-btn"
                 title="Delete from database"
@@ -394,6 +426,14 @@ export function DatasetAdmin() {
               <span className={previewItem.detected ? 'da-yes' : 'da-no'}>{previewItem.detected ? '✓ Detected' : '✗ Rejected'}</span>
               {previewItem.label && <span className={`cmp-label-badge cmp-label-${previewItem.label === 'true_positive' ? 'tp' : previewItem.label === 'false_positive' ? 'fp' : 'other'}`}>{previewItem.label === 'true_positive' ? 'TP' : previewItem.label === 'false_positive' ? 'FP' : previewItem.label}</span>}
               <span className="da-preview-counter">{(previewIdx ?? 0) + 1} / {items.length}</span>
+              {!previewItem.hires_file && (
+                <button
+                  className="da-hires-btn"
+                  title="Re-grab a hi-res frame from the NVR recording at this timestamp"
+                  disabled={hiresBusy === previewItem.id}
+                  onClick={() => handleCaptureHires(previewItem.id)}
+                >{hiresBusy === previewItem.id ? '…' : '⤓ hi-res'}</button>
+              )}
             </div>
           </div>
           <button
@@ -447,9 +487,11 @@ export function DatasetAdmin() {
                 <option value="1">Cam 1</option>
               </select>
               <select value={filterSource} onChange={e => setFilterSource(e.target.value)}>
+                <option value="hires">Hi-res only</option>
                 <option value="all">All sources</option>
                 <option value="chalking">Chalking</option>
-                <option value="zone_pedestrian">Zone pedestrian</option>
+                <option value="manual_hires">Manual hi-res</option>
+                <option value="zone_pedestrian">Zone pedestrian (lo-res)</option>
               </select>
             </div>
 

@@ -202,6 +202,28 @@ class EventVectorStore:
         meta["label"] = label
         self._col.update(ids=[event_id], metadatas=[meta])
 
+    def attach_hires(self, event_id: str, jpeg_bytes: bytes, retag_source: str = "manual_hires") -> str:
+        """Save a hi-res JPEG for an existing event and update its metadata.
+
+        Used by the 'capture hi-res' action: a low-res historical event gets a
+        full-resolution image re-grabbed from the NVR recording. Returns the
+        saved filename. Optionally re-tags capture_source (default manual_hires)
+        so the event surfaces in the hi-res dataset view.
+        """
+        existing = self._col.get(ids=[event_id], include=["metadatas"])
+        if not existing["ids"]:
+            raise KeyError(event_id)
+        meta = existing["metadatas"][0]
+        import base64 as _b64
+        fname = self._save_image(event_id, _b64.b64encode(jpeg_bytes).decode(), "hires")
+        if not fname:
+            raise IOError("failed to save hires image")
+        meta["hires_file"] = fname
+        if retag_source:
+            meta["capture_source"] = retag_source
+        self._col.update(ids=[event_id], metadatas=[meta])
+        return fname
+
     def update_person_type(self, event_id: str, person_type: str) -> None:
         if person_type not in PERSON_TYPES:
             raise ValueError(f"person_type must be one of {PERSON_TYPES}")
@@ -243,6 +265,7 @@ class EventVectorStore:
         label: str | None = None,
         camera_id: int | None = None,
         capture_source: str | None = None,
+        exclude_source: str | None = None,
         detected: int | None = None,
     ) -> list[dict] | dict:
         """Fetch events with optional server-side filters.
@@ -266,6 +289,8 @@ class EventVectorStore:
             conditions.append({"camera_id": {"$eq": camera_id}})
         if capture_source is not None:
             conditions.append({"capture_source": {"$eq": capture_source}})
+        if exclude_source is not None:
+            conditions.append({"capture_source": {"$ne": exclude_source}})
         if detected is not None:
             conditions.append({"detected": {"$eq": detected}})
 

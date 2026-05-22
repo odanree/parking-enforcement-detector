@@ -721,6 +721,7 @@ async def dataset_list(
     label: str | None = None,
     camera_id: int | None = None,
     capture_source: str | None = None,
+    exclude_source: str | None = None,
     detected: int | None = None,
 ):
     result = vector_store.get_filtered(
@@ -729,6 +730,7 @@ async def dataset_list(
         label=label,
         camera_id=camera_id,
         capture_source=capture_source,
+        exclude_source=exclude_source,
         detected=detected,
     )
     if isinstance(result, list):
@@ -819,6 +821,38 @@ async def dataset_person_type(event_id: str, body: PersonTypePayload):
         raise HTTPException(status_code=404, detail="Event not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/dataset/{event_id}/capture-hires")
+async def dataset_capture_hires(event_id: str):
+    """Re-grab a hi-res frame for a historical event from the NVR recording.
+
+    Works only while the footage for that timestamp is still on the NVR disk
+    (within retention). Updates the event's hires_file and re-tags it
+    capture_source=manual_hires.
+    """
+    if event_id.startswith("live-"):
+        raise HTTPException(status_code=422, detail="Card not yet persisted")
+    from src.stream.recorded_frame import fetch_recorded_frame
+    rec = vector_store._col.get(ids=[event_id], include=["metadatas"])
+    if not rec["ids"]:
+        raise HTTPException(status_code=404, detail="Event not found")
+    meta = rec["metadatas"][0]
+    ts = float(meta.get("timestamp", 0) or 0)
+    cam = int(meta.get("camera_id", 0) or 0)
+    if ts <= 0:
+        raise HTTPException(status_code=400, detail="Event has no timestamp")
+    jpeg = await asyncio.to_thread(fetch_recorded_frame, cam, ts)
+    if not jpeg:
+        raise HTTPException(
+            status_code=404,
+            detail="No recorded footage at that time (out of retention or NVR unreachable)",
+        )
+    try:
+        fname = vector_store.attach_hires(event_id, jpeg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to store hi-res: {e}")
+    return {"ok": True, "hires_url": f"/dataset/{fname}", "capture_source": "manual_hires"}
 
 
 @app.get("/api/timeline")
