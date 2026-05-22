@@ -32,6 +32,15 @@ _POSE_ENABLED = os.getenv("POSE_ESTIMATION_ENABLED", "false").lower() == "true"
 _POSE_CONTACT_PX = int(os.getenv("POSE_CONTACT_PX", "35"))
 _POSE_KNEE_DEG   = float(os.getenv("POSE_KNEE_DEG", "130"))
 _POSE_MODEL      = os.getenv("POSE_MODEL", "yolov8m-pose.pt")
+
+# Chalk-wand gate. Modes:
+#   off  — disabled (default; no behaviour change)
+#   soft — detect the wand, attach the signal to the VLM prompt + trace, but
+#          never suppress a VLM call (use to gather production data first)
+#   hard — only escalate to the VLM when a wand is temporally confirmed for the
+#          track (the volume reducer; risks false negatives if the wand is missed)
+_WAND_GATE_MODE       = os.getenv("WAND_GATE", "off").lower()
+_WAND_DARK_TORSO      = os.getenv("WAND_REQUIRE_DARK_TORSO", "true").lower() == "true"
 from src.stream.frame_undistorter import FrameUndistorter
 from src.stream.osd_timestamp import extract_osd_timestamp
 from src.stream.hires_snapshot import fetch_hires_jpeg
@@ -257,6 +266,23 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     # Per-frame map populated below: track_id -> PoseSignals
     _pose_by_track: dict[int, "object"] = {}
 
+    # Chalk-wand gate (opt-in). Dedicated MOG2 keeps a fresh background model so
+    # the wand search can be restricted to moving foreground.
+    _wand_detector = None
+    _wand_tracker = None
+    _wand_mog = None
+    if _WAND_GATE_MODE in ("soft", "hard"):
+        try:
+            from src.detection.wand_detector import WandDetector, WandTracker
+            _wand_detector = WandDetector(require_dark_torso=_WAND_DARK_TORSO)
+            _wand_tracker = WandTracker(window=4, min_hits=2, min_track_motion_px=10.0)
+            _wand_mog = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=30, detectShadows=False)
+            logger.info("Wand gate ENABLED (mode=%s, dark_torso=%s)", _WAND_GATE_MODE, _WAND_DARK_TORSO)
+        except Exception:
+            logger.exception("Wand gate failed to init — disabling")
+            _wand_detector = None
+    _wand_fg = None  # latest MOG2 foreground (det-res), refreshed each frame
+
 
     _initial_paused = os.getenv("INITIAL_PAUSED", "false").lower() == "true"
     if video_path and _initial_paused:
@@ -346,6 +372,13 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             # Wall time of this frame: NVR timestamp for video files, None for live RTSP
             # (None causes _in_pe_window to fall back to datetime.now())
             _frame_wall_ts = getattr(stream, 'get_current_wall_time', lambda: None)()
+
+            # ── Wand-gate background model (opt-in) ─────────────────────────
+            # Keep MOG2 fresh every frame on the detection-res frame so the wand
+            # search can be restricted to moving foreground.
+            if _wand_mog is not None:
+                _fg = _wand_mog.apply(frame)
+                _, _wand_fg = cv2.threshold(_fg, 200, 255, cv2.THRESH_BINARY)
 
             # ── Pose estimation (opt-in) ────────────────────────────────────
             # Computed once per frame over all zone persons; results keyed by
@@ -588,6 +621,30 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                     if _hires_jpg:
                                         _hires_h, _hires_w = _raw_frame.shape[:2]
                                         logger.info("hires: RTSP fallback %dx%d cam=%d", _hires_w, _hires_h, _cam_id)
+
+                                # ── Wand gate (opt-in) — run on RAW hires before annotation ──
+                                _wand_sig_dict = None
+                                if _wand_detector is not None and _hires_jpg and det.bbox:
+                                    _nc = _native_person_crop(_hires_jpg, det.bbox, _det_w, _det_h)
+                                    if _nc is not None:
+                                        _ncrop, _pbic = _nc
+                                        _mm = _motion_mask_for_crop(_wand_fg, det.bbox, _ncrop.shape[:2], _det_w, _det_h)
+                                        _sig = _wand_detector.detect(_ncrop, _pbic, motion_mask=_mm)
+                                        _wand_confirmed = _wand_tracker.update(det.track_id, _sig, det.center)
+                                        _wand_sig_dict = _sig.as_dict()
+                                        _wand_sig_dict["confirmed"] = _wand_confirmed
+                                        if _WAND_GATE_MODE == "hard" and not _wand_confirmed:
+                                            if state:
+                                                state.record_rejected_vlm(
+                                                    "chalking", thumb, _sig.confidence,
+                                                    f"Wand gate: no confirmed wand (conf={_sig.confidence:.2f})",
+                                                    rejection_reason="wand_gate",
+                                                    track_id=det.track_id,
+                                                    bbox=list(det.bbox) if det.bbox else None,
+                                                )
+                                            chalking.on_alert(det.track_id)
+                                            continue
+
                                 if _hires_jpg and det.bbox:
                                     _hires_jpg = _annotate_hires(_hires_jpg, det.bbox, det.confidence, _det_w, _det_h)
                                 _hires_b64 = base64.b64encode(_hires_jpg).decode() if _hires_jpg else ""
@@ -602,6 +659,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                     _two_stage,
                                     vlm, confirm_vlm, vlm_frames, "chalking", vector_store,
                                     _classify_vlm, _classify_cache, det.track_id, _ps_dict,
+                                    _wand_sig_dict,
                                 )
                                 _vlm_jobs[job_key] = (fut, "chalking", det.track_id, frame.copy(), det.bbox, thumb, detail_b64, snap_ts, det.confidence, _hires_b64)
                                 if state:
@@ -617,6 +675,8 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             for tid in list(_classify_cache.keys()):
                 if tid not in active_ids:
                     del _classify_cache[tid]
+            if _wand_tracker is not None:
+                _wand_tracker.tick_absent(active_ids)
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
@@ -763,6 +823,7 @@ def _two_stage(
     classify_cache: "dict[int, str] | None" = None,
     track_id: "int | None" = None,
     pose_signals: "dict | None" = None,
+    wand_signals: "dict | None" = None,
 ) -> dict:
     """Run primary VLM; RAG lookup; optionally skip confirm; run confirm VLM.
 
@@ -820,7 +881,7 @@ def _two_stage(
                 },
             }
 
-    prior_str = None
+    prior_parts: list[str] = []
     if pose_signals:
         # Compact, fact-only sentence — the VLM tends to over-anchor on long hints.
         flags = []
@@ -829,7 +890,14 @@ def _two_stage(
         if pose_signals.get("wrist_near_vehicle"): flags.append("wrist within 35px of a vehicle")
         if not flags:
             flags.append("neutral stance")
-        prior_str = "; ".join(flags) + f" (pose conf={pose_signals.get('confidence', 0.0):.2f})"
+        prior_parts.append("; ".join(flags) + f" (pose conf={pose_signals.get('confidence', 0.0):.2f})")
+    if wand_signals and wand_signals.get("present"):
+        prior_parts.append(
+            f"a long thin near-white object (possible chalk wand) detected angled "
+            f"to the ground at {wand_signals.get('angle_deg', 0):.0f}° "
+            f"(wand conf={wand_signals.get('confidence', 0.0):.2f})"
+        )
+    prior_str = ". ".join(prior_parts) if prior_parts else None
 
     first = primary.analyze(frames, kind, prior_signals=prior_str)
 
@@ -837,6 +905,7 @@ def _two_stage(
     trace: dict = {
         "classify": classify_trace,
         "pose":     pose_signals,
+        "wand":     wand_signals,
         "first_pass": {
             "detected":    first.get(f"{kind}_detected", False),
             "confidence":  first.get("confidence", 0.0),
@@ -1009,6 +1078,67 @@ def _annotate_hires(
 
     ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return buf.tobytes() if ok else jpeg_bytes
+
+
+def _native_person_crop(
+    hires_jpeg: bytes,
+    bbox: tuple[int, int, int, int],
+    det_w: int,
+    det_h: int,
+    pad_ratio: float = 0.6,
+) -> "tuple[np.ndarray, tuple[int,int,int,int]] | None":
+    """Tight native-resolution crop around the person for the wand detector.
+
+    Unlike `_crop_vlm_from_hires` (fixed 1280×720 window), this keeps the wand
+    prominent: it crops the hi-res image at the bbox scaled to native coords
+    with padding (more below, for the wand reaching the ground). Returns the
+    BGR crop and the person bbox within that crop, or None.
+    """
+    arr = np.frombuffer(hires_jpeg, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    ih, iw = img.shape[:2]
+    sx, sy = iw / det_w, ih / det_h
+    bx1, by1 = int(bbox[0] * sx), int(bbox[1] * sy)
+    bx2, by2 = int(bbox[2] * sx), int(bbox[3] * sy)
+    bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
+    padx = int(bw * pad_ratio * 2)
+    padt = int(bh * 0.15)
+    padb = int(bh * pad_ratio)
+    cx1, cy1 = max(0, bx1 - padx), max(0, by1 - padt)
+    cx2, cy2 = min(iw, bx2 + padx), min(ih, by2 + padb)
+    crop = img[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return None
+    return crop, (bx1 - cx1, by1 - cy1, bx2 - cx1, by2 - cy1)
+
+
+def _motion_mask_for_crop(
+    fg: "np.ndarray | None",
+    bbox: tuple[int, int, int, int],
+    crop_shape: tuple[int, int],
+    det_w: int,
+    det_h: int,
+    pad_ratio: float = 0.6,
+) -> "np.ndarray | None":
+    """Resample the MOG2 foreground (det-res) to align with a native person crop."""
+    if fg is None:
+        return None
+    fh, fw = fg.shape[:2]
+    sx, sy = fw / det_w, fh / det_h
+    bx1, by1 = int(bbox[0] * sx), int(bbox[1] * sy)
+    bx2, by2 = int(bbox[2] * sx), int(bbox[3] * sy)
+    bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
+    padx = int(bw * pad_ratio * 2)
+    padt = int(bh * 0.15)
+    padb = int(bh * pad_ratio)
+    cx1, cy1 = max(0, bx1 - padx), max(0, by1 - padt)
+    cx2, cy2 = min(fw, bx2 + padx), min(fh, by2 + padb)
+    sub = fg[cy1:cy2, cx1:cx2]
+    if sub.size == 0:
+        return None
+    return cv2.resize(sub, (crop_shape[1], crop_shape[0]), interpolation=cv2.INTER_NEAREST)
 
 
 def _crop_scene_bytes(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> bytes:
