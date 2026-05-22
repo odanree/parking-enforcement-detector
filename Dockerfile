@@ -31,6 +31,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application source
 COPY src/ ./src/
 COPY config/ ./config/
+# Maintenance/ingestion CLIs (run via `docker compose run` / `docker exec`)
+COPY scripts/ ./scripts/
 
 # Built React frontend from stage 1
 COPY --from=frontend-builder /app/frontend-dist/ ./frontend-dist/
