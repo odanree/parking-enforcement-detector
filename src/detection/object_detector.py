@@ -67,6 +67,12 @@ class ObjectDetector:
         fp_suppress_seconds: float = 10.0,
     ) -> None:
         self._model = YOLO(model_path)
+        self._model_path = model_path
+        # Separate, lazily-loaded model for stateless single-frame localization
+        # (see localize_person). Kept distinct from self._model so a one-off
+        # predict() never disturbs the persistent ByteTrack/BoT-SORT state that
+        # self._model.track(persist=True) maintains across frames.
+        self._loc_model: YOLO | None = None
         self._threshold = threshold
         # ByteTrack low threshold: fed to the tracker so it can re-associate
         # partly-occluded tracks without creating new false-positive tracks.
@@ -170,6 +176,83 @@ class ObjectDetector:
 
         self._update_grid(hits_this_frame)
         return detections
+
+    def localize_person(
+        self,
+        frame: np.ndarray,
+        search_bbox: tuple[int, int, int, int] | None = None,
+        search_pad: float = 2.0,
+        conf: float | None = None,
+        imgsz: int = 1280,
+    ) -> tuple[int, int, int, int] | None:
+        """Stateless single-frame person localization (no tracking/suppression).
+
+        Runs YOLO once and returns a person bbox **in frame-pixel coordinates**,
+        or None if no person clears ``conf``.
+
+        When ``search_bbox`` (a coarse seed, in ``frame`` coords) is given, the
+        search is restricted to an ROI of that box padded by ``search_pad`` ×
+        its size, and predict runs on the native-resolution crop. This is the
+        path that matters for hi-res frames: a distant person is only ~tens of
+        px tall in a 4K frame, so a full-frame predict at ``imgsz`` downscales
+        them away — cropping first keeps them large enough to detect. The
+        returned bbox is offset back to full-frame coords, and the candidate
+        nearest the seed center is chosen.
+
+        Purpose: a hi-res snapshot is fetched a few hundred ms after the RTSP
+        detection frame, so the RTSP bbox (merely scaled up) lags behind a
+        moving person. Re-detecting on the snapshot yields a box at the
+        snapshot's own instant, so the drawn box and the VLM crop align to the
+        pixels actually being analysed.
+
+        Uses a separate model instance (lazily loaded) so the persistent
+        tracker state on ``self._model`` is never perturbed.
+        """
+        if self._loc_model is None:
+            self._loc_model = YOLO(self._model_path)
+            logger.info("Localizer model loaded (%s) for hi-res re-detection", self._model_path)
+
+        h, w = frame.shape[:2]
+        ox, oy = 0, 0
+        seed_center: tuple[int, int] | None = None
+        roi = frame
+        if search_bbox is not None:
+            sx1, sy1, sx2, sy2 = search_bbox
+            seed_center = ((sx1 + sx2) // 2, (sy1 + sy2) // 2)
+            pad_x = int((sx2 - sx1) * search_pad)
+            pad_y = int((sy2 - sy1) * search_pad)
+            ox, oy = max(0, sx1 - pad_x), max(0, sy1 - pad_y)
+            roi = frame[oy : min(h, sy2 + pad_y), ox : min(w, sx2 + pad_x)]
+            if roi.size == 0:
+                roi, ox, oy = frame, 0, 0
+
+        person_id = next(
+            (i for i, n in self._loc_model.names.items() if n == "person"), 0
+        )
+        results = self._loc_model.predict(
+            roi,
+            conf=conf if conf is not None else self._threshold,
+            classes=[person_id],
+            imgsz=imgsz,
+            verbose=False,
+        )
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+
+        candidates = [
+            (int(b[0]) + ox, int(b[1]) + oy, int(b[2]) + ox, int(b[3]) + oy)
+            for b in boxes.xyxy.cpu().numpy()
+        ]
+        if seed_center is None:
+            confs = boxes.conf.cpu().numpy()
+            return candidates[int(np.argmax(confs))]
+
+        cx, cy = seed_center
+        return min(
+            candidates,
+            key=lambda b: ((b[0] + b[2]) / 2 - cx) ** 2 + ((b[1] + b[3]) / 2 - cy) ** 2,
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

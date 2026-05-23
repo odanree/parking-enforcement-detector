@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 _PE_WINDOW_ENABLED = os.getenv("PE_WINDOW_ENABLED", "true").lower() == "true"
 _PE_WINDOW_START   = int(os.getenv("PE_WINDOW_START", "8"))   # 08:00 local time
 _PE_WINDOW_END     = int(os.getenv("PE_WINDOW_END",   "16"))  # 16:00 local time
+# Re-run YOLO on the hi-res snapshot to get a box at the snapshot's own instant
+# instead of scaling up the time-lagged RTSP bbox. Falls back to the scaled
+# RTSP bbox when no person is found on the snapshot. (see ADR-025)
+_HIRES_RELOCALIZE  = os.getenv("HIRES_RELOCALIZE", "true").lower() == "true"
 # Playback mode: VIDEO_PATH set → skip vector-store duplicate suppression so
 # replaying the same footage always fires alerts.
 _IS_PLAYBACK       = bool(os.getenv("VIDEO_PATH"))
@@ -627,13 +631,38 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                         _hires_h, _hires_w = _raw_frame.shape[:2]
                                         logger.info("hires: RTSP fallback %dx%d cam=%d", _hires_w, _hires_h, _cam_id)
 
+                                # ── Re-localize the person on the hi-res snapshot ──
+                                # The snapshot is a separate capture taken Δ after the
+                                # RTSP detection frame, so scaling the RTSP bbox up leaves
+                                # the box (and the VLM crop) lagging a moving person.
+                                # Re-detecting on the snapshot gives a box at its own
+                                # instant; all hi-res consumers below use this triple.
+                                # Fallback: scaled RTSP bbox in detection coords. (ADR-025)
+                                _hb, _hb_w, _hb_h = det.bbox, _det_w, _det_h
+                                if _HIRES_RELOCALIZE and _hires_jpg and det.bbox:
+                                    _hr_img = cv2.imdecode(np.frombuffer(_hires_jpg, np.uint8), cv2.IMREAD_COLOR)
+                                    if _hr_img is not None:
+                                        _hh, _hw = _hr_img.shape[:2]
+                                        _sx, _sy = _hw / _det_w, _hh / _det_h
+                                        # Scaled RTSP bbox = coarse seed for the ROI search.
+                                        _seed = (int(det.bbox[0] * _sx), int(det.bbox[1] * _sy),
+                                                 int(det.bbox[2] * _sx), int(det.bbox[3] * _sy))
+                                        _nb = detector.localize_person(_hr_img, search_bbox=_seed)
+                                        if _nb is not None:
+                                            _hb, _hb_w, _hb_h = _nb, _hw, _hh
+                                        else:
+                                            logger.info(
+                                                "hires re-localize: no person on snapshot cam=%d tid=%s — using scaled RTSP bbox",
+                                                _cam_id, det.track_id,
+                                            )
+
                                 # ── Wand gate (opt-in) — run on RAW hires before annotation ──
                                 _wand_sig_dict = None
                                 if _wand_detector is not None and _hires_jpg and det.bbox:
-                                    _nc = _native_person_crop(_hires_jpg, det.bbox, _det_w, _det_h)
+                                    _nc = _native_person_crop(_hires_jpg, _hb, _hb_w, _hb_h)
                                     if _nc is not None:
                                         _ncrop, _pbic = _nc
-                                        _mm = _motion_mask_for_crop(_wand_fg, det.bbox, _ncrop.shape[:2], _det_w, _det_h)
+                                        _mm = _motion_mask_for_crop(_wand_fg, _hb, _ncrop.shape[:2], _hb_w, _hb_h)
                                         _sig = _wand_detector.detect(_ncrop, _pbic, motion_mask=_mm)
                                         _wand_confirmed = _wand_tracker.update(det.track_id, _sig, det.center)
                                         _wand_sig_dict = _sig.as_dict()
@@ -656,19 +685,19 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 # returning 'unknown' on a wide 1280×720 window.
                                 _classify_jpg = None
                                 if _CLASSIFY_ENABLED and _hires_jpg and det.bbox:
-                                    _cnc = _native_person_crop(_hires_jpg, det.bbox, _det_w, _det_h, pad_ratio=0.8)
+                                    _cnc = _native_person_crop(_hires_jpg, _hb, _hb_w, _hb_h, pad_ratio=0.8)
                                     if _cnc is not None:
                                         _ok_cc, _cc_buf = cv2.imencode('.jpg', _cnc[0], [cv2.IMWRITE_JPEG_QUALITY, 90])
                                         if _ok_cc:
                                             _classify_jpg = _cc_buf.tobytes()
 
                                 if _hires_jpg and det.bbox:
-                                    _hires_jpg = _annotate_hires(_hires_jpg, det.bbox, det.confidence, _det_w, _det_h)
+                                    _hires_jpg = _annotate_hires(_hires_jpg, _hb, det.confidence, _hb_w, _hb_h)
                                 _hires_b64 = base64.b64encode(_hires_jpg).decode() if _hires_jpg else ""
                                 # VLM gets a bbox-region crop from the hi-res image — person +
                                 # adjacent vehicles but not the full 4K frame.
                                 # Full hi-res is kept in the dataset via _hires_b64.
-                                _vlm_jpg = _crop_vlm_from_hires(_hires_jpg, det.bbox, _det_w, _det_h) if _hires_jpg and det.bbox else None
+                                _vlm_jpg = _crop_vlm_from_hires(_hires_jpg, _hb, _hb_w, _hb_h) if _hires_jpg and det.bbox else None
                                 vlm_frames = [_vlm_jpg] if _vlm_jpg else ([scene] + detail_frames)
                                 _ps = _pose_by_track.get(det.track_id)
                                 _ps_dict = _ps.as_dict() if _ps is not None else None
