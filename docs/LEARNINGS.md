@@ -288,3 +288,15 @@ This is simply `panX += cursorX * (1 - ratio)` — add a delta, never multiply t
 **Fix:** Restored a discriminating requirement but shifted it from posture to time: CONDITION B now requires the person to be *stationary* at the rear wheel position across the *majority of frames* in the evaluation window. A PE officer dwells at the wheel for several seconds; a car owner briefly passes it. The multi-frame context window (ADR 020) makes this temporal check possible.
 
 **Why it matters:** Posture and proximity are each individually ambiguous at overhead camera distance. The reliable discriminator is temporal: chalking requires sustained presence at a specific location. Any single-frame criterion (posture, tool, proximity alone) will have unacceptable false-positive or false-negative rates in real street footage.
+
+---
+
+## L18 — A new enum value needs its CSS `.active` rule, or a toggle "won't stick" while actually saving fine
+
+**Date:** 2026-05-23
+
+**What happened:** Added a new `resident` person-type. After selecting it in the kanban modal the button appeared not to "stick." Hours could have gone into the data flow: verified the backend container restarted, that `resident` was in the validation set, that the `POST /person-type` returned 200, that the value persisted in ChromaDB, and that `/api/pipeline/trace` returned `person_type: 'resident'` on the card. All correct. The button even carried the `active` class in the DOM. The real cause: `index.css` had a per-type highlight rule for every category (`.btn-pt-pedestrian.active`, `.btn-pt-occupant.active`, …) **except** the newly added `.btn-pt-resident.active`. So the selected button got the class but no visual style — it looked unselected.
+
+**Fix:** Add the matching `.btn-pt-resident.active` rule. More generally: when adding an enum value that has per-value styling, grep the CSS for the sibling values and add the parallel rule in the same commit.
+
+**Why it matters:** "It saves but the UI doesn't reflect it" has two very different root causes — state/data flow vs. presentation. When the data demonstrably persists (DB + API both show the value) and the element even has the right class, **check the stylesheet before the data flow.** A missing per-variant CSS rule is invisible in logic and easy to overlook when adding a new enum option. Also: adding a frontend enum touches several layers (prompt/validation set, skip/routing logic, the button list, AND the CSS) — miss any one and it silently half-works.
