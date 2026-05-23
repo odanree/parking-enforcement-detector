@@ -25,7 +25,7 @@ import cv2
 logger = logging.getLogger(__name__)
 
 _LABELS = {"true_positive", "false_positive", "true_negative", "false_negative"}
-PERSON_TYPES = {"pedestrian", "occupant", "worker_landscape", "worker_delivery", "chalker", ""}
+PERSON_TYPES = {"pedestrian", "resident", "occupant", "worker_landscape", "worker_delivery", "chalker", ""}
 
 
 def _try_default_ef():

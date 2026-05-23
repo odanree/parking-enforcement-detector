@@ -165,6 +165,8 @@ _CLASSIFY_SYSTEM_PROMPT = (
     "You are a person-type classifier for an overhead street camera. "
     "Classify the person visible in the image into exactly one of these categories:\n"
     "  pedestrian      — walking past on the sidewalk or street, no interaction with any vehicle\n"
+    "  resident        — a person who lives at this residence (entering/leaving the home or gate, "
+    "moving around the property, in casual home clothing)\n"
     "  occupant        — getting in or out of a parked vehicle, loading/unloading bags or groceries\n"
     "  worker_landscape — gardener, landscaper, or maintenance worker (mowing, trimming, cleaning)\n"
     "  worker_delivery — delivery driver carrying packages (UPS, FedEx, USPS, Amazon, food delivery)\n"
@@ -189,7 +191,7 @@ _CLASSIFY_FALLBACK = {
 
 
 def _normalize_classify(data: dict) -> dict:
-    valid = {"pedestrian", "occupant", "worker_landscape", "worker_delivery", "chalker", "unknown"}
+    valid = {"pedestrian", "resident", "occupant", "worker_landscape", "worker_delivery", "chalker", "unknown"}
     pt = str(data.get("person_type", "unknown")).lower().strip()
     if pt not in valid:
         pt = "unknown"

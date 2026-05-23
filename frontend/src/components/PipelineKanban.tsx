@@ -83,6 +83,7 @@ function groupCards(cards: TraceCard[]): CardGroup[] {
 
 const PERSON_TYPES: { key: string; label: string; emoji: string }[] = [
   { key: 'pedestrian',       label: 'Pedestrian',  emoji: '🚶' },
+  { key: 'resident',         label: 'Resident',    emoji: '🏠' },
   { key: 'occupant',         label: 'Occupant',    emoji: '🚗' },
   { key: 'worker_landscape', label: 'Landscaper',  emoji: '🌿' },
   { key: 'worker_delivery',  label: 'Delivery',    emoji: '📦' },
@@ -491,7 +492,7 @@ const COLUMNS: { key: string; label: string; desc: string }[] = [
   { key: 'vlm_error',    label: 'VLM Error ⚠',    desc: 'Timeout / connection failure'            },
   { key: 'not_chalking', label: 'False Detect ✗', desc: 'Model disagreement — not a real detection' },
   { key: 'pedestrian',   label: 'Pedestrian',     desc: 'Person on sidewalk / walking by'         },
-  { key: 'occupant',     label: 'Occupant',       desc: 'Person exiting or entering vehicle'      },
+  { key: 'occupant',     label: 'Occupant',       desc: 'Resident or person entering/exiting a vehicle' },
   { key: 'worker',       label: 'Worker',         desc: 'Delivery driver, landscaper, or maintenance' },
   { key: 'chalking',     label: 'Chalking ✓',     desc: 'Confirmed chalking activity'             },
 ];
@@ -514,6 +515,7 @@ function cardColumn(card: TraceCard): string {
   // by design but ARE correctly-classified people, not false detections).
   switch (card.person_type) {
     case 'pedestrian':       return 'pedestrian';
+    case 'resident':         return 'occupant';   // folded into Occupant column
     case 'occupant':         return 'occupant';
     case 'worker_delivery':  return 'worker';
     case 'worker_landscape': return 'worker';

@@ -825,7 +825,7 @@ _RAG_FP_MIN_VOTES  = int(os.getenv("RAG_FP_MIN_VOTES", "3"))
 _CLASSIFY_ENABLED   = os.getenv("PERSON_CLASSIFIER_ENABLED", "false").lower() == "true"
 _CLASSIFY_SKIP_TYPES = set(
     t.strip() for t in os.getenv(
-        "PERSON_CLASSIFIER_SKIP", "pedestrian,occupant,worker_delivery"
+        "PERSON_CLASSIFIER_SKIP", "pedestrian,resident,occupant,worker_delivery"
     ).split(",") if t.strip()
 )
 

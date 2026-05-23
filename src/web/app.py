@@ -809,7 +809,7 @@ async def dataset_label(event_id: str, body: LabelPayload):
 
 
 class PersonTypePayload(BaseModel):
-    person_type: str  # pedestrian | occupant | worker_landscape | worker_delivery | chalker | ""
+    person_type: str  # pedestrian | resident | occupant | worker_landscape | worker_delivery | chalker | ""
 
 
 @app.post("/api/dataset/{event_id}/person-type")
