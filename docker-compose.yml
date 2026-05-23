@@ -4,6 +4,9 @@ services:
     restart: unless-stopped
     environment:
       - OLLAMA_MAX_LOADED_MODELS=1
+      # Unload the model 30s after the last call so its ~6GB RAM is freed
+      # between detection events (VLM fires only when a person is near a vehicle).
+      - OLLAMA_KEEP_ALIVE=30s
     volumes:
       - ollama_data:/root/.ollama
     networks:
