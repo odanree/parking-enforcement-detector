@@ -352,16 +352,27 @@ function PersonTypeLabeler({ card }: { card: TraceCard }) {
   const [current, setCurrent] = useState(card.person_type ?? '');
   const [saving, setSaving] = useState(false);
 
+  const isLive = card.id.startsWith('live-');
+
+  // Re-sync the displayed selection when the card refreshes (auto-refresh
+  // passes a new card object). Without this, useState keeps its initial value
+  // and the selection can appear to "not stick" across kanban refreshes.
+  useEffect(() => { setCurrent(card.person_type ?? ''); }, [card.id, card.person_type]);
+
   async function applyLabel(pt: string) {
+    if (isLive) return;  // not yet persisted to the DB — can't label until it has a real id
     const next = current === pt ? '' : pt; // toggle off if already set
+    setCurrent(next);                       // optimistic — reflects immediately
     setSaving(true);
     try {
-      await fetch(`/api/dataset/${card.id}/person-type`, {
+      const res = await fetch(`/api/dataset/${card.id}/person-type`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ person_type: next }),
       });
-      setCurrent(next);
+      if (!res.ok) setCurrent(card.person_type ?? '');  // revert on failure
+    } catch {
+      setCurrent(card.person_type ?? '');
     } finally {
       setSaving(false);
     }
@@ -376,8 +387,8 @@ function PersonTypeLabeler({ card }: { card: TraceCard }) {
             key={pt.key}
             className={`btn-person-type btn-pt-${pt.key}${current === pt.key ? ' active' : ''}`}
             onClick={() => applyLabel(pt.key)}
-            disabled={saving}
-            title={pt.label}
+            disabled={saving || isLive}
+            title={isLive ? 'Card not yet saved — wait for it to persist' : pt.label}
           >
             {pt.emoji} {pt.label}
           </button>
