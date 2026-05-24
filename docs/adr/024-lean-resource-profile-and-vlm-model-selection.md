@@ -1,6 +1,6 @@
 # ADR 024 — Lean resource profile and VLM model selection
 
-**Status:** Accepted
+**Status:** Accepted (CPU-only torch decision superseded by [ADR-026](026-gpu-inference-for-yolo.md))
 **Date:** 2026-05-23
 
 ## Context
