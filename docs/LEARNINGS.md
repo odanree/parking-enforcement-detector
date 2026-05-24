@@ -300,3 +300,15 @@ This is simply `panX += cursorX * (1 - ratio)` — add a delta, never multiply t
 **Fix:** Add the matching `.btn-pt-resident.active` rule. More generally: when adding an enum value that has per-value styling, grep the CSS for the sibling values and add the parallel rule in the same commit.
 
 **Why it matters:** "It saves but the UI doesn't reflect it" has two very different root causes — state/data flow vs. presentation. When the data demonstrably persists (DB + API both show the value) and the element even has the right class, **check the stylesheet before the data flow.** A missing per-variant CSS rule is invisible in logic and easy to overlook when adding a new enum option. Also: adding a frontend enum touches several layers (prompt/validation set, skip/routing logic, the button list, AND the CSS) — miss any one and it silently half-works.
+
+---
+
+## L19 — A model's disk size is not its VRAM footprint, and capacity you can't use is just footprint
+
+**Date:** 2026-05-24
+
+**What happened:** Asked to lower the VLM's "7 GB" GPU usage, the first surprise was that `qwen2.5vl:7b` — listed as 6 GB by `ollama list` — actually occupied **~14 GB** resident (`ollama ps`, 100% GPU, context 4096). For a vision model the disk artifact is just the quantized language weights; loaded, it also carries the vision encoder and the KV cache, often 2x+ the disk size. The probe also varied with context window (a default-context `ollama run` reported 22 GB vs 14 GB at the production 4096). Second surprise: scoring three sizes (moondream 1.3 GB, gemma3:4b 4.4 GB, qwen 14 GB) on 199 labeled person-type events, **all three landed at ~30–35% accuracy** — gemma3:4b (35.2%) even edged the 3x-larger qwen (34.2%), while moondream collapsed to labeling nearly everything "pedestrian."
+
+**Fix:** Picked gemma3:4b (equal accuracy, lower `unknown` rate, ~⅓ the VRAM — ADR-027). Measure loaded footprint with `ollama ps` at the *production context*, never `ollama list`.
+
+**Why it matters:** Two transferable points. (1) **Footprint is the loaded size at your real context, not the download size** — sizing a GPU or comparing models off `ollama list` is wrong by ~2x for VLMs. (2) **When accuracy is flat across model sizes, the task taxonomy is the ceiling, not model capacity** — so the only honest lever is footprint, and the bigger model was paying ~10 GB of VRAM for nothing. This is ADR-024's "bigger isn't better" in the cost-cutting direction. Corollary worth chasing: a classifier stuck at ~35% may not be earning its VLM cost at all.
