@@ -10,9 +10,9 @@ RUN npm run build
 
 
 # ── Stage 2: Python runtime ────────────────────────────────────────────────────
-# For GPU acceleration (YOLO), replace the base image with:
-#   nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
-# and install python3.11 + pip manually.
+# GPU acceleration (YOLO on the RTX 3090) uses the CUDA torch wheels below; the
+# wheels bundle the CUDA/cuDNN runtime, so the slim base needs no system CUDA —
+# only the host NVIDIA driver + nvidia-container-runtime (already in place).
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -23,9 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Python dependencies — install CPU-only torch first to avoid pulling CUDA builds
+# Python dependencies — install CUDA torch first so the later requirements.txt
+# resolve doesn't pull a different (CPU) build. cu124 matches host driver 595.79.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application source

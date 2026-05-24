@@ -63,6 +63,33 @@ _PE_WINDOW_END     = int(os.getenv("PE_WINDOW_END",   "16"))  # 16:00 local time
 # instead of scaling up the time-lagged RTSP bbox. Falls back to the scaled
 # RTSP bbox when no person is found on the snapshot. (see ADR-025)
 _HIRES_RELOCALIZE  = os.getenv("HIRES_RELOCALIZE", "true").lower() == "true"
+# Cap YOLO's share of the 24 GB GPU (fraction of total) so it can't starve the
+# ollama VLM (~6 GB qwen2.5vl, loaded on-demand during events) or the host's
+# LM Studio. yolov8n inference needs ~1.5-2.5 GB, so ~0.15 (≈3.6 GB) is ample.
+_GPU_MEM_FRACTION = float(os.getenv("GPU_MEM_FRACTION", "0.15"))
+_gpu_setup_done = False
+
+
+def _setup_gpu() -> None:
+    """Log the inference device and cap GPU memory (idempotent, process-wide)."""
+    global _gpu_setup_done
+    if _gpu_setup_done:
+        return
+    _gpu_setup_done = True
+    try:
+        import torch
+        if torch.cuda.is_available():
+            if 0.0 < _GPU_MEM_FRACTION < 1.0:
+                torch.cuda.set_per_process_memory_fraction(_GPU_MEM_FRACTION, 0)
+            logger.info(
+                "Inference device: CUDA %s (mem cap %.0f%% of %.1f GB)",
+                torch.cuda.get_device_name(0), _GPU_MEM_FRACTION * 100,
+                torch.cuda.get_device_properties(0).total_memory / 1e9,
+            )
+        else:
+            logger.info("Inference device: CPU (CUDA not available)")
+    except Exception:
+        logger.warning("GPU setup failed; falling back to default device", exc_info=True)
 # Playback mode: VIDEO_PATH set → skip vector-store duplicate suppression so
 # replaying the same footage always fires alerts.
 _IS_PLAYBACK       = bool(os.getenv("VIDEO_PATH"))
@@ -137,6 +164,8 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     video_path:  overrides VIDEO_PATH env var (file-based second camera).
     zone_key:    which zones entry in detection.yaml to use as the initial polygon.
     """
+    _setup_gpu()
+
     cfg_det = _load_yaml("config/detection.yaml")
     cfg_alerts = _load_yaml("config/alerts.yaml")
 
