@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -88,7 +89,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/detector.log", encoding="utf-8"),
+        # Rotate so the log (incl. per-event DECISION lines) can't grow unbounded.
+        RotatingFileHandler(
+            "logs/detector.log", encoding="utf-8",
+            maxBytes=10 * 1024 * 1024, backupCount=5,
+        ),
     ],
 )
 logger = logging.getLogger(__name__)

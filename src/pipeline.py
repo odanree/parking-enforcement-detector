@@ -459,6 +459,23 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 usage          = result.pop("_usage", None)
                 rag_neighbors  = result.pop("_rag_neighbors", [])
                 pipeline_trace = result.pop("_pipeline_trace", None)
+
+                # Durable decision trace — the in-memory pipeline_trace ring buffer
+                # rotates and skipped events aren't persisted, so log one greppable
+                # line per VLM decision (classify outcome + final verdict) here.
+                _cls   = (pipeline_trace or {}).get("classify") or {}
+                _det   = bool(result.get(f"{kind}_detected", False))
+                _pt    = _cls.get("person_type", "n/a")
+                _outcome = ("skip" if (_cls and _pt in _CLASSIFY_SKIP_TYPES)
+                            else "alert" if _det else "reject")
+                _model = _cls.get("backend") or ((pipeline_trace or {}).get("first_pass") or {}).get("backend", "?")
+                logger.info(
+                    "DECISION track=%d cam=%d kind=%s classify=%s classify_conf=%.2f "
+                    "model=%s detected=%s conf=%.2f outcome=%s",
+                    tid, (state.camera_id if state else 0), kind, _pt,
+                    float(_cls.get("confidence", 0.0)), _model, _det,
+                    float(result.get("confidence", 0.0)), _outcome,
+                )
                 if pipeline_trace is not None and yolo_conf is not None:
                     pipeline_trace["yolo"] = {
                         "confidence": round(yolo_conf, 3),
