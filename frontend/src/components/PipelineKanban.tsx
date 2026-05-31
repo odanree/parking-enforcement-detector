@@ -588,7 +588,7 @@ export function PipelineKanban() {
     }
     timerRef.current = setInterval(fetchCards, 5000);
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [kanbanOpen, autoRefresh, timeWindowSecs, labelFilter, camFilter]);
+  }, [kanbanOpen, autoRefresh, timeWindowSecs, camFilter]);
 
   // Keep the open modal in sync with the latest card fetch (e.g. hires_url backfill after restart).
   // Only refresh cards that belong to the same kanban column as the originally-selected group
