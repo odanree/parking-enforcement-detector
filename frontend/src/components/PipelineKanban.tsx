@@ -2,8 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../store';
 import type { PipelineStage, RagNeighbor, RagStage } from '../types';
 
-type TimeFilter  = '5m' | '1h' | '12h' | '24h' | 'all';
-type LabelFilter = 'unlabeled' | 'labeled' | 'all';
+type TimeFilter  = '5m' | '1h' | '6h' | '12h' | '24h' | 'all';
 type CamFilter   = 0 | 1 | 'all';
 
 interface ModelEvalEntry {
@@ -550,19 +549,17 @@ export function PipelineKanban() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [timeFilter,  setTimeFilter]  = useState<TimeFilter>('1h');
-  const [labelFilter, setLabelFilter] = useState<LabelFilter>('unlabeled');
   const [camFilter,   setCamFilter]   = useState<CamFilter>('all');
 
   const timeWindowSecs = useMemo(() => {
     if (timeFilter === 'all') return null;
     return timeFilter === '5m' ? 300 : timeFilter === '1h' ? 3600
-         : timeFilter === '12h' ? 12 * 3600 : 24 * 3600;
+         : timeFilter === '6h' ? 6 * 3600 : timeFilter === '12h' ? 12 * 3600 : 24 * 3600;
   }, [timeFilter]);
 
   function buildUrl() {
     const p = new URLSearchParams({ limit: '500' });
     if (timeWindowSecs !== null) p.set('since', String(Math.floor(Date.now() / 1000) - timeWindowSecs));
-    if (labelFilter === 'unlabeled') p.set('label', '');
     if (camFilter !== 'all') p.set('camera_id', String(camFilter));
     return `/api/pipeline/trace?${p}`;
   }
@@ -582,7 +579,7 @@ export function PipelineKanban() {
       .then((d) => setCards(d.cards ?? []))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [kanbanOpen, timeWindowSecs, labelFilter, camFilter]);
+  }, [kanbanOpen, timeWindowSecs, camFilter]);
 
   useEffect(() => {
     if (!kanbanOpen || !autoRefresh) {
@@ -616,10 +613,7 @@ export function PipelineKanban() {
     return () => document.removeEventListener('keydown', onKey);
   }, [kanbanOpen, setKanbanOpen]);
 
-  // Client-side: 'labeled' filter = only cards that have a label set
-  const visibleCards = labelFilter === 'labeled'
-    ? cards.filter((c) => c.label && c.label !== '')
-    : cards;
+  const visibleCards = cards;
 
   const oldestTs = cards.length > 0 ? Math.min(...cards.map(c => c.timestamp)) : null;
   const oldestLabel = oldestTs !== null ? (() => {
@@ -657,7 +651,6 @@ export function PipelineKanban() {
           startIndex={selected.index}
           onClose={() => setSelected(null)}
           onLabeled={(label, cardId) => {
-            if (label && labelFilter === 'unlabeled') setLabelFilter('all');
             setCards(prev => prev.map(c => c.id === cardId ? { ...c, label } : c));
           }}
         />
@@ -668,18 +661,10 @@ export function PipelineKanban() {
             <h2 className="kanban-title">Pipeline Kanban</h2>
             <div className="kanban-filters">
               {/* Time */}
-              {(['5m','1h','12h','24h','all'] as TimeFilter[]).map((t) => (
+              {(['5m','1h','6h','12h','24h','all'] as TimeFilter[]).map((t) => (
                 <button key={t} className={`kanban-filter-btn${timeFilter === t ? ' active' : ''}`}
                   onClick={() => setTimeFilter(t)}>
-                  {t === '5m' ? '5 min' : t === '1h' ? '1 hr' : t === '12h' ? '12 hr' : t === '24h' ? '24 hr' : 'All time'}
-                </button>
-              ))}
-              <span className="kanban-filter-sep" />
-              {/* Label */}
-              {(['unlabeled','labeled','all'] as LabelFilter[]).map((l) => (
-                <button key={l} className={`kanban-filter-btn${labelFilter === l ? ' active' : ''}`}
-                  onClick={() => setLabelFilter(l)}>
-                  {l === 'unlabeled' ? 'Unlabeled' : l === 'labeled' ? 'Labeled' : 'Any label'}
+                  {t === '5m' ? '5 min' : t === '1h' ? '1 hr' : t === '6h' ? '6 hr' : t === '12h' ? '12 hr' : t === '24h' ? '24 hr' : 'All time'}
                 </button>
               ))}
               <span className="kanban-filter-sep" />
