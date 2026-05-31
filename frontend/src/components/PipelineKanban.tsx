@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../store';
 import type { PipelineStage, RagNeighbor, RagStage } from '../types';
 
-type TimeFilter  = '5m' | '1h' | '6h' | '12h' | '24h' | 'all';
+type TimeFilter  = '5m' | '1h' | '3h' | '6h' | '12h' | '24h' | 'all';
 type CamFilter   = 0 | 1 | 'all';
 
 interface ModelEvalEntry {
@@ -554,7 +554,7 @@ export function PipelineKanban() {
   const timeWindowSecs = useMemo(() => {
     if (timeFilter === 'all') return null;
     return timeFilter === '5m' ? 300 : timeFilter === '1h' ? 3600
-         : timeFilter === '6h' ? 6 * 3600 : timeFilter === '12h' ? 12 * 3600 : 24 * 3600;
+         : timeFilter === '3h' ? 3 * 3600 : timeFilter === '6h' ? 6 * 3600 : timeFilter === '12h' ? 12 * 3600 : 24 * 3600;
   }, [timeFilter]);
 
   function buildUrl() {
@@ -661,10 +661,10 @@ export function PipelineKanban() {
             <h2 className="kanban-title">Pipeline Kanban</h2>
             <div className="kanban-filters">
               {/* Time */}
-              {(['5m','1h','6h','12h','24h','all'] as TimeFilter[]).map((t) => (
+              {(['5m','1h','3h','6h','12h','24h','all'] as TimeFilter[]).map((t) => (
                 <button key={t} className={`kanban-filter-btn${timeFilter === t ? ' active' : ''}`}
                   onClick={() => setTimeFilter(t)}>
-                  {t === '5m' ? '5 min' : t === '1h' ? '1 hr' : t === '6h' ? '6 hr' : t === '12h' ? '12 hr' : t === '24h' ? '24 hr' : 'All time'}
+                  {t === '5m' ? '5 min' : t === '1h' ? '1 hr' : t === '3h' ? '3 hr' : t === '6h' ? '6 hr' : t === '12h' ? '12 hr' : t === '24h' ? '24 hr' : 'All time'}
                 </button>
               ))}
               <span className="kanban-filter-sep" />
