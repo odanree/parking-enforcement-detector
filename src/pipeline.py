@@ -121,8 +121,10 @@ def _annotate(
     all_dets: list[Detection],
     zone_dets: list[Detection],
     alert_ids: set[int],
+    action_labels: dict[int, str] | None = None,
 ) -> np.ndarray:
     out = frame.copy()
+    action_labels = action_labels or {}
 
     zone_id_set = {d.track_id for d in zone_dets}
 
@@ -148,6 +150,10 @@ def _annotate(
             label = f"[{source}] {det.class_name} #{det.track_id} {det.confidence:.0%}"
             cv2.putText(out, label, (x1, max(y1 - 6, 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            action = action_labels.get(det.track_id)
+            if action and det.class_name == "person":
+                cv2.putText(out, action, (x1, max(y1 - 20, 28)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 1, cv2.LINE_AA)
 
     return out
 
@@ -286,6 +292,11 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             "Person classifier ENABLED — skip types: %s",
             ",".join(sorted(_CLASSIFY_SKIP_TYPES)),
         )
+
+    # Real-time action classifier — always enabled, negligible cost.
+    from src.detection.action_classifier import ActionClassifier
+    _action_clf = ActionClassifier()
+    _action_labels: dict[int, str] = {}
 
     # Pose estimator — opt-in. Provides deterministic crouch / wrist-low /
     # wrist-near-vehicle signals that the VLM can use as a structured prior.
@@ -757,6 +768,17 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                                 if state:
                                     state.add_pending_vlm("chalking", det.track_id, thumb)
 
+            # Update real-time action labels for all visible persons
+            _action_labels = {
+                det.track_id: _action_clf.update(
+                    det.track_id, det.bbox,
+                    pose=_pose_by_track.get(det.track_id),
+                )
+                for det in all_dets
+                if det.class_name == "person"
+            }
+            _action_clf.tick_absent(active_ids)
+
             # Evict gone tracks
             for tid in list(chalking._frame_count.keys()):
                 if tid not in active_ids:
@@ -772,7 +794,7 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
 
             # Push annotated frame to web state at capped rate
             if state and frame_count % _PUSH_EVERY_N == 0:
-                annotated = _annotate(frame, all_dets, zone_dets, alert_ids)
+                annotated = _annotate(frame, all_dets, zone_dets, alert_ids, _action_labels)
                 if state.privacy_mode and state.privacy_regions:
                     annotated = _apply_privacy(annotated, state.privacy_regions)
                 _last_jpeg = _encode_jpeg(annotated)
