@@ -18,6 +18,7 @@ detector:
   - person
   - truck
   - motorcycle
+  - chalker
 motion_detector:
   edge_margin: 50
   history: 500

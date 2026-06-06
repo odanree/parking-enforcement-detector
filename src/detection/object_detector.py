@@ -11,7 +11,7 @@ from ultralytics import YOLO
 logger = logging.getLogger(__name__)
 
 # COCO class names the spec requires us to track
-_TRACKED_CLASSES = {"person", "truck", "motorcycle", "car"}
+_TRACKED_CLASSES = {"person", "truck", "motorcycle", "car", "chalker"}
 
 # Cars are exempt from stationary masking — a car that *stops* is the signal
 # we want for PE vehicle detection, not noise to suppress.

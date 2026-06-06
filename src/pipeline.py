@@ -589,6 +589,30 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
             vehicle_bboxes = [d.bbox for d in all_dets if d.class_name in {"car", "truck", "motorcycle"}]
 
             for det in zone_dets:
+                # ── YOLO chalker fast-path ─────────────────────────────────────
+                # Fine-tuned model detected a chalker class directly — skip VLM
+                # and wand gate entirely, fire alert immediately.
+                if det.class_name == "chalker":
+                    job_key = ("chalking", det.track_id)
+                    if job_key not in _vlm_jobs and det.track_id not in alert_ids:
+                        crop = _crop_wide_bytes(frame, det.bbox)
+                        thumb = _thumb_b64_from_jpeg(crop)
+                        auto_desc = f"YOLO chalker detection (conf={det.confidence:.0%})"
+                        sf = _apply_privacy(frame, state.privacy_regions) if (state and state.privacy_mode) else frame
+                        snap = notifier.send("chalking", {"chalking_detected": True, "confidence": det.confidence, "description": auto_desc}, sf, det.bbox, yolo_conf=det.confidence)
+                        osd_ts = extract_osd_timestamp(frame)
+                        if state:
+                            state.record_alert("chalking", det.confidence, auto_desc, snapshot=snap.name if snap else None, frames=[thumb], track_id=det.track_id, timestamp=osd_ts)
+                        if vector_store:
+                            try:
+                                vector_store.add(description=auto_desc, detected=True, confidence=det.confidence, camera_id=state.camera_id if state else 0, thumbnail_b64=thumb, yolo_confidence=det.confidence, person_type="chalker", capture_source="chalking")
+                            except Exception:
+                                logger.debug("vector_store.add failed for chalker fast-path", exc_info=True)
+                        alert_ids.add(det.track_id)
+                        chalking.on_alert(det.track_id)
+                        logger.info("Chalker fast-path: track=%d conf=%.0f%%", det.track_id, det.confidence * 100)
+                    continue
+
                 # ── Chalking ──────────────────────────────────────────────────
                 if det.class_name == "person":
                     if not _near_vehicle(det.bbox, vehicle_bboxes, _vehicle_proximity_px):
