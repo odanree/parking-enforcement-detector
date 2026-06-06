@@ -234,8 +234,8 @@ def main() -> None:
         f"  1: chalker\n"
     )
 
-    print(f"\n  Written {written} images + labels → {out_dir}")
-    print(f"  data.yaml → {yaml_path}")
+    print(f"\n  Written {written} images + labels -> {out_dir}")
+    print(f"  data.yaml -> {yaml_path}")
     print("\nTo fine-tune:")
     print(f"  yolo train model=yolov8n.pt data={yaml_path} epochs=50 imgsz=320 batch=32")
     print("---------------------\n")
