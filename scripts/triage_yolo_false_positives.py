@@ -207,6 +207,12 @@ def main() -> None:
         print("No candidates found.")
         return
 
+    if not args.apply:
+        print(f"\n  DRY-RUN -- would process {len(candidates)} candidates with {args.model}")
+        print(f"  Estimated cost: ~${len(candidates) * 0.0006:.2f} (haiku) or ~${len(candidates) * 0.0018:.2f} (sonnet)")
+        print("  Pass --apply to run.\n")
+        return
+
     counts = {"no": 0, "yes": 0, "uncertain": 0, "error": 0}
     uncertain_rows: list[tuple[dict, str, Path]] = []
 
@@ -254,8 +260,6 @@ def main() -> None:
     print(f"  true_negative  : {counts['yes']} (VLM was wrong, YOLO was right)")
     print(f"  uncertain      : {counts['uncertain']} (needs human review)")
     print(f"  errors         : {counts['error']}")
-    if not args.apply:
-        print("\n  DRY-RUN -- pass --apply to write labels to ChromaDB")
 
     if uncertain_rows:
         out = _ROOT / "yolo_fp_review_queue.html"
