@@ -178,7 +178,7 @@ def main() -> None:
     col     = chroma.get_or_create_collection(_COLLECTION)
 
     logger.info("Loading events ...")
-    result = col.get(include=["metadatas", "documents", "ids"], limit=100_000)
+    result = col.get(include=["metadatas", "documents"], limit=100_000)
 
     # Candidates: YOLO confident, VLM rejected, not yet human-labeled, has image
     candidates = []
