@@ -46,6 +46,11 @@ services:
       # on every `docker compose up --build` / recreate.
       - ./data:/app/data
       - ./dataset:/app/dataset
+      # ChromaDB's Rust backend requires POSIX file locking (WAL mode) which
+      # is incompatible with Windows NTFS mounts via WSL2/9P. Named volume
+      # stores the DB on the Linux ext4 filesystem inside the WSL2 VM,
+      # overriding the ./data bind mount for just this subdirectory.
+      - chroma-data:/app/data/vectors
     networks:
       - parking-net
     deploy:
@@ -58,6 +63,7 @@ services:
 
 volumes:
   ollama_data:
+  chroma-data:
 
 networks:
   parking-net:
