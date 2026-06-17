@@ -29,6 +29,20 @@ import re
 import anthropic
 import httpx
 
+try:
+    from langfuse.decorators import langfuse_context, observe
+except ImportError:
+    def observe(**_kw):
+        def _wrap(fn):
+            return fn
+        return _wrap
+
+    class _LfNoCtx:
+        def update_current_observation(self, **_kw): pass
+        def update_current_trace(self, **_kw): pass
+
+    langfuse_context = _LfNoCtx()
+
 logger = logging.getLogger(__name__)
 
 _OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
@@ -351,12 +365,18 @@ class VLMAnalyzer:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    @observe(name="vlm.classify_person", capture_input=False)
     def classify_person(self, image_bytes: bytes | list[bytes]) -> dict:
         """Classify the person in the image into a person_type category.
 
         Returns: { person_type, confidence, description }
         person_type one of: pedestrian, occupant, worker_landscape, worker_delivery, chalker, unknown
         """
+        frames_count = len(image_bytes) if isinstance(image_bytes, list) else 1
+        langfuse_context.update_current_trace(
+            name="vlm.classify_person",
+            metadata={"backend": self._backend, "model": self.model_name, "frames": frames_count},
+        )
         if self._backend == "mock":
             return {"person_type": "pedestrian", "confidence": 0.9, "description": "Mock classification."}
         frames = image_bytes if isinstance(image_bytes, list) else [image_bytes]
@@ -368,6 +388,7 @@ class VLMAnalyzer:
             logger.exception("classify_person error")
             return _CLASSIFY_FALLBACK.copy()
 
+    @observe(name="vlm.analyze", capture_input=False)
     def analyze(
         self,
         image_bytes: bytes | list[bytes],
@@ -384,6 +405,18 @@ class VLMAnalyzer:
         wheel). It is appended to the user prompt as a hint, not as ground
         truth — the VLM still owns the final decision.
         """
+        frames_count = len(image_bytes) if isinstance(image_bytes, list) else 1
+        langfuse_context.update_current_trace(
+            name="vlm.analyze",
+            metadata={
+                "backend": self._backend,
+                "model": self.model_name,
+                "kind": kind,
+                "structured": self._structured,
+                "frames": frames_count,
+                "prior_signals": prior_signals,
+            },
+        )
         if self._backend == "mock":
             return _MOCK_RESULTS.get(kind, _MOCK_RESULTS["pe_vehicle"])
         frames = image_bytes if isinstance(image_bytes, list) else [image_bytes]
@@ -446,6 +479,14 @@ class VLMAnalyzer:
                 max_tokens=512,
                 system=system_prompt,
                 messages=[{"role": "user", "content": content}],
+            )
+            langfuse_context.update_current_observation(
+                model=self._claude_model,
+                usage_details={
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
+                },
+                output=response.content[0].text,
             )
             return response.content[0].text
         else:
@@ -513,6 +554,16 @@ class VLMAnalyzer:
             "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
             "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
         }
+        langfuse_context.update_current_observation(
+            model=self._claude_model,
+            usage_details={
+                "input": usage["input_tokens"],
+                "output": usage["output_tokens"],
+                "cache_read_input_tokens": usage["cache_read_input_tokens"],
+                "cache_creation_input_tokens": usage["cache_creation_input_tokens"],
+            },
+            output=response.content[0].text,
+        )
         if self._structured:
             obs = _parse_json_raw(response.content[0].text)
             return {"_obs_raw": obs, "_usage": usage}

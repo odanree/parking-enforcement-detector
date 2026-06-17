@@ -97,11 +97,22 @@ class EventVectorStore:
                 self._clip_col = None
 
         # Persistent dedup: load all known hashes so restarts don't re-add the
-        # same frame if the pipeline replays the same footage.
-        all_meta = self._col.get(include=["metadatas"], limit=100_000).get("metadatas", [])
-        self._thumb_hashes: set[str] = {
-            m["thumb_hash"] for m in all_meta if m.get("thumb_hash")
-        }
+        # same frame if the pipeline replays the same footage. Paginated because
+        # chromadb's rust backend builds an internal SQL query whose bound-param
+        # count scales with limit; a single large fetch trips SQLite's variable
+        # ceiling once the collection grows past a few thousand rows.
+        self._thumb_hashes: set[str] = set()
+        page_size, offset = 500, 0
+        while True:
+            page = self._col.get(include=["metadatas"], limit=page_size, offset=offset)
+            metas = page.get("metadatas", []) or []
+            for m in metas:
+                h = m.get("thumb_hash")
+                if h:
+                    self._thumb_hashes.add(h)
+            if len(metas) < page_size:
+                break
+            offset += page_size
         count = self._col.count()
         logger.info("Vector store ready (%d events, %d unique thumbs)", count, len(self._thumb_hashes))
 

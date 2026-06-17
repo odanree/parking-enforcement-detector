@@ -3,6 +3,7 @@ lap>=0.5.12
 opencv-python>=4.9.0
 numpy>=1.26.0
 anthropic>=0.30.0
+langfuse>=2.0,<4.0
 httpx>=0.27.0
 pyyaml>=6.0.1
 python-dotenv>=1.0.0
@@ -13,7 +14,10 @@ jinja2>=3.1.4
 websockets>=12.0
 wsproto>=1.2.0
 twilio>=8.0.0
-chromadb>=0.5.0
+# Pinned after 1.x rust-backend rebuild surfaced "too many SQL variables"
+# on unbounded .get() — see ADR-029. vector_store.py paginates regardless,
+# but capping the major prevents another silent break on rebuild.
+chromadb>=1.5.9,<2.0.0
 pytesseract>=0.3.10
 # Optional — enables CLIP image embeddings in the vector store
 # (CLIP_EMBEDDINGS_ENABLED=true). Comment out to save ~1 GB on install.
