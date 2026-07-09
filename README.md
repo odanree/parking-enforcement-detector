@@ -1,6 +1,6 @@
 # Parking Enforcement Detector
 
-Real-time detection of parking enforcement activity using YOLO object detection and a vision-language model (Claude or Ollama). Monitors an RTSP camera feed or video file and alerts when it detects tire chalking by a PE officer.
+Real-time detection of parking enforcement activity using YOLO object detection and a vision-language model (Claude or Ollama). Monitors an RTSP camera feed or video file and alerts on tire chalking by a PE officer, stopped PE vehicles ([ADR-006](docs/adr/006-pe-vehicle-stopped-detection.md)), and street sweepers.
 
 ## How it works
 
@@ -111,12 +111,18 @@ See [`.env.example`](.env.example) for all options and [`docs/runbooks/operation
 
 ## Stack
 
-- **Detection:** YOLOv8 (Ultralytics) + ByteTrack; opt-in YOLOv8-pose and a classical-CV chalk-wand detector
-- **VLM:** Claude via Anthropic API, or any Ollama multimodal model
-- **RAG:** ChromaDB store (description text + opt-in CLIP image embeddings) for retrieval and auto-rejection
+- **Detection:** YOLOv8 (Ultralytics) + ByteTrack; opt-in YOLOv8-pose and a classical-CV chalk-wand detector; person action classifier covers `standing`, `walking`, `running`, `crouching`, `bending`
+- **VLM:** Claude via Anthropic API, or any Ollama multimodal model (see [ADR-027](docs/adr/027-gemma3-4b-for-classifier-footprint.md) for the local-model choice)
+- **RAG:** ChromaDB store (description text + opt-in CLIP image embeddings, perceptual-hash dedup) for retrieval and auto-rejection
 - **Backend:** FastAPI + WebSocket
 - **Frontend:** React 19 + Vite + Zustand
 - **Alerts:** Email (Gmail SMTP), ntfy.sh, Home Assistant webhook
+- **GPU / Compute:** NVIDIA RTX 3090 / CUDA — inference migrated from CPU-torch per [ADR-026](docs/adr/026-gpu-inference-for-yolo.md), superseding the earlier lean-resource profile in [ADR-024](docs/adr/024-lean-resource-profile-and-vlm-model-selection.md)
+- **Observability:** Langfuse traces on every VLM call for cost + latency visibility ([ADR-029](docs/adr/029-langfuse-vlm-observability.md))
+
+## Tuning history
+
+Recent accuracy work is captured in [ADR-023 (detection accuracy rework)](docs/adr/023-detection-accuracy-rework.md): YOLO inference threshold raised from `0.30` → `0.55`, position-grid FP suppression added to drop repeated hits at fixed pixel regions, and the RAG auto-reject gate (`RAG_FP_THRESHOLD` / `RAG_FP_MIN_VOTES`) wired up to short-circuit VLM calls on labeled-negative-adjacent detections.
 
 ## Maintenance
 
