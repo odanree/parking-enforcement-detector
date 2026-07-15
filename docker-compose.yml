@@ -36,7 +36,9 @@ services:
       - "8000:8000"
     environment:
       - OLLAMA_URL=http://ollama:11434
-      - TZ=America/Los_Angeles
+      # Set TZ in .env for local time in logs / off-hours gate. Defaults to UTC
+      # so the tracked file doesn't leak the operator's geographic region.
+      - TZ=${TZ:-UTC}
     volumes:
       - ./config:/app/config:ro
       - ./snapshots:/app/snapshots

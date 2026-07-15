@@ -12,7 +12,7 @@ Two phases, because of two hard environment constraints:
 
 Phase 1 (host):
     python -m scripts.ingest_nvr_positives extract \
-        --video "C:/Users/Danh/Desktop/NVR/May 4 incident/NVR_ch3_main_...mp4" \
+        --video /path/to/nvr_clip.mp4 \
         --seconds 119 122 136 406 423 429 445 --out _ingest_payload
 
 Phase 2 (container one-off, main container stopped):
