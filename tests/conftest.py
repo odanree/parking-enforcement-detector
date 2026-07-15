@@ -7,8 +7,13 @@ uvicorn/fastapi/playwright are absent.
 """
 
 import importlib.util
+import os
 import sys
 from unittest.mock import MagicMock
+
+# Phase 0 auth requires PED_API_KEY at import time — set a test value before
+# any src.web.* module loads. See docs/adr/031-phase-0-api-key-auth.md.
+os.environ.setdefault("PED_API_KEY", "test-key-not-a-real-secret-32chars")
 
 # ── Stub missing heavy packages before any src imports ────────────────────────
 # Unit tests only exercise pure-Python logic and never call these at runtime.
@@ -79,3 +84,17 @@ def app_server():
 def base_url(app_server):
     """Playwright-compatible base_url pointing at the test server."""
     return app_server
+
+
+@pytest.fixture(autouse=True)
+def _inject_test_api_key(request):
+    """Pre-populate localStorage with the test API key before every Playwright
+    navigation, so the app's auth prompt doesn't block E2E tests. No-op for
+    unit tests (they don't consume the `page` fixture).
+    """
+    if "page" not in request.fixturenames:
+        return
+    page = request.getfixturevalue("page")
+    page.add_init_script(
+        "localStorage.setItem('ped.apiKey', 'test-key-not-a-real-secret-32chars');"
+    )
