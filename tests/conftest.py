@@ -87,14 +87,19 @@ def base_url(app_server):
 
 
 @pytest.fixture(autouse=True)
-def _inject_test_api_key(request):
-    """Pre-populate localStorage with the test API key before every Playwright
-    navigation, so the app's auth prompt doesn't block E2E tests. No-op for
-    unit tests (they don't consume the `page` fixture).
+def _login_for_playwright(request):
+    """Log in through /api/auth/login before every Playwright test so the app's
+    auth prompt doesn't block. The Playwright context stores the resulting
+    HttpOnly session cookie and shares it across page navigations in this test.
+    No-op for unit tests (they don't consume the `page` fixture).
+
+    See docs/adr/032-phase-0-5-session-cookie-auth.md for the auth model.
     """
-    if "page" not in request.fixturenames:
+    if "page" not in request.fixturenames or "base_url" not in request.fixturenames:
         return
     page = request.getfixturevalue("page")
-    page.add_init_script(
-        "localStorage.setItem('ped.apiKey', 'test-key-not-a-real-secret-32chars');"
+    base_url = request.getfixturevalue("base_url")
+    page.request.post(
+        f"{base_url}/api/auth/login",
+        data={"api_key": "test-key-not-a-real-secret-32chars"},
     )

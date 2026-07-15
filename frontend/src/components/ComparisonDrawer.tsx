@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { useAppStore } from '../store';
-import { authedUrl } from '../lib/auth';
 
 interface ComparisonEvent {
   id: string;
@@ -29,7 +28,7 @@ interface ComparisonData {
 type Filter = 'fp_fixed' | 'new_detections' | 'all';
 
 function thumb_url(thumb_file: string) {
-  return thumb_file ? authedUrl(`/dataset/${thumb_file}`) : '';
+  return thumb_file ? `/dataset/${thumb_file}` : '';
 }
 
 function pct(v: number) {

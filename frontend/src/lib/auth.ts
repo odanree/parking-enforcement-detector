@@ -1,153 +1,104 @@
 /**
- * Phase 0 frontend auth — API key stored in localStorage, injected into
- * every fetch() and WebSocket URL via global interceptors.
+ * Phase 0.5 frontend auth — HttpOnly cookie sessions + one-shot WS tickets.
  *
- * Why interceptors instead of an API client: there are 18 existing fetch
- * call sites across hooks/components. Monkey-patching window.fetch and
- * window.WebSocket at boot lets all of them work unchanged.
+ * No secrets touch JavaScript. Login POSTs the API key to /api/auth/login,
+ * the browser stores the resulting HttpOnly cookie, and every subsequent
+ * same-origin request (fetch, <img src>, <script src>) carries it
+ * automatically. WebSocket handshakes can't set headers, so before opening
+ * a WS we mint a short-lived single-use ticket via authed REST.
  *
- * See docs/adr/030-aws-migration-strangler-fig.md (Phase 0) and
- * docs/adr/031-phase-0-api-key-auth.md for backend rationale.
+ * See docs/adr/032-phase-0-5-session-cookie-auth.md for rationale, and
+ * docs/adr/031 for the Phase 0 mechanism this supersedes.
  */
 
-const STORAGE_KEY = 'ped.apiKey';
+/** Same-origin credentials mode used for every API call. */
+const CREDS: RequestCredentials = 'same-origin';
 
-/** Paths that are served without auth (must match backend _PUBLIC_*). */
-const PUBLIC_PATH_PREFIXES = ['/assets/'];
-const PUBLIC_PATH_EXACT = new Set(['/', '/favicon.svg', '/health']);
+// ── Fetch interceptor: force credentials: 'same-origin' on our origin ────────
 
-/** Paths that need the token as a query param instead of Authorization header. */
-const QUERY_PARAM_PATH_PREFIXES = ['/snapshots/', '/dataset/'];
-
-function isPublicPath(pathname: string): boolean {
-  if (PUBLIC_PATH_EXACT.has(pathname)) return true;
-  return PUBLIC_PATH_PREFIXES.some((p) => pathname.startsWith(p));
-}
-
-function needsQueryParam(pathname: string): boolean {
-  return QUERY_PARAM_PATH_PREFIXES.some((p) => pathname.startsWith(p));
-}
-
-export function getApiKey(): string | null {
-  return localStorage.getItem(STORAGE_KEY);
-}
-
-/**
- * Append the API key as ?token= to a same-origin URL that a browser
- * resource loader will fetch (e.g. `<img src>`, `<a href>` downloads).
- * fetch() and WebSocket calls do NOT need this — those are handled by
- * the global interceptors installed at boot.
- *
- * Returns the path unchanged when no key is stored (image will 401,
- * which is what we want during the login-prompt phase).
- */
-export function authedUrl(path: string): string {
-  const key = getApiKey();
-  if (!key) return path;
-  const sep = path.includes('?') ? '&' : '?';
-  return `${path}${sep}token=${encodeURIComponent(key)}`;
-}
-
-export function setApiKey(key: string): void {
-  localStorage.setItem(STORAGE_KEY, key.trim());
-}
-
-export function clearApiKey(): void {
-  localStorage.removeItem(STORAGE_KEY);
-}
-
-/** Prompt the user for a key if none is stored. Returns the key or null on cancel. */
-export function promptForApiKey(): string | null {
-  const existing = getApiKey();
-  if (existing) return existing;
-  const entered = window.prompt(
-    'Enter PED API key (set as PED_API_KEY on the server):',
-    '',
-  );
-  if (!entered) return null;
-  setApiKey(entered);
-  return entered;
-}
-
-function toUrlObject(input: RequestInfo | URL): URL {
-  if (input instanceof URL) return input;
-  const raw = typeof input === 'string' ? input : input.url;
-  // Relative URLs need a base to construct a URL object.
-  return new URL(raw, window.location.origin);
-}
-
-/**
- * Install fetch + WebSocket interceptors. Call once at boot BEFORE any
- * React component mounts (so no hook sneaks a call in first).
- */
 export function installAuthInterceptors(): void {
   const nativeFetch = window.fetch.bind(window);
-  const NativeWebSocket = window.WebSocket;
-
-  window.fetch = async (input: RequestInfo | URL, init: RequestInit = {}) => {
-    let url: URL;
+  window.fetch = (input: RequestInfo | URL, init: RequestInit = {}) => {
+    let url: string;
+    if (typeof input === 'string') {
+      url = input;
+    } else if (input instanceof URL) {
+      url = input.toString();
+    } else {
+      url = input.url;
+    }
     try {
-      url = toUrlObject(input);
+      const u = new URL(url, window.location.origin);
+      if (u.origin === window.location.origin) {
+        return nativeFetch(input as RequestInfo, { ...init, credentials: CREDS });
+      }
     } catch {
-      return nativeFetch(input as RequestInfo, init);
+      // Fall through — non-URL input, let native fetch handle it.
     }
-
-    // Only touch requests to this app's own origin — no leaking the key
-    // to third-party CDNs, telemetry, etc.
-    if (url.origin !== window.location.origin) {
-      return nativeFetch(input as RequestInfo, init);
-    }
-
-    if (isPublicPath(url.pathname)) {
-      return nativeFetch(input as RequestInfo, init);
-    }
-
-    const key = getApiKey();
-    if (!key) {
-      // 401 without ever hitting the network — lets the caller show the login UI.
-      return new Response('no api key set', { status: 401 });
-    }
-
-    if (needsQueryParam(url.pathname)) {
-      // <img> tags etc. — token has to ride on the URL because you can't
-      // set headers on a fetch that a browser resource loader kicked off.
-      url.searchParams.set('token', key);
-      const nextInit: RequestInit = { ...init };
-      return nativeFetch(url.toString(), nextInit);
-    }
-
-    const headers = new Headers(init.headers ?? {});
-    headers.set('Authorization', `Bearer ${key}`);
-    return nativeFetch(input as RequestInfo, { ...init, headers });
+    return nativeFetch(input as RequestInfo, init);
   };
+}
 
-  // WebSocket: rewrite the URL to include ?token= before the handshake fires.
-  // Wrap the native constructor rather than subclassing — subclassing WebSocket
-  // is inconsistent across browsers.
-  const patchedWs = function (
-    url: string | URL,
-    protocols?: string | string[],
-  ) {
-    const target = url instanceof URL ? url : new URL(url, window.location.href);
-    const key = getApiKey();
-    // Compare host (host:port) not origin — origin includes the scheme, and
-    // ws://localhost:8000 has a different origin from http://localhost:8000
-    // even though it's the same server.
-    if (key && target.host === window.location.host) {
-      target.searchParams.set('token', key);
-    }
-    return new NativeWebSocket(target.toString(), protocols);
-  };
+// ── Auth state ────────────────────────────────────────────────────────────────
 
-  // Mirror the constructor-level readonly constants (CONNECTING/OPEN/CLOSING/CLOSED)
-  // via defineProperties so we don't trip TS's readonly check on the WebSocket type.
-  Object.defineProperties(patchedWs, {
-    prototype:  { value: NativeWebSocket.prototype },
-    CONNECTING: { value: NativeWebSocket.CONNECTING, enumerable: true },
-    OPEN:       { value: NativeWebSocket.OPEN,       enumerable: true },
-    CLOSING:    { value: NativeWebSocket.CLOSING,    enumerable: true },
-    CLOSED:     { value: NativeWebSocket.CLOSED,     enumerable: true },
+export async function isAuthenticated(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/auth/status', { credentials: CREDS });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return !!data.authenticated;
+  } catch {
+    return false;
+  }
+}
+
+export async function login(apiKey: string): Promise<boolean> {
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: apiKey.trim() }),
+    credentials: CREDS,
   });
+  return res.ok;
+}
 
-  window.WebSocket = patchedWs as unknown as typeof WebSocket;
+export async function logout(): Promise<void> {
+  await fetch('/api/auth/logout', { method: 'POST', credentials: CREDS });
+}
+
+/**
+ * Prompt the user to log in if they aren't already. Loops until authenticated
+ * or the user cancels the prompt.
+ */
+export async function ensureLoggedIn(): Promise<boolean> {
+  if (await isAuthenticated()) return true;
+  while (true) {
+    const key = window.prompt('Enter PED API key (set as PED_API_KEY on the server):', '');
+    if (!key) return false;
+    if (await login(key)) return true;
+    window.alert('Invalid API key — try again.');
+  }
+}
+
+// ── WebSocket helper — must be awaited because the ticket fetch is async ────
+
+/**
+ * Open a WebSocket to a same-origin URL with authentication. Mints a one-shot
+ * ticket via /api/auth/ws-ticket and passes it on the handshake URL.
+ *
+ * The ticket is opaque, single-use, and expires in 30s — safe to appear on
+ * the URL (unlike a bearer key would be).
+ */
+export async function openAuthedWebSocket(url: string | URL): Promise<WebSocket> {
+  const target = url instanceof URL ? url : new URL(url, window.location.href);
+  const res = await fetch('/api/auth/ws-ticket', {
+    method: 'POST',
+    credentials: CREDS,
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to mint WS ticket (${res.status})`);
+  }
+  const { ticket } = (await res.json()) as { ticket: string };
+  target.searchParams.set('ticket', ticket);
+  return new WebSocket(target.toString());
 }

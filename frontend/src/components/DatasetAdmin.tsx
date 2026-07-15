@@ -1,6 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useAppStore } from '../store';
-import { authedUrl } from '../lib/auth';
 
 const PAGE_SIZE = 50;
 
@@ -93,8 +92,8 @@ function AdminRow({
     }
   }
 
-  const thumbUrl = item.thumb_file ? authedUrl(`/dataset/${item.thumb_file}`) : null;
-  const hiresUrl = item.hires_file ? authedUrl(`/dataset/${item.hires_file}`) : null;
+  const thumbUrl = item.thumb_file ? `/dataset/${item.thumb_file}` : null;
+  const hiresUrl = item.hires_file ? `/dataset/${item.hires_file}` : null;
   const previewUrl = hiresUrl || thumbUrl;
 
   return (
@@ -160,7 +159,7 @@ function GroupCard({
   onOpen: () => void;
 }) {
   const { rep, count, all } = group;
-  const thumbUrl = rep.thumb_file ? authedUrl(`/dataset/${rep.thumb_file}`) : null;
+  const thumbUrl = rep.thumb_file ? `/dataset/${rep.thumb_file}` : null;
 
   const lc: Record<string, number> = {};
   for (const item of all) lc[item.label || 'none'] = (lc[item.label || 'none'] ?? 0) + 1;
@@ -360,12 +359,12 @@ export function DatasetAdmin() {
 
   const previewItem = previewIdx !== null ? items[previewIdx] : null;
   const previewUrl  = previewItem
-    ? (previewItem.hires_file ? authedUrl(`/dataset/${previewItem.hires_file}`) : previewItem.thumb_file ? authedUrl(`/dataset/${previewItem.thumb_file}`) : null)
+    ? (previewItem.hires_file ? `/dataset/${previewItem.hires_file}` : previewItem.thumb_file ? `/dataset/${previewItem.thumb_file}` : null)
     : null;
 
   const gpItem = groupPreview ? groupPreview.all[groupPreview.idx] : null;
   const gpUrl  = gpItem
-    ? (gpItem.hires_file ? authedUrl(`/dataset/${gpItem.hires_file}`) : gpItem.thumb_file ? authedUrl(`/dataset/${gpItem.thumb_file}`) : null)
+    ? (gpItem.hires_file ? `/dataset/${gpItem.hires_file}` : gpItem.thumb_file ? `/dataset/${gpItem.thumb_file}` : null)
     : null;
 
   const groups = viewMode === 'grouped' ? groupItems(items) : [];
