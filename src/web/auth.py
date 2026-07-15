@@ -32,6 +32,7 @@ import hmac
 import logging
 import os
 import secrets
+import threading
 import time
 from typing import Callable, Optional
 from urllib.parse import parse_qs
@@ -53,10 +54,10 @@ class AuthConfig:
         self.allowed_origins: frozenset[str] = frozenset(
             o.strip() for o in raw_origins.split(",") if o.strip()
         )
-        # Cookies flagged Secure won't be sent over http:// (even localhost on
-        # some browsers). Default off so local dev works; production TLS deploys
-        # should set PED_COOKIE_SECURE=true.
-        self.cookie_secure = os.getenv("PED_COOKIE_SECURE", "false").lower() == "true"
+        # Cookies flagged Secure won't be sent over http:// — safe default is on.
+        # Local http://localhost dev must opt out explicitly with
+        # PED_COOKIE_INSECURE=true; anything reachable over TLS keeps the flag.
+        self.cookie_secure = os.getenv("PED_COOKIE_INSECURE", "false").lower() != "true"
         if not self.api_key:
             raise RuntimeError(
                 "PED_API_KEY is not set. Refusing to start with an "
@@ -80,8 +81,12 @@ class AuthConfig:
 _CONFIG = AuthConfig()
 
 # In-memory stores. Reset on container restart (documented trade-off — see ADR-032).
+# All access is serialized by _store_lock — FastAPI dispatches sync endpoints to
+# a threadpool, so plain dict mutation would race between the ASGI middleware
+# (async) and the login/logout/ws-ticket handlers (thread).
 _sessions: dict[str, dict] = {}   # session_id -> {"created_at": ts}
-_tickets: dict[str, dict] = {}    # ticket -> {"created_at": ts, "used": bool}
+_tickets: dict[str, dict] = {}    # ticket -> {"created_at": ts}
+_store_lock = threading.Lock()
 
 # Paths served without auth so the SPA can load the login flow.
 _PUBLIC_PREFIXES: tuple[str, ...] = ("/assets/",)
@@ -150,7 +155,8 @@ def _parse_cookie_header(header: str) -> dict[str, str]:
 
 # ── Session lifecycle (public API for the login/logout endpoints) ────────────
 
-def _purge_expired_sessions() -> None:
+def _purge_expired_sessions_locked() -> None:
+    """Caller must hold _store_lock."""
     cutoff = _now() - _SESSION_TTL_SEC
     stale = [sid for sid, entry in _sessions.items() if entry["created_at"] < cutoff]
     for sid in stale:
@@ -163,26 +169,30 @@ def check_api_key(candidate: str | None) -> bool:
 
 
 def create_session() -> str:
-    _purge_expired_sessions()
-    sid = secrets.token_hex(32)
-    _sessions[sid] = {"created_at": _now()}
-    return sid
+    with _store_lock:
+        _purge_expired_sessions_locked()
+        sid = secrets.token_hex(32)
+        _sessions[sid] = {"created_at": _now()}
+        return sid
 
 
 def is_valid_session(session_id: str | None) -> bool:
     if not session_id:
         return False
-    entry = _sessions.get(session_id)
-    if not entry:
-        return False
-    if _now() - entry["created_at"] > _SESSION_TTL_SEC:
-        _sessions.pop(session_id, None)
-        return False
-    return True
+    with _store_lock:
+        entry = _sessions.get(session_id)
+        if not entry:
+            return False
+        if _now() - entry["created_at"] > _SESSION_TTL_SEC:
+            _sessions.pop(session_id, None)
+            return False
+        return True
 
 
 def destroy_session(session_id: str | None) -> None:
-    if session_id:
+    if not session_id:
+        return
+    with _store_lock:
         _sessions.pop(session_id, None)
 
 
@@ -200,32 +210,35 @@ def cookie_settings() -> dict:
 
 # ── WS ticket lifecycle (public API for the ticket endpoint) ─────────────────
 
-def _purge_expired_tickets() -> None:
+def _purge_expired_tickets_locked() -> None:
+    """Caller must hold _store_lock."""
     cutoff = _now() - _TICKET_TTL_SEC
-    stale = [t for t, entry in _tickets.items()
-             if entry["created_at"] < cutoff or entry["used"]]
+    stale = [t for t, entry in _tickets.items() if entry["created_at"] < cutoff]
     for t in stale:
-        _tickets.pop(t, None)
+        del _tickets[t]
 
 
 def create_ws_ticket() -> str:
-    _purge_expired_tickets()
-    ticket = secrets.token_hex(24)
-    _tickets[ticket] = {"created_at": _now(), "used": False}
-    return ticket
+    with _store_lock:
+        _purge_expired_tickets_locked()
+        ticket = secrets.token_hex(24)
+        _tickets[ticket] = {"created_at": _now()}
+        return ticket
 
 
 def _consume_ws_ticket(ticket: str | None) -> bool:
+    """Atomic pop-then-check. Removing the entry BEFORE checking TTL closes
+    the TOCTOU that a check-then-set version had — two concurrent handshakes
+    can't both see 'not used' before either marks it. If two handshakes race
+    for the same ticket, exactly one wins the pop and the other gets None.
+    """
     if not ticket:
         return False
-    entry = _tickets.get(ticket)
-    if not entry or entry["used"]:
+    with _store_lock:
+        entry = _tickets.pop(ticket, None)
+    if not entry:
         return False
-    if _now() - entry["created_at"] > _TICKET_TTL_SEC:
-        _tickets.pop(ticket, None)
-        return False
-    entry["used"] = True
-    return True
+    return (_now() - entry["created_at"]) <= _TICKET_TTL_SEC
 
 
 # ── ASGI middleware ──────────────────────────────────────────────────────────
