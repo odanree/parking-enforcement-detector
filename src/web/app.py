@@ -29,7 +29,7 @@ import numpy as _np
 import cv2 as _cv2
 from datetime import datetime as _dt
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -101,6 +101,7 @@ logger = logging.getLogger(__name__)
 from src import pipeline
 from src.storage.vector_store import EventVectorStore
 from src.vlm.analyzer import VLMAnalyzer, _LENIENT_USER_PROMPT, _LENIENT_SYSTEM_PROMPT
+from src.web.auth import AuthMiddleware, authorize_websocket, require_confirm
 from src.web.state import AppState
 
 states = [AppState(0), AppState(1)]
@@ -245,9 +246,19 @@ _SNAPSHOTS_DIR.mkdir(exist_ok=True)
 _DIST = _BASE.parent.parent / "frontend-dist"
 
 app = FastAPI(title="Parking Enforcement Detector", lifespan=lifespan)
+# Phase 0 trust boundary — see docs/adr/030 + docs/adr/031.
+# Middleware guards every HTTP route except `/`, `/favicon.svg`, `/assets/*`.
+# WebSocket handlers call authorize_websocket() directly (separate ASGI scope).
+app.add_middleware(AuthMiddleware)
 app.mount("/assets",    StaticFiles(directory=str(_DIST / "assets")),  name="assets")
 app.mount("/snapshots", StaticFiles(directory=str(_SNAPSHOTS_DIR)),    name="snapshots")
 app.mount("/dataset",   StaticFiles(directory=str(_DATASET_DIR)),      name="dataset")
+
+
+@app.get("/health")
+async def health():
+    """Unauthenticated liveness probe — public so docker healthchecks work."""
+    return {"ok": True}
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
@@ -403,12 +414,13 @@ async def clear_rejected():
     return {"ok": True}
 
 
-@app.delete("/api/pipeline/history")
+@app.delete("/api/pipeline/history", dependencies=[Depends(require_confirm)])
 async def clear_pipeline_history():
     """Clear in-memory pipeline state (live kanban cards, events deque, alerts).
 
     Does NOT touch the persistent vector store / dataset — use DELETE /api/dataset
     for that.  This only clears the live view so the kanban resets to empty.
+    Requires ?confirm=true.
     """
     for s in states:
         s.clear_all_history()
@@ -743,8 +755,9 @@ async def dataset_list(
     return JSONResponse(result)
 
 
-@app.delete("/api/dataset")
+@app.delete("/api/dataset", dependencies=[Depends(require_confirm)])
 async def dataset_clear_all():
+    """Wipe the entire vector store. Requires ?confirm=true in addition to auth."""
     removed = vector_store.clear_all()
     return {"ok": True, "removed": removed}
 
@@ -1479,6 +1492,8 @@ async def playback_preview_ws(websocket: WebSocket, timestamp: float, camera_id:
     the NVR allows; the WS loop skips (speed-1) frames per displayed frame at 25 fps.
     speedpara is still passed to the NVR URL in case the firmware honours it.
     """
+    if not await authorize_websocket(websocket):
+        return
     import collections
     from src.stream.rtsp_handler import build_nvr_playback_url
     await websocket.accept()
@@ -1529,6 +1544,8 @@ async def playback_preview_ws(websocket: WebSocket, timestamp: float, camera_id:
 
 @app.websocket("/ws/video/{cam_id}")
 async def video_stream(websocket: WebSocket, cam_id: int = 0):
+    if not await authorize_websocket(websocket):
+        return
     if cam_id not in (0, 1):
         await websocket.close(code=1008)
         return

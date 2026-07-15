@@ -80,10 +80,24 @@ docker compose run --rm detector python -m scripts.dataset_maintenance stats
 
 ## Configuration
 
+**Required for first run** — the app fails to start without an auth key
+(see [ADR-031](docs/adr/031-phase-0-api-key-auth.md)):
+
+```bash
+# In .env
+PED_API_KEY=$(openssl rand -hex 32)          # any high-entropy string, min 16 chars
+PED_ALLOWED_ORIGINS=                         # comma-separated; blank = same-origin only
+```
+
+The dashboard prompts for this key on first load (stored in `localStorage`).
+All `/api/*`, `/ws/*`, `/snapshots/*`, `/dataset/*` requests require it.
+
 Key `.env` variables:
 
 | Variable | Default | Description |
 |---|---|---|
+| `PED_API_KEY` | — | **Required.** Bearer token for all authenticated routes. |
+| `PED_ALLOWED_ORIGINS` | — | Comma-separated cross-origin allowlist (blank = same-origin only). |
 | `RTSP_URL` | — | `rtsp://user:pass@host/stream` — leave blank for demo mode |
 | `VIDEO_PATH` | — | Local video file for replay mode (disables dedup and off-hours gate) |
 | `VLM_BACKEND` | `claude` | `claude`, `ollama`, or `mock` |
