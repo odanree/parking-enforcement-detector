@@ -27,8 +27,8 @@ Measured resolutions (live cameras, 2026-05-22):
 
 | Camera | RTSP `stream1` | snapshot.cgi main | Aspect match? |
 |---|---|---|---|
-| cam1 (192.168.1.142) | 1024×480 (2.13:1) | 4096×1944 (2.11:1) | yes — same FOV, 4× |
-| cam0 (192.168.1.123) | 704×576 (4:3) | 3840×2160 (16:9) | **no** — different crop |
+| cam1 | 1024×480 (2.13:1) | 4096×1944 (2.11:1) | yes — same FOV, 4× |
+| cam0 | 704×576 (4:3) | 3840×2160 (16:9) | **no** — different crop |
 
 For **cam1** (the reported case) the FOV matches and the scale composes exactly
 (`resize 1024→1280 ×1.25` then `annotate 1280→4096 ×3.2` = ×4.0; vertical
