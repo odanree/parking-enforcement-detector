@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store';
+import { openAuthedWebSocket } from '../lib/auth';
 import { TYPE_LABELS } from '../types';
 
 function ZoomableImage({ src }: { src: string }) {
@@ -110,23 +111,34 @@ export function EventModal() {
     if (!previewActive || !ev) return;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const camId = ev.camera_id ?? ev.camera ?? 0;
-    const ws = new WebSocket(`${proto}://${location.host}/ws/playback/preview?timestamp=${ev.timestamp}&camera_id=${camId}&speed=${previewSpeed}`);
-    ws.binaryType = 'blob';
-    ws.onmessage = (e) => {
-      const url = URL.createObjectURL(e.data as Blob);
-      const img = new Image();
-      img.onload = () => {
-        const canvas = previewCanvasRef.current;
-        if (canvas) {
-          if (canvas.width !== img.naturalWidth)   canvas.width  = img.naturalWidth;
-          if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
-          canvas.getContext('2d')?.drawImage(img, 0, 0);
-        }
-        URL.revokeObjectURL(url);
+    let ws: WebSocket | null = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        ws = await openAuthedWebSocket(
+          `${proto}://${location.host}/ws/playback/preview?timestamp=${ev.timestamp}&camera_id=${camId}&speed=${previewSpeed}`,
+        );
+      } catch {
+        return;
+      }
+      if (cancelled) { ws.close(); return; }
+      ws.binaryType = 'blob';
+      ws.onmessage = (e) => {
+        const url = URL.createObjectURL(e.data as Blob);
+        const img = new Image();
+        img.onload = () => {
+          const canvas = previewCanvasRef.current;
+          if (canvas) {
+            if (canvas.width !== img.naturalWidth)   canvas.width  = img.naturalWidth;
+            if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
+            canvas.getContext('2d')?.drawImage(img, 0, 0);
+          }
+          URL.revokeObjectURL(url);
+        };
+        img.src = url;
       };
-      img.src = url;
-    };
-    return () => ws.close();
+    })();
+    return () => { cancelled = true; ws?.close(); };
   }, [previewActive, ev, previewSpeed]);
 
   // Close on Escape

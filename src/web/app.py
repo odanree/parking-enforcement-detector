@@ -29,7 +29,7 @@ import numpy as _np
 import cv2 as _cv2
 from datetime import datetime as _dt
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -101,7 +101,18 @@ logger = logging.getLogger(__name__)
 from src import pipeline
 from src.storage.vector_store import EventVectorStore
 from src.vlm.analyzer import VLMAnalyzer, _LENIENT_USER_PROMPT, _LENIENT_SYSTEM_PROMPT
-from src.web.auth import AuthMiddleware, authorize_websocket, require_confirm
+from src.web.auth import (
+    AuthMiddleware,
+    SESSION_COOKIE_NAME,
+    authorize_websocket,
+    check_api_key,
+    cookie_settings,
+    create_session,
+    create_ws_ticket,
+    destroy_session,
+    is_valid_session,
+    require_confirm,
+)
 from src.web.state import AppState
 
 states = [AppState(0), AppState(1)]
@@ -259,6 +270,52 @@ app.mount("/dataset",   StaticFiles(directory=str(_DATASET_DIR)),      name="dat
 async def health():
     """Unauthenticated liveness probe — public so docker healthchecks work."""
     return {"ok": True}
+
+
+# ── Auth endpoints (Phase 0.5 — see docs/adr/032) ────────────────────────────
+
+class LoginBody(BaseModel):
+    api_key: str
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginBody, response: Response):
+    """Validate PED_API_KEY and set an HttpOnly session cookie."""
+    if not check_api_key(body.api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    session_id = create_session()
+    response.set_cookie(value=session_id, **cookie_settings())
+    return {"ok": True}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response):
+    """Clear the session cookie and remove the server-side session."""
+    destroy_session(request.cookies.get(SESSION_COOKIE_NAME))
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    """Public — used by the SPA on boot to decide whether to prompt for login."""
+    session_ok = is_valid_session(request.cookies.get(SESSION_COOKIE_NAME))
+    # Also honour a bearer token — lets a curl script call /api/auth/status too.
+    auth = request.headers.get("authorization", "")
+    bearer_ok = auth.lower().startswith("bearer ") and check_api_key(
+        auth.split(" ", 1)[1].strip()
+    )
+    return {"authenticated": bool(session_ok or bearer_ok)}
+
+
+@app.post("/api/auth/ws-ticket")
+async def auth_ws_ticket():
+    """Mint a short-lived, single-use ticket for a WebSocket handshake.
+
+    Caller must be authenticated (session cookie or bearer). Ticket is
+    consumed by authorize_websocket() on the WS upgrade; 30s TTL.
+    """
+    return {"ticket": create_ws_ticket()}
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────

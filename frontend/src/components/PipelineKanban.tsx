@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../store';
-import { authedUrl } from '../lib/auth';
 import type { PipelineStage, RagNeighbor, RagStage } from '../types';
 
 type TimeFilter  = '5m' | '1h' | '3h' | '6h' | '12h' | '24h' | 'all';
@@ -211,13 +210,13 @@ function ZoomableImage({ src }: { src: string }) {
 }
 
 function thumbSrc(card: TraceCard): string | null {
-  if (card.thumb_url)  return authedUrl(card.thumb_url);
+  if (card.thumb_url)  return card.thumb_url;
   if (card.thumbnail)  return `data:image/jpeg;base64,${card.thumbnail}`;
   return null;
 }
 
 function hiresSrc(card: TraceCard): string | null {
-  return card.hires_url ? authedUrl(card.hires_url) : thumbSrc(card);
+  return card.hires_url ?? thumbSrc(card);
 }
 
 function KanbanCard({ card, count, onClick }: { card: TraceCard; count?: number; onClick: () => void }) {

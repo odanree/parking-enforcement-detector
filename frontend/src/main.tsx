@@ -3,18 +3,28 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import { useAppStore } from './store.ts'
-import { installAuthInterceptors, promptForApiKey } from './lib/auth.ts'
+import { installAuthInterceptors, ensureLoggedIn } from './lib/auth.ts'
 
-// Phase 0 trust boundary — install BEFORE any React component mounts so
-// no hook can sneak an unauthenticated fetch through first.
+// Phase 0.5 trust boundary — install fetch interceptor (forces same-origin
+// credentials so the session cookie rides on every request) BEFORE any React
+// component mounts, then gate the render on a successful login.
 installAuthInterceptors()
-promptForApiKey()
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+async function boot() {
+  const ok = await ensureLoggedIn()
+  if (!ok) {
+    document.body.innerHTML =
+      '<pre style="padding:2em;font-family:system-ui">Login required. Reload the page to try again.</pre>'
+    return
+  }
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+}
+
+boot()
 
 // Playwright E2E helper — opens the event modal without needing a real event in the log
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
