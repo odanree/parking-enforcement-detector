@@ -138,7 +138,12 @@ class WandDetector:
         # end reaches below. Score candidates and keep the best.
         best: WandSignal | None = None
         for ln in lines:
-            ax, ay, bx, by = ln[0]
+            # HoughLinesP usually returns (N, 1, 4) but some cv2 builds squeeze
+            # to (N, 4). Ravel first so `ax, ay, bx, by` unpack works either way
+            # — a bare (4,) row would fail `ln[0]` unpack with "cannot unpack
+            # non-iterable numpy.int32", which historically killed the pipeline
+            # thread (see 2026-07-15 outage — both cams stuck for 12h).
+            ax, ay, bx, by = np.asarray(ln).ravel()[:4]
             length = math.hypot(bx - ax, by - ay)
             if length < min_len:
                 continue
