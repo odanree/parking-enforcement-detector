@@ -5,7 +5,6 @@ export function Header() {
   const wsStatuses        = useAppStore((s) => s.wsStatuses);
   const debugItems        = useAppStore((s) => s.debugItems);
   const setDebugOpen      = useAppStore((s) => s.setDebugOpen);
-  const setComparisonOpen = useAppStore((s) => s.setComparisonOpen);
   const setKanbanOpen     = useAppStore((s) => s.setKanbanOpen);
   const setAdminOpen      = useAppStore((s) => s.setAdminOpen);
   const setTimelineOpen   = useAppStore((s) => s.setTimelineOpen);
@@ -28,9 +27,6 @@ export function Header() {
           <>
             <button className="btn-debug-open" onClick={() => setKanbanOpen(true)}>
               Pipeline
-            </button>
-            <button className="btn-debug-open" onClick={() => setComparisonOpen(true)}>
-              Comparison
             </button>
             <button className="btn-debug-open" onClick={() => setAdminOpen(true)}>
               Dataset

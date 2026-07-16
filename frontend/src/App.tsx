@@ -4,7 +4,6 @@ import { VideoPanel }        from './components/VideoPanel/VideoPanel';
 import { SidePanel }         from './components/SidePanel/SidePanel';
 import { EventModal }        from './components/EventModal';
 import { DebugDrawer }       from './components/DebugDrawer';
-import { ComparisonDrawer }  from './components/ComparisonDrawer';
 import { PipelineKanban }   from './components/PipelineKanban';
 import { DatasetAdmin }     from './components/DatasetAdmin';
 import { TimelinePlot }    from './components/TimelinePlot';
@@ -69,7 +68,6 @@ export default function App() {
         <SidePanel />
       </main>
       <DebugDrawer />
-      <ComparisonDrawer />
       <PipelineKanban />
       <DatasetAdmin />
       <TimelinePlot />

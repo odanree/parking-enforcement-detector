@@ -519,15 +519,6 @@ async def pipeline_trace(
             "backend":     _model_primary,
         }
         confirm = None
-        if ev.get("reeval_backend"):
-            confirm = {
-                "detected":    bool(ev.get("reeval_detected")),
-                "confidence":  float(ev.get("reeval_confidence", 0)),
-                "description": ev.get("reeval_description", ""),
-                "backend":     ev["reeval_backend"],
-            }
-        elif _model_confirm:
-            confirm = None  # confirm stage was original pipeline — already captured in first_pass progression
         thumb_file   = ev.get("thumb_file", "")
         hires_file   = ev.get("hires_file", "")
         thumb_phash  = ev.get("thumb_phash") or None
@@ -1069,78 +1060,6 @@ async def dataset_deduplicate():
     return {"removed": removed, "remaining": vector_store.count()}
 
 
-# ── Re-evaluation (second-opinion) ───────────────────────────────────────────
-
-_reeval_vlm: VLMAnalyzer | None = None
-
-
-def _get_reeval_vlm() -> VLMAnalyzer:
-    global _reeval_vlm
-    if _reeval_vlm is None:
-        backend = os.getenv("REEVAL_BACKEND", "claude")
-        _reeval_vlm = VLMAnalyzer(
-            backend=backend,
-            claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
-            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
-            ollama_model=os.getenv("REEVAL_OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "")),
-        )
-        logger.info("Re-eval VLM initialised (backend=%s)", backend)
-    return _reeval_vlm
-
-
-_reeval_progress: dict = {"running": False, "done": 0, "total": 0, "errors": 0}
-
-
-@app.post("/api/dataset/reeval")
-async def reeval_dataset(background_tasks: BackgroundTasks, ids: list[str] | None = None, detected_only: bool = False):
-    """Re-evaluate stored events using REEVAL_BACKEND (default: claude).
-
-    POST with no body → re-evaluate all events that have frame files on disk.
-    POST with JSON body ["id1", "id2", ...] → re-evaluate specific events only.
-    ?detected_only=true → only re-evaluate events the original model flagged as detected.
-
-    Runs in the background.  Poll GET /api/dataset/comparison for results.
-    """
-    if _reeval_progress["running"]:
-        raise HTTPException(status_code=409, detail="Re-evaluation already in progress")
-
-    vlm = _get_reeval_vlm()
-    backend = os.getenv("REEVAL_BACKEND", "claude")
-    all_items = vector_store.get_all(limit=10_000)["items"]
-    targets = [e for e in all_items if not ids or e["id"] in ids]
-    if detected_only:
-        targets = [e for e in targets if e.get("detected")]
-
-    def _run() -> None:
-        _reeval_progress.update(running=True, done=0, total=len(targets), errors=0)
-        for ev in targets:
-            frames = vector_store.get_frame_bytes(ev["id"])
-            if not frames:
-                _reeval_progress["errors"] += 1
-                continue
-            try:
-                result = vlm.analyze(frames, "chalking")
-                vector_store.update_reeval(
-                    ev["id"],
-                    backend=backend,
-                    detected=result["chalking_detected"],
-                    confidence=result["confidence"],
-                    description=result["description"],
-                )
-            except Exception:
-                logger.exception("reeval failed for event %s", ev["id"])
-                _reeval_progress["errors"] += 1
-            _reeval_progress["done"] += 1
-        _reeval_progress["running"] = False
-        logger.info(
-            "Re-eval complete: %d/%d done, %d errors",
-            _reeval_progress["done"], _reeval_progress["total"], _reeval_progress["errors"],
-        )
-
-    background_tasks.add_task(_run)
-    return {"queued": len(targets), "backend": backend}
-
-
 class ModelEvalRequest(BaseModel):
     model_name: str                       # e.g. "qwen2.5vl:7b"
     backend: str = "ollama"               # "ollama" | "claude"
@@ -1242,31 +1161,6 @@ async def run_model_eval(body: ModelEvalRequest, background_tasks: BackgroundTas
 @app.get("/api/dataset/model-eval/progress")
 async def model_eval_progress():
     return JSONResponse(_model_eval_progress)
-
-
-@app.get("/api/dataset/comparison")
-async def comparison_report():
-    """Return all events that have a re-eval result alongside the original.
-
-    Each item includes:
-      detected / confidence / description   — original model result
-      reeval_detected / reeval_confidence / reeval_description / reeval_backend — second opinion
-      agreement — true if both models agree on detected flag
-    """
-    all_items = vector_store.get_all(limit=10_000)["items"]
-    compared  = [e for e in all_items if "reeval_backend" in e]
-    for ev in compared:
-        ev["agreement"] = bool(ev["detected"]) == bool(ev["reeval_detected"])
-
-    total      = len(compared)
-    agreements = sum(1 for e in compared if e["agreement"])
-    return JSONResponse({
-        "progress":       _reeval_progress,
-        "total":          total,
-        "agreement_rate": round(agreements / total, 3) if total else None,
-        "disagreements":  [e for e in compared if not e["agreement"]],
-        "agreements":     [e for e in compared if e["agreement"]],
-    })
 
 
 @app.get("/api/pipeline/model-stats")

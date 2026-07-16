@@ -8,7 +8,6 @@ interface AppStore {
   pending:     VlmJob[];
   debugItems:  DebugItem[];
   debugOpen:        boolean;
-  comparisonOpen:   boolean;
   kanbanOpen:       boolean;
   adminOpen:        boolean;
   timelineOpen:     boolean;
@@ -22,7 +21,6 @@ interface AppStore {
   setPending:          (jobs: VlmJob[]) => void;
   setDebugItems:       (items: DebugItem[]) => void;
   setDebugOpen:        (open: boolean) => void;
-  setComparisonOpen:   (open: boolean) => void;
   setKanbanOpen:       (open: boolean) => void;
   setAdminOpen:        (open: boolean) => void;
   setTimelineOpen:     (open: boolean) => void;
@@ -39,7 +37,6 @@ export const useAppStore = create<AppStore>((set) => ({
   pending:    [],
   debugItems: [],
   debugOpen:        false,
-  comparisonOpen:   false,
   kanbanOpen:       false,
   adminOpen:        false,
   timelineOpen:     false,
@@ -53,7 +50,6 @@ export const useAppStore = create<AppStore>((set) => ({
   setPending:          (pending)    => set({ pending }),
   setDebugItems:       (debugItems) => set({ debugItems }),
   setDebugOpen:        (debugOpen)  => set({ debugOpen }),
-  setComparisonOpen:   (comparisonOpen) => set({ comparisonOpen }),
   setKanbanOpen:       (kanbanOpen)     => set({ kanbanOpen }),
   setAdminOpen:        (adminOpen)      => set({ adminOpen }),
   setTimelineOpen:     (timelineOpen)   => set({ timelineOpen }),

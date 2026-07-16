@@ -489,25 +489,6 @@ class EventVectorStore:
                 out.append(path.read_bytes())
         return out
 
-    def update_reeval(
-        self,
-        event_id: str,
-        backend: str,
-        detected: bool,
-        confidence: float,
-        description: str,
-    ) -> None:
-        """Store a second-opinion VLM result alongside the original evaluation."""
-        existing = self._col.get(ids=[event_id], include=["metadatas"])
-        if not existing["ids"]:
-            raise KeyError(event_id)
-        meta = existing["metadatas"][0]
-        meta["reeval_backend"]     = backend
-        meta["reeval_detected"]    = int(detected)
-        meta["reeval_confidence"]  = float(confidence)
-        meta["reeval_description"] = description
-        self._col.update(ids=[event_id], metadatas=[meta])
-
     def add_model_eval(
         self,
         event_id: str,
