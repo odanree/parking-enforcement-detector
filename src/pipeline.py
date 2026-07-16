@@ -26,6 +26,11 @@ from src.alerts.notifier import Notifier
 from src.behavior.chalking_analyzer import ChalkingAnalyzer
 from src.detection.motion_detector import MotionDetector
 from src.detection.object_detector import Detection, ObjectDetector
+from src.detection.strategy import (
+    DetectionStrategy,
+    PositiveEvent,
+    strategy_from_env,
+)
 from src.detection.zone_filter import ZoneFilter
 
 _POSE_ENABLED = os.getenv("POSE_ESTIMATION_ENABLED", "false").lower() == "true"
@@ -163,23 +168,33 @@ def _encode_jpeg(frame: np.ndarray) -> bytes:
     return buf.tobytes() if ok else b""
 
 
-def run(state=None, stream_url: str | None = None, video_path: str | None = None, zone_key: str = "street_zone", vector_store=None, vlm: "VLMAnalyzer | None" = None, confirm_vlm: "VLMAnalyzer | None" = None) -> None:
+def run(state=None, stream_url: str | None = None, video_path: str | None = None, zone_key: str | None = None, vector_store=None, vlm: "VLMAnalyzer | None" = None, confirm_vlm: "VLMAnalyzer | None" = None, strategy: "DetectionStrategy | None" = None) -> None:
     """Main pipeline loop.  Blocks until KeyboardInterrupt.
 
     stream_url:  overrides RTSP_URL env var (RTSP second camera).
     video_path:  overrides VIDEO_PATH env var (file-based second camera).
-    zone_key:    which zones entry in detection.yaml to use as the initial polygon.
+    zone_key:    which zones entry in the strategy's config to use as the initial
+                 polygon. Defaults to ``strategy.zone_key`` when None.
+    strategy:    detection strategy (parking | rodent). Defaults to
+                 ``strategy_from_env()`` — DETECTION_MODE env var picks the mode.
     """
     _setup_gpu()
 
-    cfg_det = _load_yaml("config/detection.yaml")
+    if strategy is None:
+        strategy = strategy_from_env()
+    if zone_key is None:
+        zone_key = strategy.zone_key
+
+    cfg_det = _load_yaml(strategy.zones_config_path)
     cfg_alerts = _load_yaml("config/alerts.yaml")
 
     det_cfg = cfg_det["detector"]
     mask_cfg = cfg_det.get("stationary_mask", {})
-    chalk_cfg   = cfg_det["chalking"]
+    chalk_cfg   = cfg_det.get("chalking", {})
     _vehicle_proximity_px = int(os.getenv("VEHICLE_PROXIMITY_PX", chalk_cfg.get("vehicle_proximity_px", 250)))
     mot_cfg = cfg_det.get("motion_detector", {})
+    logger.info("Detection strategy: %s (parking_gates=%s alert=%s zone=%s)",
+                strategy.name, strategy.use_parking_gates, strategy.alert_category, zone_key)
 
     video_path = video_path or (os.getenv("VIDEO_PATH", "") if stream_url is None else "")
     if video_path:
@@ -218,10 +233,10 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     chalking = ChalkingAnalyzer(
         entry_frames=chalk_cfg.get("entry_frames", 10),
         sample_every_n=chalk_cfg.get("sample_every_n", 30),
-        cooldown_seconds=chalk_cfg["cooldown_seconds"],
+        cooldown_seconds=chalk_cfg.get("cooldown_seconds", 30),
         frame_buffer_size=chalk_cfg.get("frame_buffer_size", 4),
         buffer_sample_every_n=chalk_cfg.get("buffer_sample_every_n", 5),
-    )
+    ) if strategy.use_parking_gates else None
 
     # Track when we last stored a zone-pedestrian snapshot per track_id.
     # Throttle to one capture per 30 seconds per track so we don't flood the DB
@@ -229,12 +244,15 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     _ZONE_PED_INTERVAL = 30.0  # seconds between captures for the same track
     _zone_ped_last_seen: dict[int, float] = {}
 
+    _strategy_user_prompt, _strategy_system_prompt = strategy.vlm_prompts()
     if vlm is None:
         vlm = VLMAnalyzer(
             backend=os.getenv("VLM_BACKEND", "claude"),
             claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
             ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "llava:7b-v1.6-mistral-q4_K_M"),
+            user_prompt=_strategy_user_prompt,
+            system_prompt=_strategy_system_prompt,
         )
 
     # Two-stage pipeline: if CONFIRM_BACKEND is set and different from VLM_BACKEND,
@@ -254,6 +272,8 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                 claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
                 ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
                 ollama_model=_confirm_model,
+                user_prompt=_strategy_user_prompt,
+                system_prompt=_strategy_system_prompt,
             )
             logger.info("Two-stage VLM: %s(%s) → %s(%s)", os.getenv("VLM_BACKEND"), os.getenv("OLLAMA_MODEL"), _confirm_backend, _confirm_model)
 
@@ -285,9 +305,11 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     # Person-type classifier cache: tid -> person_type (one classify per track).
     # Re-use the primary VLM for classification unless an explicit override is
     # provided; the call is cheap and reuses cache_control on Claude.
+    # Parking-only stage — rodent mode skips it entirely.
     _classify_cache: dict[int, str] = {}
-    _classify_vlm: VLMAnalyzer | None = vlm if _CLASSIFY_ENABLED else None
-    if _CLASSIFY_ENABLED:
+    _classify_enabled_effective = _CLASSIFY_ENABLED and strategy.use_parking_gates
+    _classify_vlm: VLMAnalyzer | None = vlm if _classify_enabled_effective else None
+    if _classify_enabled_effective:
         logger.info(
             "Person classifier ENABLED — skip types: %s",
             ",".join(sorted(_CLASSIFY_SKIP_TYPES)),
@@ -300,8 +322,9 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
 
     # Pose estimator — opt-in. Provides deterministic crouch / wrist-low /
     # wrist-near-vehicle signals that the VLM can use as a structured prior.
+    # Parking-only stage.
     _pose_estimator = None
-    if _POSE_ENABLED:
+    if _POSE_ENABLED and strategy.use_parking_gates:
         try:
             from src.detection.pose_estimator import PoseEstimator
             _pose_estimator = PoseEstimator(
@@ -317,10 +340,11 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
 
     # Chalk-wand gate (opt-in). Dedicated MOG2 keeps a fresh background model so
     # the wand search can be restricted to moving foreground.
+    # Parking-only stage.
     _wand_detector = None
     _wand_tracker = None
     _wand_mog = None
-    if _WAND_GATE_MODE in _WAND_ENABLED_MODES:
+    if _WAND_GATE_MODE in _WAND_ENABLED_MODES and strategy.use_parking_gates:
         try:
             from src.detection.wand_detector import WandDetector, WandTracker
             _wand_detector = WandDetector(require_dark_torso=_WAND_DARK_TORSO)
@@ -349,6 +373,10 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
     _last_jpeg: bytes = b""
     # track_ids that fired an alert in the current pass (for red bbox overlay)
     alert_ids: set[int] = set()
+    # Rodent-mode per-track VLM rate limiter — one call per track every N seconds.
+    # Prevents burning the VLM budget on the same rat lingering in view.
+    _rodent_last_vlm: dict[int, float] = {}
+    _RODENT_VLM_INTERVAL = float(os.getenv("RODENT_VLM_INTERVAL_S", "2.0"))
 
     try:
         while True:
@@ -585,8 +613,73 @@ def run(state=None, stream_url: str | None = None, video_path: str | None = None
                     # pedestrian doesn't re-trigger VLM calls every sample_every_n frames.
                     if result.get("confidence", 0.0) >= 0.80:
                         chalking.on_alert(tid)
+                elif kind == "rodent" and result.get("rodent_detected", False):
+                    sf = _apply_privacy(snap_fr, state.privacy_regions) if (state and state.privacy_mode) else snap_fr
+                    snap = notifier.send(strategy.alert_category, result, sf, bbox, yolo_conf=yolo_conf)
+                    event_ts = snap_ts or extract_osd_timestamp(snap_fr)
+                    if state:
+                        state.record_alert(strategy.alert_category, result["confidence"], result["description"], snapshot=snap.name if snap else None, frames=detail_b64, track_id=tid, timestamp=event_ts)
+                    alert_ids.add(tid)
+                    # Post-detection hook — slew the secondary PTZ camera to this zone.
+                    try:
+                        fh_r, fw_r = snap_fr.shape[:2]
+                        strategy.on_positive(PositiveEvent(
+                            track_id=tid, bbox=bbox,
+                            frame_width=fw_r, frame_height=fh_r,
+                            confidence=float(result.get("confidence", 0.0)),
+                        ))
+                    except Exception:
+                        logger.exception("strategy.on_positive failed for rodent track=%d", tid)
 
             vehicle_bboxes = [d.bbox for d in all_dets if d.class_name in {"car", "truck", "motorcycle"}]
+
+            # ── Rodent lean path ──────────────────────────────────────────────
+            # Skips all the parking gates (wand, pose, classifier, RAG, chalking
+            # analyzer). YOLO COCO can't see rats/mice, so this path relies on
+            # the MOG2 motion supplement to surface small movers, then submits a
+            # rodent-specific VLM call per track (rate-limited).
+            if not strategy.use_parking_gates:
+                for det in zone_dets:
+                    job_key = ("rodent", det.track_id)
+                    if job_key in _vlm_jobs or det.track_id in alert_ids:
+                        continue
+                    _now = time.time()
+                    _last = _rodent_last_vlm.get(det.track_id, 0.0)
+                    if _now - _last < _RODENT_VLM_INTERVAL:
+                        continue
+                    _rodent_last_vlm[det.track_id] = _now
+                    crop = _crop_wide_bytes(frame, det.bbox)
+                    thumb = _thumb_b64_from_jpeg(crop)
+                    fut = _vlm_pool.submit(vlm.analyze, [crop], "rodent")
+                    # Harvest tuple shape must match parking's (fut, kind, tid, snap_fr, bbox, thumb, detail_b64, snap_ts, yolo_conf, hires_b64)
+                    _vlm_jobs[job_key] = (fut, "rodent", det.track_id, frame.copy(), det.bbox, thumb, [thumb], _frame_wall_ts, det.confidence, "")
+                    if state:
+                        state.add_pending_vlm("rodent", det.track_id, thumb)
+                # Skip the parking loop below when in rodent mode.
+                # Push annotated frame + evict tracks handled below.
+                _skip_parking_loop = True
+            else:
+                _skip_parking_loop = False
+
+            if _skip_parking_loop:
+                # Update action labels (cheap, still useful for UI even in rodent mode)
+                _action_labels = {
+                    det.track_id: _action_clf.update(det.track_id, det.bbox, pose=None)
+                    for det in all_dets
+                }
+                _action_clf.tick_absent(active_ids)
+                # Evict rodent state for gone tracks
+                for _tid in list(_rodent_last_vlm.keys()):
+                    if _tid not in active_ids:
+                        del _rodent_last_vlm[_tid]
+                # Push annotated frame
+                if state and frame_count % _PUSH_EVERY_N == 0:
+                    annotated = _annotate(frame, all_dets, zone_dets, alert_ids, _action_labels)
+                    if state.privacy_mode and state.privacy_regions:
+                        annotated = _apply_privacy(annotated, state.privacy_regions)
+                    _last_jpeg = _encode_jpeg(annotated)
+                    state.push_frame(_last_jpeg)
+                continue  # next frame — skip the parking-mode zone loop
 
             for det in zone_dets:
                 # ── YOLO chalker fast-path ─────────────────────────────────────

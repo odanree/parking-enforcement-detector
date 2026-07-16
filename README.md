@@ -2,6 +2,8 @@
 
 Real-time detection of parking enforcement activity using YOLO object detection and a vision-language model (Claude or Ollama). Monitors an RTSP camera feed or video file and alerts on tire chalking by a PE officer, stopped PE vehicles ([ADR-006](docs/adr/006-pe-vehicle-stopped-detection.md)), and street sweepers.
 
+**Rodent mode** (new): the same pipeline can be flipped into rodent-detection with `DETECTION_MODE=rodent`. Motion-gated VLM classification (no YOLO fine-tune) plus a slew-to-zone dispatcher that pans a secondary Amcrest/Dahua PTZ camera to the zone where a rat/mouse was seen. See [Rodent mode](#rodent-mode) below.
+
 ## How it works
 
 ```
@@ -122,6 +124,23 @@ Opt-in accuracy/volume features (default off):
 | `CLIP_EMBEDDINGS_ENABLED` | `false` | Add CLIP image embeddings for visual RAG (needs `open-clip-torch`) |
 
 See [`.env.example`](.env.example) for all options and [`docs/runbooks/operations.md`](docs/runbooks/operations.md) for detailed setup.
+
+## Rodent mode
+
+The pipeline can be repurposed to detect rats/mice using the same motion-gated VLM classification pattern. Set `DETECTION_MODE=rodent` in `.env` and the pipeline loads [`config/rodent.yaml`](config/rodent.yaml) instead of `config/detection.yaml`, swaps in a rodent-specific VLM prompt, and skips the parking-only stages (wand gate, pose priors, chalking analyzer, person classifier, RAG neighbours). Deployment is a **strategy pattern** — parking and rodent are separate `DetectionStrategy` implementations under [`src/detection/strategy.py`](src/detection/strategy.py).
+
+**Dual-camera slew-to-zone**: on a rodent positive, [`src/stream/slew.py`](src/stream/slew.py) looks up which zone in `config/rodent.yaml` contains the detection center and issues a `GotoPreset` to the secondary Amcrest/Dahua PTZ camera (`SECONDARY_CAMERA_ID`). Presets are saved in the NVR UI; the mapping is a **zone → preset lookup** (no homography calibration needed for the MVP). Per-event lockout (`SLEW_LOCKOUT_SECONDS`, default 10s) prevents PTZ thrashing while a rat lingers.
+
+```bash
+# .env
+DETECTION_MODE=rodent
+SECONDARY_CAMERA_ID=1
+RODENT_SLEW_ENABLED=true
+AMCREST_HOST=192.168.1.100
+PTZ_CHANNEL_1=2
+```
+
+Edit `config/rodent.yaml` → `slew_presets` to map primary-FOV polygons to the preset numbers you saved on the secondary camera.
 
 ## Stack
 

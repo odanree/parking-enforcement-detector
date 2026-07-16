@@ -247,6 +247,17 @@ _MOCK_RESULTS: dict[str, dict] = {
             "Officer visible near driver door. Vehicle has been stationary for several seconds."
         ),
     },
+    "rodent": {
+        "rodent_detected": True,
+        "chalking_detected": False,
+        "sweeper_detected": False,
+        "pe_vehicle_detected": False,
+        "confidence": 0.86,
+        "description": (
+            "Small elongated body with visible tail moving low along the ground. "
+            "Motion pattern consistent with a rat/mouse."
+        ),
+    },
 }
 
 _FALLBACK = {

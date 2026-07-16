@@ -1,0 +1,59 @@
+# Rodent-detection deployment config.
+# Loaded when DETECTION_MODE=rodent.
+#
+# Layout mirrors config/detection.yaml so the same pipeline knobs work; only
+# the values differ. Zones + slew_presets are the two rodent-specific sections.
+
+detector:
+  # Rodents are small — keep a low min_area_fraction so tiny bboxes survive
+  # YOLO's post-track gate. YOLO is advisory in rodent mode (COCO has no rat
+  # class); motion + VLM classification is the load-bearing signal.
+  fp_grid_cell_px: 32
+  fp_suppress_seconds: 4.0
+  input_height: 720
+  input_width: 1280
+  max_area_fraction: 0.10
+  min_area_fraction: 0.0002
+  model: yolov8n.pt
+  threshold: 0.35
+
+motion_detector:
+  # Lower sensitivity floor than parking — small pixel-area movers must survive.
+  edge_margin: 20
+  history: 400
+  max_area: 4000
+  min_area: 80
+  seam_margin: 0
+  seam_x: 0
+  var_threshold: 18
+
+stationary_mask:
+  enabled: true
+  frames: 60
+  pixel_threshold: 8
+
+# Zones: primary-camera FOV polygons. On a rodent-positive event the pipeline
+# looks up which zone contains the detection center and asks the slew
+# dispatcher to send the secondary PTZ camera to the matching preset.
+zones:
+  yard_zone:
+    polygon:
+      - [0, 0]
+      - [1280, 0]
+      - [1280, 720]
+      - [0, 720]
+
+# Zone -> secondary-camera preset lookup.
+# Set the preset numbers to match what you saved in the NVR UI for the
+# secondary Amcrest/Dahua camera. Add sub-zones as you refine the map.
+#
+# Format: list of {name, polygon, preset} entries. First match wins.
+# polygon is a list of [x, y] pairs in PRIMARY-camera detection coords.
+slew_presets:
+  - name: default
+    polygon:
+      - [0, 0]
+      - [1280, 0]
+      - [1280, 720]
+      - [0, 720]
+    preset: 1
